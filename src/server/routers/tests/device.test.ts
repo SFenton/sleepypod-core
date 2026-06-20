@@ -853,7 +853,10 @@ describe('device.setPower', () => {
     await caller.setPower({ side: 'left', powered: false })
     expect(helpersMock.client.setPower).toHaveBeenCalledWith('left', false, undefined)
     expect(automationMock.registerManualOverride).toHaveBeenCalledWith('left')
-    expect(broadcastMock.broadcastMutationStatus).toHaveBeenCalledWith('left', { targetLevel: 0 })
+    expect(broadcastMock.broadcastMutationStatus).toHaveBeenCalledWith('left', {
+      targetTemperature: null,
+      targetLevel: 0,
+    })
     expect(dbChain('update').set).toHaveBeenCalledWith({
       isPowered: false,
       poweredOnAt: null,
