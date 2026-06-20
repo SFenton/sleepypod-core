@@ -23,7 +23,7 @@ if [ -r /etc/sleepypod/data-dir ] && [ -s /etc/sleepypod/data-dir ]; then
 else
   DATA_DIR="/persistent/sleepypod-data"
 fi
-GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-sleepypod/core}"
+GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-SFenton/sleepypod-core}"
 BRANCH="${1:-main}"
 
 echo "=== SleepyPod Update ==="

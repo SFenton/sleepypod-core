@@ -585,7 +585,7 @@ for bin in node npm npx pnpm; do
 done
 
 INSTALL_DIR="/home/dac/sleepypod-core"
-GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-sleepypod/core}"
+GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-SFenton/sleepypod-core}"
 SCRIPT_DEFAULT_BRANCH="__BRANCH__"  # substituted at release time by .github/workflows/{release,dev-release}.yml
 # Guard for users curling the raw source from main: the substitution only
 # happens inside the release tarball, so the file at raw.githubusercontent
@@ -1706,6 +1706,10 @@ if [ "${SKIP_SSH:-}" != true ] && [ -t 0 ] && [[ "${SETUP_SSH:-}" =~ ^[Yy]$ ]]; 
   sed -i "s/#\?PermitRootLogin .*/PermitRootLogin prohibit-password/" /etc/ssh/sshd_config
   sed -i "s/#\?PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
   sed -i "s/#\?PermitEmptyPasswords .*/PermitEmptyPasswords no/" /etc/ssh/sshd_config
+  if grep -qE '^[[:space:]]*AllowUsers[[:space:]]+' /etc/ssh/sshd_config \
+      && ! grep -E '^[[:space:]]*AllowUsers[[:space:]]+' /etc/ssh/sshd_config | grep -qw root; then
+    sed -i -E 's|^([[:space:]]*AllowUsers[[:space:]]+)|\1root |' /etc/ssh/sshd_config
+  fi
 
   echo ""
   echo "Enter your SSH public key:"
@@ -1714,10 +1718,13 @@ if [ "${SKIP_SSH:-}" != true ] && [ -t 0 ] && [[ "${SETUP_SSH:-}" =~ ^[Yy]$ ]]; 
   if [ -n "$SSH_KEY" ]; then
     # Validate key format
     if echo "$SSH_KEY" | grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp[0-9]+) [A-Za-z0-9+/=]+'; then
-      mkdir -p /root/.ssh
-      echo "$SSH_KEY" >> /root/.ssh/authorized_keys
-      chmod 700 /root/.ssh
-      chmod 600 /root/.ssh/authorized_keys
+      ROOT_HOME="$(awk -F: '$1 == "root" { print $6 }' /etc/passwd 2>/dev/null || true)"
+      [ -n "$ROOT_HOME" ] || ROOT_HOME="/root"
+      mkdir -p "$ROOT_HOME/.ssh"
+      echo "$SSH_KEY" >> "$ROOT_HOME/.ssh/authorized_keys"
+      chown -R root:root "$ROOT_HOME/.ssh"
+      chmod 700 "$ROOT_HOME/.ssh"
+      chmod 600 "$ROOT_HOME/.ssh/authorized_keys"
       echo "SSH key added"
     else
       echo "Warning: Invalid SSH key format, skipping"
