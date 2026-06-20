@@ -42,12 +42,10 @@ describe('migrations smoke test', () => {
         'SELECT side, button, tap_type, action_type, temperature_change, temperature_amount, power_behavior FROM tap_gestures WHERE button != \'surface\' ORDER BY side, button, tap_type',
       ).all()
       expect(buttonGestureRows).toEqual([
-        { side: 'left', button: 'bottom', tap_type: 'singleTap', action_type: 'temperature', temperature_change: 'decrement', temperature_amount: 1, power_behavior: null },
-        { side: 'left', button: 'middle', tap_type: 'singleTap', action_type: 'power', temperature_change: null, temperature_amount: null, power_behavior: 'toggle' },
-        { side: 'left', button: 'top', tap_type: 'singleTap', action_type: 'temperature', temperature_change: 'increment', temperature_amount: 1, power_behavior: null },
-        { side: 'right', button: 'bottom', tap_type: 'singleTap', action_type: 'temperature', temperature_change: 'decrement', temperature_amount: 1, power_behavior: null },
-        { side: 'right', button: 'middle', tap_type: 'singleTap', action_type: 'power', temperature_change: null, temperature_amount: null, power_behavior: 'toggle' },
-        { side: 'right', button: 'top', tap_type: 'singleTap', action_type: 'temperature', temperature_change: 'increment', temperature_amount: 1, power_behavior: null },
+        { side: 'left', button: 'bottom', tap_type: 'doubleTap', action_type: 'temperature', temperature_change: 'decrement', temperature_amount: 1, power_behavior: null },
+        { side: 'left', button: 'top', tap_type: 'doubleTap', action_type: 'temperature', temperature_change: 'increment', temperature_amount: 1, power_behavior: null },
+        { side: 'right', button: 'bottom', tap_type: 'doubleTap', action_type: 'temperature', temperature_change: 'decrement', temperature_amount: 1, power_behavior: null },
+        { side: 'right', button: 'top', tap_type: 'doubleTap', action_type: 'temperature', temperature_change: 'increment', temperature_amount: 1, power_behavior: null },
       ])
     }
     finally {
@@ -87,11 +85,11 @@ describe('migrations smoke test', () => {
       const insertStmt = raw.prepare(
         'INSERT INTO tap_gestures (side, button, tap_type, action_type) VALUES (?, ?, ?, ?)',
       )
-      insertStmt.run('left', 'top', 'doubleTap', 'temperature')
-      insertStmt.run('left', 'bottom', 'doubleTap', 'alarm')
+      insertStmt.run('left', 'middle', 'doubleTap', 'power')
+      insertStmt.run('right', 'middle', 'doubleTap', 'alarm')
       insertStmt.run('left', 'top', 'tripleTap', 'temperature')
 
-      expect(() => insertStmt.run('left', 'top', 'doubleTap', 'alarm')).toThrow()
+      expect(() => insertStmt.run('left', 'middle', 'doubleTap', 'alarm')).toThrow()
     }
     finally {
       raw.close()

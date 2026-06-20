@@ -397,7 +397,7 @@ describe('device.setPower', () => {
 
     await caller.setPower({ side: 'left', powered: false })
     expect(helpersMock.client.setPower).toHaveBeenCalledWith('left', false, undefined)
-    expect(broadcastMock.broadcastMutationStatus).toHaveBeenCalledWith('left', { targetLevel: 0 })
+    expect(broadcastMock.broadcastMutationStatus).toHaveBeenCalledWith('left', { targetTemperature: null, targetLevel: 0 })
   })
 
   it('throws PRECONDITION_FAILED when powering on while pump stall guard is active', async () => {
