@@ -23,7 +23,7 @@ if [ -r /etc/sleepypod/data-dir ] && [ -s /etc/sleepypod/data-dir ]; then
 else
   DATA_DIR="/persistent/sleepypod-data"
 fi
-GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-sleepypod/core}"
+GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-SFenton/sleepypod-core}"
 BRANCH=main
 ARCHIVE=""
 usage() {
@@ -33,7 +33,7 @@ Usage: sp-update [branch]
 
 Downloads a pre-built GitHub release; never builds Next.js on the Pod.
 For a cloned repo on your computer, run: ./scripts/deploy POD_IP [branch]
-SLEEPYPOD_GITHUB_REPO selects the release repository (default: sleepypod/core).
+SLEEPYPOD_GITHUB_REPO selects the release repository (default: SFenton/sleepypod-core).
 TMPDIR selects temporary storage (default: /persistent).
 EOF
 }

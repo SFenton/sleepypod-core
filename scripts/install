@@ -646,7 +646,7 @@ for bin in node npm npx pnpm; do
 done
 
 INSTALL_DIR="/home/dac/sleepypod-core"
-GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-sleepypod/core}"
+GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-SFenton/sleepypod-core}"
 SCRIPT_DEFAULT_BRANCH="__BRANCH__"  # substituted at release time by .github/workflows/{release,dev-release}.yml
 # Guard for users curling the raw source from main: the substitution only
 # happens inside the release tarball, so the file at raw.githubusercontent
