@@ -19,6 +19,8 @@
 
 import { connectDac, disconnectDac } from './dacTransport'
 import { DacMonitor } from './dacMonitor'
+import { CoverButtonActionHandler, type CoverButton, type CoverButtonEvent } from './coverButtonActionHandler'
+import { defaultCoverButtonActionDeps } from './coverButtonActionHandler.deps'
 import { GestureActionHandler } from './gestureActionHandler'
 import { defaultGestureActionDeps } from './gestureActionHandler.deps'
 import { DeviceStateSync, getAlarmState } from './deviceStateSync'
@@ -33,10 +35,33 @@ const KEYS = {
   server: '__sp_dac_server__',
   monitor: '__sp_dac_monitor__',
   gesture: '__sp_gesture_handler__',
+  coverButton: '__sp_cover_button_handler__',
   unsubFlow: '__sp_unsub_flow__',
+  unsubCoverButtons: '__sp_unsub_cover_buttons__',
 } as const
 
 const g = globalThis as Record<string, unknown>
+
+const COVER_BUTTONS: readonly CoverButton[] = ['top', 'middle', 'bottom']
+
+function extractCoverButtonEvents(frame: Record<string, unknown>): CoverButtonEvent[] {
+  if (frame.type !== 'buttonEvent') return []
+
+  const events: CoverButtonEvent[] = []
+  const ts = typeof frame.ts === 'number' ? frame.ts : undefined
+  for (const side of ['left', 'right'] as const) {
+    const payload = frame[side]
+    if (typeof payload !== 'object' || payload === null) continue
+
+    const sidePayload = payload as Record<string, unknown>
+    for (const button of COVER_BUTTONS) {
+      const count = Number(sidePayload[button])
+      if (!Number.isInteger(count) || count <= 0) continue
+      events.push({ side, button, count, ts })
+    }
+  }
+  return events
+}
 
 export async function startDacServer(): Promise<void> {
   if (g[KEYS.server]) return
@@ -68,6 +93,7 @@ export const getDacMonitor = async (): Promise<DacMonitor> => {
       const hwClient = getSharedHardwareClient()
       const monitor = new DacMonitor({ socketPath: DAC_SOCK_PATH, hardwareClient: hwClient })
       const gestureHandler = new GestureActionHandler(DAC_SOCK_PATH, defaultGestureActionDeps)
+      const coverButtonHandler = new CoverButtonActionHandler(DAC_SOCK_PATH, defaultCoverButtonActionDeps)
       const stateSync = new DeviceStateSync()
 
       monitor.on('gesture:detected', (event) => {
@@ -124,8 +150,17 @@ export const getDacMonitor = async (): Promise<DacMonitor> => {
         })
       }).catch(() => { /* WS server may not be started yet */ })
 
+      import('../streaming/piezoStream').then(({ onServerFrame }) => {
+        g[KEYS.unsubCoverButtons] = onServerFrame((frame) => {
+          for (const event of extractCoverButtonEvents(frame)) {
+            void coverButtonHandler.handle(event)
+          }
+        })
+      }).catch(() => { /* WS server may not be started yet */ })
+
       g[KEYS.monitor] = monitor
       g[KEYS.gesture] = gestureHandler
+      g[KEYS.coverButton] = coverButtonHandler
 
       await monitor.start()
       console.log('[DAC] monitor started')
@@ -135,6 +170,7 @@ export const getDacMonitor = async (): Promise<DacMonitor> => {
     catch (error) {
       g[KEYS.monitor] = null
       g[KEYS.gesture] = null
+      g[KEYS.coverButton] = null
       throw error
     }
     finally {
@@ -158,6 +194,7 @@ export const shutdownDacMonitor = async (): Promise<void> => {
 
   const monitor = g[KEYS.monitor] as DacMonitor | undefined
   const gestureHandler = g[KEYS.gesture] as GestureActionHandler | undefined
+  const coverButtonHandler = g[KEYS.coverButton] as CoverButtonActionHandler | undefined
 
   cancelSnooze('left')
   cancelSnooze('right')
@@ -165,15 +202,20 @@ export const shutdownDacMonitor = async (): Promise<void> => {
 
   const unsubFlow = g[KEYS.unsubFlow] as (() => void) | undefined
   unsubFlow?.()
+  const unsubCoverButtons = g[KEYS.unsubCoverButtons] as (() => void) | undefined
+  unsubCoverButtons?.()
 
   g[KEYS.monitor] = null
   g[KEYS.gesture] = null
+  g[KEYS.coverButton] = null
   g[KEYS.server] = null
   g[KEYS.unsubFlow] = null
+  g[KEYS.unsubCoverButtons] = null
   clearSharedHardwareClient()
   monitorInitPromise = null
 
   gestureHandler?.cleanup()
+  coverButtonHandler?.cleanup()
 
   if (monitor) {
     monitor.removeAllListeners('gesture:detected')

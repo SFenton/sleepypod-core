@@ -369,7 +369,7 @@ async function findLatestRawAsync(dir: string): Promise<string | null> {
 const ALL_SENSOR_TYPES = [
   'piezo-dual', 'capSense', 'capSense2',
   'bedTemp', 'bedTemp2', 'frzTemp', 'frzTherm', 'frzHealth', 'log',
-  'deviceStatus', 'gesture', 'lps',
+  'deviceStatus', 'gesture', 'buttonEvent', 'lps',
 ] as const
 
 /** Valid sensor type string. Used for subscription filtering. */
@@ -857,8 +857,8 @@ function dispatchSensorFrame(frame: Record<string, unknown>): void {
     }
   }
 
-  // Notify server-side listeners (only frzHealth currently has consumers).
-  if (frameType === 'frzHealth' && serverFrameListeners.size > 0) {
+  // Notify server-side listeners for every decoded frame.
+  if (serverFrameListeners.size > 0) {
     for (const cb of serverFrameListeners) {
       try {
         cb(frame)

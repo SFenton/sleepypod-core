@@ -3,23 +3,32 @@
 import { useState, useCallback } from 'react'
 import { trpc } from '@/src/utils/trpc'
 import { useSideNames } from '@/src/hooks/useSideNames'
-import { Hand, Plus, Trash2, Thermometer, Bell, ChevronDown } from 'lucide-react'
+import { Bell, ChevronDown, Circle, Hand, Minus, Plus, Power, Thermometer, Trash2 } from 'lucide-react'
 import clsx from 'clsx'
 
 type TapType = 'doubleTap' | 'tripleTap' | 'quadTap'
-type ActionType = 'temperature' | 'alarm'
+type CoverButton = 'top' | 'middle' | 'bottom'
+type ActionType = 'temperature' | 'alarm' | 'power'
 type Side = 'left' | 'right'
 
-interface GestureRecord {
+interface ActionRecord {
   id: number
   side: Side
-  tapType: TapType
   actionType: ActionType
   temperatureChange: 'increment' | 'decrement' | null
   temperatureAmount: number | null
+  powerBehavior?: 'toggle' | 'on' | 'off' | null
   alarmBehavior: 'snooze' | 'dismiss' | null
   alarmSnoozeDuration: number | null
   alarmInactiveBehavior: 'power' | 'none' | null
+}
+
+interface GestureRecord extends ActionRecord {
+  tapType: TapType
+}
+
+interface CoverButtonActionRecord extends ActionRecord {
+  button: CoverButton
 }
 
 const TAP_TYPES: { key: TapType, label: string, taps: number }[] = [
@@ -28,31 +37,65 @@ const TAP_TYPES: { key: TapType, label: string, taps: number }[] = [
   { key: 'quadTap', label: 'Quad Tap', taps: 4 },
 ]
 
-function gestureDescription(gesture: GestureRecord): string {
-  if (gesture.actionType === 'temperature') {
-    const dir = gesture.temperatureChange === 'increment' ? '+' : '-'
-    return `${dir}${gesture.temperatureAmount}° temp`
+const COVER_BUTTONS: {
+  key: CoverButton
+  label: string
+  description: string
+  icon: typeof Plus
+}[] = [
+  { key: 'top', label: 'Plus Button', description: 'Top cover button', icon: Plus },
+  { key: 'middle', label: 'Center Button', description: 'Middle cover button', icon: Circle },
+  { key: 'bottom', label: 'Minus Button', description: 'Bottom cover button', icon: Minus },
+]
+
+function actionDescription(action: ActionRecord): string {
+  if (action.actionType === 'temperature') {
+    const dir = action.temperatureChange === 'increment' ? '+' : '-'
+    return `${dir}${action.temperatureAmount}° temp`
   }
-  return gesture.alarmBehavior === 'snooze' ? 'Snooze alarm' : 'Dismiss alarm'
+  if (action.actionType === 'power') {
+    if (action.powerBehavior === 'on') return 'Power on'
+    if (action.powerBehavior === 'off') return 'Power off'
+    return 'Toggle power'
+  }
+  return action.alarmBehavior === 'snooze' ? 'Snooze alarm' : 'Dismiss alarm'
 }
 
 interface EditState {
+  mode: 'tap' | 'cover'
   side: Side
-  tapType: TapType
+  tapType?: TapType
+  button?: CoverButton
   actionType: ActionType
   temperatureChange: 'increment' | 'decrement'
   temperatureAmount: number
+  powerBehavior: 'toggle' | 'on' | 'off'
   alarmBehavior: 'snooze' | 'dismiss'
   alarmSnoozeDuration: number
   alarmInactiveBehavior: 'power' | 'none'
 }
 
 const defaultEditState = (side: Side, tapType: TapType): EditState => ({
+  mode: 'tap',
   side,
   tapType,
   actionType: 'temperature',
   temperatureChange: 'increment',
   temperatureAmount: 2,
+  powerBehavior: 'toggle',
+  alarmBehavior: 'snooze',
+  alarmSnoozeDuration: 300,
+  alarmInactiveBehavior: 'none',
+})
+
+const defaultCoverButtonState = (side: Side, button: CoverButton): EditState => ({
+  mode: 'cover',
+  side,
+  button,
+  actionType: button === 'middle' ? 'power' : 'temperature',
+  temperatureChange: button === 'bottom' ? 'decrement' : 'increment',
+  temperatureAmount: 1,
+  powerBehavior: 'toggle',
   alarmBehavior: 'snooze',
   alarmSnoozeDuration: 300,
   alarmInactiveBehavior: 'none',
@@ -60,14 +103,47 @@ const defaultEditState = (side: Side, tapType: TapType): EditState => ({
 
 function editStateFromGesture(g: GestureRecord): EditState {
   return {
+    mode: 'tap',
     side: g.side,
     tapType: g.tapType,
     actionType: g.actionType,
     temperatureChange: g.temperatureChange ?? 'increment',
     temperatureAmount: g.temperatureAmount ?? 2,
+    powerBehavior: 'toggle',
     alarmBehavior: g.alarmBehavior ?? 'snooze',
     alarmSnoozeDuration: g.alarmSnoozeDuration ?? 300,
     alarmInactiveBehavior: g.alarmInactiveBehavior ?? 'none',
+  }
+}
+
+function editStateFromCoverButton(action: CoverButtonActionRecord): EditState {
+  return {
+    mode: 'cover',
+    side: action.side,
+    button: action.button,
+    actionType: action.actionType,
+    temperatureChange: action.temperatureChange ?? 'increment',
+    temperatureAmount: action.temperatureAmount ?? 1,
+    powerBehavior: action.powerBehavior ?? 'toggle',
+    alarmBehavior: action.alarmBehavior ?? 'snooze',
+    alarmSnoozeDuration: action.alarmSnoozeDuration ?? 300,
+    alarmInactiveBehavior: action.alarmInactiveBehavior ?? 'none',
+  }
+}
+
+function defaultCoverButtonAction(side: Side, button: CoverButton): CoverButtonActionRecord {
+  const state = defaultCoverButtonState(side, button)
+  return {
+    id: -1,
+    side,
+    button,
+    actionType: state.actionType,
+    temperatureChange: state.actionType === 'temperature' ? state.temperatureChange : null,
+    temperatureAmount: state.actionType === 'temperature' ? state.temperatureAmount : null,
+    powerBehavior: state.actionType === 'power' ? state.powerBehavior : null,
+    alarmBehavior: null,
+    alarmSnoozeDuration: null,
+    alarmInactiveBehavior: null,
   }
 }
 
@@ -86,6 +162,12 @@ export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right'
       setEditing(null)
     },
   })
+  const setCoverButtonAction = trpc.settings.setCoverButtonAction.useMutation({
+    onSuccess: () => {
+      utils.settings.getAll.invalidate()
+      setEditing(null)
+    },
+  })
   const deleteGesture = trpc.settings.deleteGesture.useMutation({
     onSuccess: () => {
       utils.settings.getAll.invalidate()
@@ -97,6 +179,9 @@ export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right'
   const gestures = settingsQuery.data?.gestures as
     | { left: GestureRecord[], right: GestureRecord[] }
     | undefined
+  const coverButtons = settingsQuery.data?.coverButtons as
+    | { left: CoverButtonActionRecord[], right: CoverButtonActionRecord[] }
+    | undefined
 
   const findGesture = useCallback(
     (side: Side, tapType: TapType): GestureRecord | undefined => {
@@ -105,8 +190,53 @@ export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right'
     [gestures]
   )
 
+  const findCoverButtonAction = useCallback(
+    (side: Side, button: CoverButton): CoverButtonActionRecord => {
+      return coverButtons?.[side]?.find((action: CoverButtonActionRecord) => action.button === button)
+        ?? defaultCoverButtonAction(side, button)
+    },
+    [coverButtons]
+  )
+
   const handleSave = useCallback(() => {
     if (!editing) return
+
+    if (editing.mode === 'cover') {
+      if (!editing.button) return
+
+      if (editing.actionType === 'temperature') {
+        setCoverButtonAction.mutate({
+          side: editing.side,
+          button: editing.button,
+          actionType: 'temperature',
+          temperatureChange: editing.temperatureChange,
+          temperatureAmount: editing.temperatureAmount,
+        })
+      }
+      else if (editing.actionType === 'power') {
+        setCoverButtonAction.mutate({
+          side: editing.side,
+          button: editing.button,
+          actionType: 'power',
+          powerBehavior: editing.powerBehavior,
+        })
+      }
+      else {
+        setCoverButtonAction.mutate({
+          side: editing.side,
+          button: editing.button,
+          actionType: 'alarm',
+          alarmBehavior: editing.alarmBehavior,
+          alarmSnoozeDuration:
+            editing.alarmBehavior === 'snooze' ? editing.alarmSnoozeDuration : undefined,
+          alarmInactiveBehavior: editing.alarmInactiveBehavior,
+        })
+      }
+      return
+    }
+
+    if (!editing.tapType) return
+    if (editing.actionType === 'power') return
 
     if (editing.actionType === 'temperature') {
       setGesture.mutate({
@@ -128,7 +258,7 @@ export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right'
         alarmInactiveBehavior: editing.alarmInactiveBehavior,
       })
     }
-  }, [editing, setGesture])
+  }, [editing, setCoverButtonAction, setGesture])
 
   const handleDelete = useCallback(
     (side: Side, tapType: TapType) => {
@@ -137,15 +267,13 @@ export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right'
     [deleteGesture]
   )
 
-  const renderSideSection = (side: Side) => {
+  const renderTapRows = (side: Side) => {
     return (
-      <div className="space-y-2">
-        <h4 className="text-xs font-semibold text-sky-400">{sideName(side)}</h4>
-
+      <>
         {TAP_TYPES.map(({ key, label }) => {
           const gesture = findGesture(side, key)
           const isEditing
-            = editing?.side === side && editing?.tapType === key
+            = editing?.mode === 'tap' && editing?.side === side && editing?.tapType === key
 
           return (
             <div key={`${side}-${key}`}>
@@ -161,7 +289,7 @@ export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right'
                   <span className="text-sm text-zinc-300">{label}</span>
                   {gesture && (
                     <p className="text-xs text-zinc-500">
-                      {gestureDescription(gesture)}
+                      {actionDescription(gesture)}
                     </p>
                   )}
                 </div>
@@ -215,11 +343,84 @@ export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right'
                   onSave={handleSave}
                   onCancel={() => setEditing(null)}
                   isSaving={setGesture.isPending}
+                  allowPower={false}
                 />
               )}
             </div>
           )
         })}
+      </>
+    )
+  }
+
+  const renderCoverButtonRows = (side: Side) => {
+    return (
+      <div className="space-y-1.5 pt-2">
+        <p className="px-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+          Cover Buttons
+        </p>
+
+        {COVER_BUTTONS.map(({ key, label, description, icon: Icon }) => {
+          const action = findCoverButtonAction(side, key)
+          const isEditing
+            = editing?.mode === 'cover' && editing?.side === side && editing?.button === key
+
+          return (
+            <div key={`${side}-${key}`}>
+              <div className="flex min-h-[44px] items-center gap-3 rounded-xl bg-zinc-900/50 px-3 py-2.5">
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-zinc-800">
+                  <Icon size={14} className="text-zinc-500" />
+                </div>
+
+                <div className="flex-1">
+                  <span className="text-sm text-zinc-300">{label}</span>
+                  <p className="text-xs text-zinc-500">
+                    {description}
+                    {' · '}
+                    {actionDescription(action)}
+                  </p>
+                </div>
+
+                <button
+                  onClick={() =>
+                    setEditing(
+                      isEditing ? null : editStateFromCoverButton(action)
+                    )}
+                  className="flex h-11 w-11 items-center justify-center rounded-lg text-zinc-500 active:bg-zinc-800 active:text-zinc-300"
+                >
+                  <ChevronDown
+                    size={14}
+                    className={clsx(
+                      'transition-transform',
+                      isEditing && 'rotate-180'
+                    )}
+                  />
+                </button>
+              </div>
+
+              {isEditing && editing && (
+                <GestureEditPanel
+                  state={editing}
+                  onChange={setEditing}
+                  onSave={handleSave}
+                  onCancel={() => setEditing(null)}
+                  isSaving={setCoverButtonAction.isPending}
+                  allowPower
+                />
+              )}
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
+  const renderSideSection = (side: Side) => {
+    return (
+      <div className="space-y-2">
+        <h4 className="text-xs font-semibold text-sky-400">{sideName(side)}</h4>
+        {renderTapRows(side)}
+        {renderCoverButtonRows(side)}
       </div>
     )
   }
@@ -243,7 +444,7 @@ export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right'
       <div>
         <h3 className="text-sm font-medium text-white">Tap Gestures</h3>
         <p className="mt-1 text-xs text-zinc-500">
-          Tap on the pod cover to control temperature or alarm
+          Tap or press Pod 5 cover buttons to control temperature, power, or alarm
         </p>
       </div>
 
@@ -264,12 +465,14 @@ function GestureEditPanel({
   onSave,
   onCancel,
   isSaving,
+  allowPower,
 }: {
   state: EditState
   onChange: (s: EditState) => void
   onSave: () => void
   onCancel: () => void
   isSaving: boolean
+  allowPower: boolean
 }) {
   return (
     <div className="mt-1 space-y-3 rounded-xl border border-zinc-800 bg-zinc-900 p-3">
@@ -299,6 +502,20 @@ function GestureEditPanel({
           <Bell size={12} />
           Alarm
         </button>
+        {allowPower && (
+          <button
+            onClick={() => onChange({ ...state, actionType: 'power' })}
+            className={clsx(
+              'flex flex-1 min-h-[44px] items-center justify-center gap-1.5 rounded-md px-3 py-2 text-xs font-medium transition-colors',
+              state.actionType === 'power'
+                ? 'bg-zinc-700 text-white'
+                : 'text-zinc-500'
+            )}
+          >
+            <Power size={12} />
+            Power
+          </button>
+        )}
       </div>
 
       {/* Temperature config */}
@@ -363,6 +580,32 @@ function GestureEditPanel({
               >
                 +
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Power config */}
+      {state.actionType === 'power' && (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-zinc-400">Behavior</span>
+            <div className="flex rounded-lg bg-zinc-800 p-0.5">
+              {(['toggle', 'on', 'off'] as const).map(behavior => (
+                <button
+                  key={behavior}
+                  onClick={() =>
+                    onChange({ ...state, powerBehavior: behavior })}
+                  className={clsx(
+                    'rounded-md px-3 min-h-[44px] flex items-center justify-center text-xs font-medium capitalize transition-colors',
+                    state.powerBehavior === behavior
+                      ? 'bg-sky-500/20 text-sky-400'
+                      : 'text-zinc-500'
+                  )}
+                >
+                  {behavior}
+                </button>
+              ))}
             </div>
           </div>
         </div>

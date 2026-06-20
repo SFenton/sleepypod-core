@@ -32,6 +32,7 @@ interface IptablesRule {
 /** Known iptables paths from the pod capabilities manifest, used as fallbacks */
 const KNOWN_IPTABLES_PATHS = [...new Set(Object.values(POD_CAPS).map(c => c.iptablesPath))]
 const runFile = promisify(execFile)
+const IPTABLES_SAVE_HELPER = '/usr/local/bin/sp-iptables-save'
 const globalCache = globalThis as typeof globalThis & {
   __sp_iptables_health__?: {
     path: Promise<string> | null
@@ -179,6 +180,20 @@ function buildRequiredRules(iptables: string) {
   ]
 }
 
+function persistRules(iptables: string): void {
+  try {
+    execSync(`test -x ${IPTABLES_SAVE_HELPER}`, { timeout: 2000 })
+    execSync(`sudo -n ${IPTABLES_SAVE_HELPER}`, { encoding: 'utf-8', timeout: 5000 })
+    return
+  }
+  catch {
+    // Helper is installed by scripts/install on pods. Dev/CI and older installs fall through.
+  }
+
+  const iptablesSave = iptables.replace(/iptables$/, 'iptables-save')
+  execSync(`${iptablesSave} > /etc/iptables/rules.v4`, { encoding: 'utf-8', timeout: 5000 })
+}
+
 /**
  * Check if all required iptables rules are present.
  * Returns status without modifying anything.
@@ -258,10 +273,8 @@ export function checkAndRepairIptables(iptablesPath?: string): IptablesStatus {
   }
 
   if (repaired.length > 0) {
-    // Persist the repaired rules — derive iptables-save path from iptables path
-    const iptablesSave = iptables.replace(/iptables$/, 'iptables-save')
     try {
-      execSync(`${iptablesSave} > /etc/iptables/rules.v4`, { encoding: 'utf-8', timeout: 5000 })
+      persistRules(iptables)
       console.log(`[iptables] Saved ${repaired.length} repaired rules to rules.v4`)
     }
     catch {

@@ -317,6 +317,7 @@ describe('iptablesCheck — checkAndRepairIptables', () => {
       // Missing: LAN access; rest present
       if (cmd.startsWith('/sbin/iptables -L INPUT')) return 'udp dpt:5353' // omits 192.168.0.0/16
       if (cmd.startsWith('/sbin/iptables -L OUTPUT')) return 'udp dpt:5353 udp spt:5353 udp dpt:123'
+      if (cmd === 'test -x /usr/local/bin/sp-iptables-save') throw unavailableError('missing', 1)
       // Repair invocation
       if (cmd.includes('-I INPUT 1 -s 192.168.0.0/16')) {
         repaired.push(cmd)
@@ -390,6 +391,7 @@ describe('iptablesCheck — checkAndRepairIptables', () => {
       if (cmd.startsWith('/sbin/iptables -L INPUT')) return 'udp dpt:5353' // missing LAN
       if (cmd.startsWith('/sbin/iptables -L OUTPUT')) return 'udp dpt:5353 udp spt:5353 udp dpt:123'
       if (cmd.includes('-I INPUT 1 -s 192.168.0.0/16')) return ''
+      if (cmd === 'test -x /usr/local/bin/sp-iptables-save') throw unavailableError('missing', 1)
       if (cmd.startsWith('/sbin/iptables-save')) {
         throw unavailableError('No such file or directory: /etc/iptables/rules.v4')
       }
@@ -475,5 +477,31 @@ describe('iptablesCheck — checkAndRepairIptables', () => {
     expect(repairs).toHaveLength(5)
     expect(repairs.every(cmd => / -I (?:INPUT|OUTPUT) 1 /.test(cmd))).toBe(true)
     log.mockRestore()
+  })
+
+  it('uses the installed root helper before falling back to direct iptables-save', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    let saveCmd = ''
+
+    setExecHandler(({ cmd }) => {
+      if (cmd.includes('which iptables')) return '/sbin/iptables\n'
+      if (cmd.startsWith('/sbin/iptables -L INPUT')) return 'udp dpt:5353'
+      if (cmd.startsWith('/sbin/iptables -L OUTPUT')) return 'udp dpt:5353 udp spt:5353 udp dpt:123'
+      if (cmd.includes('-I INPUT 1 -s 192.168.0.0/16')) return ''
+      if (cmd === 'test -x /usr/local/bin/sp-iptables-save') return ''
+      if (cmd === 'sudo -n /usr/local/bin/sp-iptables-save') {
+        saveCmd = cmd
+        return ''
+      }
+      if (cmd.includes('iptables-save')) throw new Error('direct iptables-save should not run')
+      return ''
+    })
+
+    const { checkAndRepairIptables } = await import('../iptablesCheck')
+    const result = checkAndRepairIptables()
+
+    expect(result.repaired).toEqual(['LAN access (192.168.0.0/16)'])
+    expect(saveCmd).toBe('sudo -n /usr/local/bin/sp-iptables-save')
+    logSpy.mockRestore()
   })
 })

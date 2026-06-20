@@ -2,7 +2,7 @@
  * Tests for the settings router — getAll merges defaults, updateDevice
  * persists + reloads scheduler + mirrors homekit lifecycle, updateSide
  * rejects mutually-exclusive flags + validates away window, setAlwaysOn
- * starts/stops keepalive, gesture CRUD.
+ * starts/stops keepalive, gesture and cover-button CRUD.
  *
  * The DB transaction(cb) pattern is mocked synchronously: tx exposes
  * select/update/insert/delete chains terminating in .all() which returns
@@ -161,17 +161,23 @@ describe('settings.getAll', () => {
       { side: 'right', name: 'R', awayMode: false, alwaysOn: false, autoOffEnabled: false, autoOffMinutes: 30, awayStart: null, awayReturn: null, createdAt: new Date(0), updatedAt: new Date(0) },
     ]
     const gestures: unknown[] = []
-    dbState.topRowsQueue.push([device], sides, gestures)
+    const coverButtons = [
+      { id: 1, side: 'left', button: 'top', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: 2, side: 'right', button: 'middle', actionType: 'power', powerBehavior: 'toggle', createdAt: new Date(0), updatedAt: new Date(0) },
+    ]
+    dbState.topRowsQueue.push([device], sides, gestures, coverButtons)
 
     const result = await caller.getAll({})
     expect(result.device.timezone).toBe('UTC')
     expect(result.sides.left.name).toBe('L')
     expect(result.sides.right.name).toBe('R')
     expect(result.gestures.left).toEqual([])
+    expect(result.coverButtons.left).toHaveLength(1)
+    expect(result.coverButtons.right).toHaveLength(1)
   })
 
   it('returns synthetic defaults when device row is missing', async () => {
-    dbState.topRowsQueue.push([], [], [])
+    dbState.topRowsQueue.push([], [], [], [])
     const result = await caller.getAll({})
     expect(result.device.timezone).toBe('America/Los_Angeles')
     expect(result.sides.left.side).toBe('left')
@@ -188,7 +194,7 @@ describe('settings.getAll', () => {
       { id: 1, side: 'left', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
       { id: 2, side: 'right', tapType: 'doubleTap', actionType: 'alarm', alarmBehavior: 'snooze', createdAt: new Date(0), updatedAt: new Date(0) },
     ]
-    dbState.topRowsQueue.push([device], sides, gestures)
+    dbState.topRowsQueue.push([device], sides, gestures, [])
     const result = await caller.getAll({})
     expect(result.gestures.left).toHaveLength(1)
     expect(result.gestures.right).toHaveLength(1)
@@ -580,6 +586,58 @@ describe('settings.setGesture / deleteGesture', () => {
     dbState.txRowsQueue.push([{ id: 1 }])
     const out = await caller.deleteGesture({ side: 'left', tapType: 'doubleTap' })
     expect(out).toEqual({ success: true })
+  })
+})
+
+describe('settings.setCoverButtonAction', () => {
+  it('creates a temperature cover-button action when none exists', async () => {
+    const created = {
+      id: 1, side: 'left', button: 'top', actionType: 'temperature',
+      temperatureChange: 'increment', temperatureAmount: 1,
+      createdAt: new Date(0), updatedAt: new Date(0),
+    }
+    dbState.txRowsQueue.push([], [created])
+
+    const out = await caller.setCoverButtonAction({
+      side: 'left',
+      button: 'top',
+      actionType: 'temperature',
+      temperatureChange: 'increment',
+      temperatureAmount: 1,
+    })
+    expect(out.id).toBe(1)
+  })
+
+  it('updates a center cover button to toggle power', async () => {
+    const existing = { id: 5, side: 'right', button: 'middle' }
+    const updated = {
+      id: 5, side: 'right', button: 'middle', actionType: 'power',
+      powerBehavior: 'toggle',
+      createdAt: new Date(0), updatedAt: new Date(0),
+    }
+    dbState.txRowsQueue.push([existing], [updated])
+
+    const out = await caller.setCoverButtonAction({
+      side: 'right',
+      button: 'middle',
+      actionType: 'power',
+      powerBehavior: 'toggle',
+    })
+    expect(out.powerBehavior).toBe('toggle')
+  })
+
+  it('wraps transaction errors for cover-button actions', async () => {
+    dbMock.transaction.mockImplementationOnce(() => {
+      throw new Error('cover db down')
+    })
+
+    await expect(caller.setCoverButtonAction({
+      side: 'left',
+      button: 'bottom',
+      actionType: 'temperature',
+      temperatureChange: 'decrement',
+      temperatureAmount: 1,
+    })).rejects.toThrow(/Failed to set cover button action: cover db down/)
   })
 })
 
