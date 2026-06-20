@@ -126,6 +126,7 @@ const expectedTables: Record<string, TableSpec> = {
     columns: [
       { name: 'id', notNull: true, default: 'fn' },
       { name: 'side', notNull: true, default: undefined },
+      { name: 'button', notNull: true, default: 'surface' },
       { name: 'tap_type', notNull: true, default: undefined },
       { name: 'action_type', notNull: true, default: undefined },
       { name: 'temperature_change', notNull: false, default: undefined },
@@ -133,11 +134,12 @@ const expectedTables: Record<string, TableSpec> = {
       { name: 'alarm_behavior', notNull: false, default: undefined },
       { name: 'alarm_snooze_duration', notNull: false, default: undefined },
       { name: 'alarm_inactive_behavior', notNull: false, default: undefined },
+      { name: 'power_behavior', notNull: false, default: undefined },
       { name: 'created_at', notNull: true, default: 'sql' },
       { name: 'updated_at', notNull: true, default: 'sql' },
     ],
     indexes: [
-      { name: 'uq_tap_side_type', unique: true, columns: ['side', 'tap_type'] },
+      { name: 'uq_tap_side_button_type', unique: true, columns: ['side', 'button', 'tap_type'] },
     ],
   },
   coverButtonActions: {

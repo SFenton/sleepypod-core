@@ -7,9 +7,10 @@ export type { GestureActionDeps }
 
 // These types mirror the DB row shapes without importing from @/src/db
 export interface TapGestureRow {
-  actionType: 'temperature' | 'alarm'
+  actionType: 'temperature' | 'alarm' | 'power'
   temperatureChange: 'increment' | 'decrement' | null
   temperatureAmount: number | null
+  powerBehavior: 'toggle' | 'on' | 'off' | null
   alarmBehavior: 'snooze' | 'dismiss' | null
   /** Duration in seconds before a snoozed alarm restarts. */
   alarmSnoozeDuration: number | null
@@ -82,6 +83,9 @@ export class GestureActionHandler {
 
     if (gesture.actionType === 'temperature') {
       await this.handleTemperatureAction(event, gesture)
+    }
+    else if (gesture.actionType === 'power') {
+      await this.handlePowerAction(event, gesture)
     }
     else if (gesture.actionType === 'alarm') {
       await this.handleAlarmAction(event, gesture)
@@ -167,6 +171,27 @@ export class GestureActionHandler {
         }
       }
       // alarmInactiveBehavior === 'none': no-op
+    }
+  }
+
+  private handlePowerAction = async (
+    event: GestureEvent,
+    gesture: TapGestureRow
+  ): Promise<void> => {
+    const state = await this.deps.findDeviceState(event.side)
+    const behavior = gesture.powerBehavior ?? 'toggle'
+    const nextPowered = behavior === 'toggle'
+      ? !(state?.isPowered ?? false)
+      : behavior === 'on'
+    const target = state?.targetTemperature ?? TEMP_NEUTRAL
+
+    const client = this.deps.newHardwareClient(this.socketPath)
+    try {
+      await client.connect()
+      await client.setPower(event.side, nextPowered, nextPowered ? target : undefined)
+    }
+    finally {
+      client.disconnect()
     }
   }
 }

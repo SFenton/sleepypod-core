@@ -165,8 +165,8 @@ Device and side configuration management.
 - `getAll()` - Fetch all settings (device + both sides + gestures)
 - `updateDevice(timezone, tempUnit, reboot, priming)` - Device-wide settings
 - `updateSide(side, name, awayMode)` - Per-side configuration
-- `setGesture(side, tapType, action, params)` - Configure tap behaviors
-- `deleteGesture(side, tapType)` - Remove tap gesture
+- `setGesture(side, button, tapType, action, params)` - Configure surface or cover-button tap behaviors
+- `deleteGesture(side, button, tapType)` - Remove tap gesture
 
 **Gestures:**
 - Tap types: doubleTap, tripleTap, quadTap

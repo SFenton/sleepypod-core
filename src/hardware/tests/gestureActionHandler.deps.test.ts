@@ -23,7 +23,7 @@ const sharedMock = vi.hoisted(() => ({
 
 vi.mock('@/src/db', () => ({ db: dbMock.db }))
 vi.mock('@/src/db/schema', () => ({
-  tapGestures: { side: 'side', tapType: 'tapType' },
+  tapGestures: { side: 'side', button: 'button', tapType: 'tapType' },
   deviceState: { side: 'side' },
 }))
 vi.mock('drizzle-orm', () => ({

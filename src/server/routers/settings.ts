@@ -2,10 +2,11 @@ import { z } from 'zod'
 import { TRPCError } from '@trpc/server'
 import { publicProcedure, router } from '@/src/server/trpc'
 import { db } from '@/src/db'
-import { coverButtonActions, deviceSettings, sideSettings, tapGestures } from '@/src/db/schema'
+import { deviceSettings, sideSettings, tapGestures } from '@/src/db/schema'
 import { eq, and } from 'drizzle-orm'
 import {
   coverButtonSchema,
+  gestureButtonSchema,
   isoDatetimeSchema,
   sideSchema,
   tapTypeSchema,
@@ -56,10 +57,12 @@ const sideSettingsSchema = z.object({
 const tapGestureSchema = z.object({
   id: z.number(),
   side: sideSchema,
+  button: gestureButtonSchema,
   tapType: tapTypeSchema,
-  actionType: z.enum(['temperature', 'alarm']),
+  actionType: z.enum(['temperature', 'alarm', 'power']),
   temperatureChange: z.enum(['increment', 'decrement']).nullable().optional(),
   temperatureAmount: z.number().nullable().optional(),
+  powerBehavior: z.enum(['toggle', 'on', 'off']).nullable().optional(),
   alarmBehavior: z.enum(['snooze', 'dismiss']).nullable().optional(),
   alarmSnoozeDuration: z.number().nullable().optional(),
   alarmInactiveBehavior: z.enum(['power', 'none']).nullable().optional(),
@@ -112,6 +115,12 @@ const PRIME_KEYS = ['primePodDaily', 'primePodTime'] as const
 const LED_KEYS = [
   'ledNightModeEnabled', 'ledNightStartTime', 'ledNightEndTime',
 ] as const
+
+type CoverButtonValue = z.infer<typeof coverButtonSchema>
+
+function isCoverButtonValue(button: string): button is CoverButtonValue {
+  return button === 'top' || button === 'middle' || button === 'bottom'
+}
 
 /**
  * Apply scheduler mutations triggered by a device-settings update. Re-reads
@@ -177,7 +186,10 @@ export const settingsRouter = router({
         const [device] = await db.select().from(deviceSettings).limit(1)
         const sides = await db.select().from(sideSettings)
         const gestures = await db.select().from(tapGestures)
-        const coverButtons = await db.select().from(coverButtonActions)
+        const coverButtons = gestures.filter(
+          (g): g is typeof g & { button: CoverButtonValue, tapType: 'singleTap' } =>
+            isCoverButtonValue(g.button) && g.tapType === 'singleTap'
+        )
 
         return {
           device: device ?? {
@@ -651,6 +663,7 @@ export const settingsRouter = router({
    *
    * Uses discriminated union validation to ensure:
    * - actionType='temperature' requires temperatureChange + temperatureAmount
+   * - actionType='power' requires/normalizes powerBehavior
    * - actionType='alarm' requires alarmBehavior (+ optional snooze/inactive fields)
    */
   setGesture: publicProcedure
@@ -659,6 +672,7 @@ export const settingsRouter = router({
         z
           .object({
             side: sideSchema,
+            button: gestureButtonSchema.optional().default('surface'),
             tapType: tapTypeSchema,
             actionType: z.literal('temperature'),
             temperatureChange: z.enum(['increment', 'decrement']),
@@ -668,6 +682,16 @@ export const settingsRouter = router({
         z
           .object({
             side: sideSchema,
+            button: gestureButtonSchema.optional().default('surface'),
+            tapType: tapTypeSchema,
+            actionType: z.literal('power'),
+            powerBehavior: z.enum(['toggle', 'on', 'off']).default('toggle'),
+          })
+          .strict(),
+        z
+          .object({
+            side: sideSchema,
+            button: gestureButtonSchema.optional().default('surface'),
             tapType: tapTypeSchema,
             actionType: z.literal('alarm'),
             alarmBehavior: z.enum(['snooze', 'dismiss']),
@@ -677,9 +701,23 @@ export const settingsRouter = router({
           .strict(),
       ])
     )
+    .output(tapGestureSchema)
     .mutation(async ({ input }) => {
       try {
         const result = db.transaction((tx) => {
+          const values = {
+            side: input.side,
+            button: input.button,
+            tapType: input.tapType,
+            actionType: input.actionType,
+            temperatureChange: input.actionType === 'temperature' ? input.temperatureChange : null,
+            temperatureAmount: input.actionType === 'temperature' ? input.temperatureAmount : null,
+            powerBehavior: input.actionType === 'power' ? input.powerBehavior : null,
+            alarmBehavior: input.actionType === 'alarm' ? input.alarmBehavior : null,
+            alarmSnoozeDuration: input.actionType === 'alarm' ? input.alarmSnoozeDuration ?? null : null,
+            alarmInactiveBehavior: input.actionType === 'alarm' ? input.alarmInactiveBehavior ?? null : null,
+          }
+
           // Check if gesture already exists
           const existing = tx
             .select()
@@ -687,6 +725,7 @@ export const settingsRouter = router({
             .where(
               and(
                 eq(tapGestures.side, input.side),
+                eq(tapGestures.button, input.button),
                 eq(tapGestures.tapType, input.tapType)
               )
             )
@@ -698,7 +737,7 @@ export const settingsRouter = router({
             const [updated] = tx
               .update(tapGestures)
               .set({
-                ...input,
+                ...values,
                 updatedAt: new Date(),
               })
               .where(eq(tapGestures.id, existing[0].id))
@@ -718,9 +757,7 @@ export const settingsRouter = router({
             // Create new
             const [created] = tx
               .insert(tapGestures)
-              .values({
-                ...input,
-              })
+              .values(values)
               .returning()
               .all()
 
@@ -749,7 +786,8 @@ export const settingsRouter = router({
     }),
 
   /**
-   * Create or update physical Pod 5 TTC cover-button action.
+   * Deprecated compatibility endpoint: physical Pod 5 cover-button actions are
+   * now single-tap gestures assigned to a button.
    */
   setCoverButtonAction: publicProcedure
     .input(
@@ -789,11 +827,12 @@ export const settingsRouter = router({
         const result = db.transaction((tx) => {
           const existing = tx
             .select()
-            .from(coverButtonActions)
+            .from(tapGestures)
             .where(
               and(
-                eq(coverButtonActions.side, input.side),
-                eq(coverButtonActions.button, input.button)
+                eq(tapGestures.side, input.side),
+                eq(tapGestures.button, input.button),
+                eq(tapGestures.tapType, 'singleTap')
               )
             )
             .limit(1)
@@ -802,6 +841,7 @@ export const settingsRouter = router({
           const values = {
             side: input.side,
             button: input.button,
+            tapType: 'singleTap' as const,
             actionType: input.actionType,
             temperatureChange: input.actionType === 'temperature' ? input.temperatureChange : null,
             temperatureAmount: input.actionType === 'temperature' ? input.temperatureAmount : null,
@@ -813,12 +853,12 @@ export const settingsRouter = router({
 
           if (existing.length > 0) {
             const [updated] = tx
-              .update(coverButtonActions)
+              .update(tapGestures)
               .set({
                 ...values,
                 updatedAt: new Date(),
               })
-              .where(eq(coverButtonActions.id, existing[0].id))
+              .where(eq(tapGestures.id, existing[0].id))
               .returning()
               .all()
 
@@ -833,7 +873,7 @@ export const settingsRouter = router({
           }
 
           const [created] = tx
-            .insert(coverButtonActions)
+            .insert(tapGestures)
             .values(values)
             .returning()
             .all()
@@ -848,7 +888,7 @@ export const settingsRouter = router({
           return created
         })
 
-        return result
+        return { ...result, button: input.button }
       }
       catch (error) {
         if (error instanceof TRPCError) throw error
@@ -870,6 +910,7 @@ export const settingsRouter = router({
       z
         .object({
           side: sideSchema,
+          button: gestureButtonSchema.optional().default('surface'),
           tapType: tapTypeSchema,
         })
         .strict()
@@ -883,6 +924,7 @@ export const settingsRouter = router({
             .where(
               and(
                 eq(tapGestures.side, input.side),
+                eq(tapGestures.button, input.button),
                 eq(tapGestures.tapType, input.tapType)
               )
             )
@@ -892,7 +934,7 @@ export const settingsRouter = router({
           if (!deleted) {
             throw new TRPCError({
               code: 'NOT_FOUND',
-              message: `Gesture for ${input.side} ${input.tapType} not found`,
+              message: `Gesture for ${input.side} ${input.button} ${input.tapType} not found`,
             })
           }
         })

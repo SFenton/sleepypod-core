@@ -79,12 +79,18 @@ export const temperatureUnitSchema = z.enum(['F', 'C'])
 /**
  * Tap type enum
  */
-export const tapTypeSchema = z.enum(['doubleTap', 'tripleTap', 'quadTap'])
+export const tapTypeSchema = z.enum(['singleTap', 'doubleTap', 'tripleTap', 'quadTap'])
 
 /**
  * Physical Pod 5 TTC cover button enum.
  */
 export const coverButtonSchema = z.enum(['top', 'middle', 'bottom'])
+
+/**
+ * Gesture trigger target. `surface` preserves existing bed-tap gestures; the
+ * physical cover buttons use top/middle/bottom.
+ */
+export const gestureButtonSchema = z.enum(['surface', 'top', 'middle', 'bottom'])
 
 /**
  * ISO 8601 datetime string validation

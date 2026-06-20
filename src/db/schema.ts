@@ -100,10 +100,13 @@ export const sideSettings = sqliteTable('side_settings', {
 export const tapGestures = sqliteTable('tap_gestures', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   side: text('side', { enum: ['left', 'right'] }).notNull(),
+  button: text('button', { enum: ['surface', 'top', 'middle', 'bottom'] })
+    .notNull()
+    .default('surface'),
   tapType: text('tap_type', {
-    enum: ['doubleTap', 'tripleTap', 'quadTap'],
+    enum: ['singleTap', 'doubleTap', 'tripleTap', 'quadTap'],
   }).notNull(),
-  actionType: text('action_type', { enum: ['temperature', 'alarm'] }).notNull(),
+  actionType: text('action_type', { enum: ['temperature', 'alarm', 'power'] }).notNull(),
   // For temperature actions
   temperatureChange: text('temperature_change', {
     enum: ['increment', 'decrement'],
@@ -115,6 +118,8 @@ export const tapGestures = sqliteTable('tap_gestures', {
   alarmInactiveBehavior: text('alarm_inactive_behavior', {
     enum: ['power', 'none'],
   }),
+  // For power actions
+  powerBehavior: text('power_behavior', { enum: ['toggle', 'on', 'off'] }),
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`),
@@ -122,7 +127,7 @@ export const tapGestures = sqliteTable('tap_gestures', {
     .notNull()
     .default(sql`(unixepoch())`),
 }, t => [
-  uniqueIndex('uq_tap_side_type').on(t.side, t.tapType),
+  uniqueIndex('uq_tap_side_button_type').on(t.side, t.button, t.tapType),
 ])
 
 export const coverButtonActions = sqliteTable('cover_button_actions', {
