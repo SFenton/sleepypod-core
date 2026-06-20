@@ -289,7 +289,7 @@ function findLatestRaw(dir: string): string | null {
 const ALL_SENSOR_TYPES = [
   'piezo-dual', 'capSense', 'capSense2',
   'bedTemp', 'bedTemp2', 'frzTemp', 'frzTherm', 'frzHealth', 'log',
-  'deviceStatus', 'gesture',
+  'deviceStatus', 'gesture', 'buttonEvent',
 ] as const
 
 /** Valid sensor type string. Used for subscription filtering. */
@@ -754,8 +754,8 @@ export function startPiezoStreamServer(): WebSocketServer {
               }
             }
 
-            // Notify server-side listeners (only frzHealth currently has consumers)
-            if (frameType === 'frzHealth' && serverFrameListeners.size > 0) {
+            // Notify server-side listeners for every decoded frame.
+            if (serverFrameListeners.size > 0) {
               for (const cb of serverFrameListeners) {
                 try {
                   cb(frame as Record<string, unknown>)

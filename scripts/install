@@ -743,7 +743,8 @@ fi
 # vendor image.
 SUDOERS_FILE="/etc/sudoers.d/sleepypod-update"
 SUDOERS_CONTENT='Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-sleepypod ALL=(root) NOPASSWD: /usr/local/bin/sp-update'
+sleepypod ALL=(root) NOPASSWD: /usr/local/bin/sp-update
+sleepypod ALL=(root) NOPASSWD: /usr/local/bin/sp-iptables-save'
 SUDOERS_TMP=$(mktemp)
 printf '%s\n' "$SUDOERS_CONTENT" > "$SUDOERS_TMP"
 chmod 0440 "$SUDOERS_TMP"
@@ -1175,6 +1176,15 @@ if [ ! -f "$INSTALL_DIR/node_modules/better-sqlite3/build/Release/better_sqlite3
   cd "$INSTALL_DIR"
 fi
 
+ensure_standalone_node_modules() {
+  if [ ! -f "$INSTALL_DIR/.next/standalone/server.js" ]; then
+    return 0
+  fi
+
+  rm -rf "$INSTALL_DIR/.next/standalone/node_modules"
+  ln -s ../../node_modules "$INSTALL_DIR/.next/standalone/node_modules"
+}
+
 # Build application (skip if .next already exists — pre-built by deploy script or CI)
 # Effective branch: --branch flag, download branch, or script default
 EFFECTIVE_BRANCH="${INSTALL_BRANCH:-${DOWNLOAD_BRANCH:-$SCRIPT_DEFAULT_BRANCH}}"
@@ -1188,6 +1198,7 @@ else
   CI=true pnpm install --frozen-lockfile
   SP_BRANCH="$EFFECTIVE_BRANCH" pnpm build
 fi
+ensure_standalone_node_modules
 
 # Create or preserve environment file
 if [ -f "$INSTALL_DIR/.env" ]; then
@@ -1265,6 +1276,47 @@ echo "Creating systemd service..."
 # namespace setup (ProtectSystem=strict makes /etc read-only by default;
 # the runtime's checkAndRepairIptables() writes /etc/iptables/rules.v4).
 mkdir -p /etc/iptables
+if id sleepypod &>/dev/null; then
+  touch /etc/iptables/rules.v4 /etc/iptables/rules.v6
+  chown root:sleepypod /etc/iptables /etc/iptables/rules.v4 /etc/iptables/rules.v6
+  chmod 2775 /etc/iptables
+  chmod 0664 /etc/iptables/rules.v4 /etc/iptables/rules.v6
+fi
+
+cat > /usr/local/bin/sp-iptables-save << 'SP_IPTABLES_SAVE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+IPTABLES_SAVE="${IPTABLES_SAVE:-}"
+if [ -z "$IPTABLES_SAVE" ]; then
+  if command -v iptables-save >/dev/null 2>&1; then
+    IPTABLES_SAVE="$(command -v iptables-save)"
+  elif [ -x /usr/sbin/iptables-save ]; then
+    IPTABLES_SAVE="/usr/sbin/iptables-save"
+  elif [ -x /sbin/iptables-save ]; then
+    IPTABLES_SAVE="/sbin/iptables-save"
+  else
+    echo "iptables-save not found" >&2
+    exit 127
+  fi
+fi
+
+mkdir -p /etc/iptables
+tmp="$(mktemp /etc/iptables/rules.v4.XXXXXX)"
+trap 'rm -f "$tmp"' EXIT
+"$IPTABLES_SAVE" > "$tmp"
+if getent group sleepypod >/dev/null 2>&1; then
+  chown root:sleepypod "$tmp"
+  chmod 0664 "$tmp"
+else
+  chown root:root "$tmp"
+  chmod 0644 "$tmp"
+fi
+mv "$tmp" /etc/iptables/rules.v4
+trap - EXIT
+SP_IPTABLES_SAVE
+chown root:root /usr/local/bin/sp-iptables-save
+chmod 0755 /usr/local/bin/sp-iptables-save
 
 # Only emit SupplementaryGroups=dac when the dac group exists — otherwise
 # systemd refuses to start the unit with "Failed to determine supplementary

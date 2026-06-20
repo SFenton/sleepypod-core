@@ -125,6 +125,34 @@ export const tapGestures = sqliteTable('tap_gestures', {
   uniqueIndex('uq_tap_side_type').on(t.side, t.tapType),
 ])
 
+export const coverButtonActions = sqliteTable('cover_button_actions', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  side: text('side', { enum: ['left', 'right'] }).notNull(),
+  button: text('button', { enum: ['top', 'middle', 'bottom'] }).notNull(),
+  actionType: text('action_type', { enum: ['temperature', 'alarm', 'power'] }).notNull(),
+  // For temperature actions
+  temperatureChange: text('temperature_change', {
+    enum: ['increment', 'decrement'],
+  }),
+  temperatureAmount: integer('temperature_amount'), // 0-10
+  // For power actions
+  powerBehavior: text('power_behavior', { enum: ['toggle', 'on', 'off'] }),
+  // For alarm actions
+  alarmBehavior: text('alarm_behavior', { enum: ['snooze', 'dismiss'] }),
+  alarmSnoozeDuration: integer('alarm_snooze_duration'), // 60-600 seconds
+  alarmInactiveBehavior: text('alarm_inactive_behavior', {
+    enum: ['power', 'none'],
+  }),
+  createdAt: integer('created_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, t => [
+  uniqueIndex('uq_cover_button_side_button').on(t.side, t.button),
+])
+
 // ============================================================================
 // Schedules
 // ============================================================================

@@ -20,6 +20,23 @@ describe('migrations smoke test', () => {
         'SELECT name FROM sqlite_master WHERE type = \'index\' AND name = \'uq_tap_side_type\'',
       ).get() as { name?: string } | undefined
       expect(idx?.name).toBe('uq_tap_side_type')
+
+      const buttonIdx = raw.prepare(
+        'SELECT name FROM sqlite_master WHERE type = \'index\' AND name = \'uq_cover_button_side_button\'',
+      ).get() as { name?: string } | undefined
+      expect(buttonIdx?.name).toBe('uq_cover_button_side_button')
+
+      const coverRows = raw.prepare(
+        'SELECT side, button, action_type, temperature_change, temperature_amount, power_behavior FROM cover_button_actions ORDER BY side, button',
+      ).all()
+      expect(coverRows).toEqual([
+        { side: 'left', button: 'bottom', action_type: 'temperature', temperature_change: 'decrement', temperature_amount: 1, power_behavior: null },
+        { side: 'left', button: 'middle', action_type: 'power', temperature_change: null, temperature_amount: null, power_behavior: 'toggle' },
+        { side: 'left', button: 'top', action_type: 'temperature', temperature_change: 'increment', temperature_amount: 1, power_behavior: null },
+        { side: 'right', button: 'bottom', action_type: 'temperature', temperature_change: 'decrement', temperature_amount: 1, power_behavior: null },
+        { side: 'right', button: 'middle', action_type: 'power', temperature_change: null, temperature_amount: null, power_behavior: 'toggle' },
+        { side: 'right', button: 'top', action_type: 'temperature', temperature_change: 'increment', temperature_amount: 1, power_behavior: null },
+      ])
     }
     finally {
       raw.close()
