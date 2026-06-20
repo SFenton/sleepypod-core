@@ -63,6 +63,7 @@ const schedulesCollectionOutput = z.object({
 })
 import { getJobManager } from '@/src/scheduler'
 import { toC } from '@/src/lib/tempUtils'
+import { notifyMqttStateChanged } from '@/src/streaming/mqttEvents'
 
 type TemperatureRow = typeof temperatureSchedules.$inferSelect
 type PowerRow = typeof powerSchedules.$inferSelect
@@ -182,6 +183,7 @@ export const schedulesRouter = router({
         })
 
         await applyScheduler(jm => jm.upsertTemperatureJob(created))
+        notifyMqttStateChanged('schedules')
 
         return created
       }
@@ -234,6 +236,7 @@ export const schedulesRouter = router({
         })
 
         await applyScheduler(jm => jm.upsertTemperatureJob(updated))
+        notifyMqttStateChanged('schedules')
 
         return updated
       }
@@ -278,6 +281,7 @@ export const schedulesRouter = router({
         })
 
         await applyScheduler(jm => jm.cancelTemperatureJob(input.id))
+        notifyMqttStateChanged('schedules')
 
         return { success: true }
       }
@@ -325,6 +329,7 @@ export const schedulesRouter = router({
         })
 
         await applyScheduler(jm => jm.upsertPowerJob(created))
+        notifyMqttStateChanged('schedules')
 
         return created
       }
@@ -378,6 +383,7 @@ export const schedulesRouter = router({
         })
 
         await applyScheduler(jm => jm.upsertPowerJob(updated))
+        notifyMqttStateChanged('schedules')
 
         return updated
       }
@@ -422,6 +428,7 @@ export const schedulesRouter = router({
         })
 
         await applyScheduler(jm => jm.cancelPowerJob(input.id))
+        notifyMqttStateChanged('schedules')
 
         return { success: true }
       }
@@ -471,6 +478,7 @@ export const schedulesRouter = router({
         })
 
         await applyScheduler(jm => jm.upsertAlarmJob(created))
+        notifyMqttStateChanged('schedules')
 
         return created
       }
@@ -526,6 +534,7 @@ export const schedulesRouter = router({
         })
 
         await applyScheduler(jm => jm.upsertAlarmJob(updated))
+        notifyMqttStateChanged('schedules')
 
         return updated
       }
@@ -570,6 +579,7 @@ export const schedulesRouter = router({
         })
 
         await applyScheduler(jm => jm.cancelAlarmJob(input.id))
+        notifyMqttStateChanged('schedules')
 
         return { success: true }
       }
@@ -716,6 +726,7 @@ export const schedulesRouter = router({
           for (const row of upsertPower) jm.upsertPowerJob(row)
           for (const row of upsertAlarm) jm.upsertAlarmJob(row)
         })
+        notifyMqttStateChanged('schedules')
 
         return { success: true }
       }

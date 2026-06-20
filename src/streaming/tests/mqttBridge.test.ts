@@ -730,9 +730,9 @@ describe('mqttBridge — startMqttBridge connect flow', () => {
       expect.any(Function),
     )
 
-    // Subscription is to <prefix>/<deviceId>/cmd/+
+    // Subscription is to <prefix>/<deviceId>/cmd/# because schedule controls use nested command topics.
     expect(fake.subscribe).toHaveBeenCalledWith(
-      expect.stringMatching(/cmd\/\+$/),
+      expect.stringMatching(/cmd\/#$/),
       { qos: 0 },
       expect.any(Function),
     )
@@ -763,7 +763,7 @@ describe('mqttBridge — startMqttBridge connect flow', () => {
     fake.emit('connect')
 
     expect(fake.subscribe).toHaveBeenCalledWith(
-      expect.stringMatching(/^custom-prefix\/.+\/cmd\/\+$/),
+      expect.stringMatching(/^custom-prefix\/.+\/cmd\/#$/),
       { qos: 0 },
       expect.any(Function),
     )
@@ -1746,6 +1746,85 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
     }
   }
 
+  function numberCfg(o: {
+    name: string
+    unique_id: string
+    state_topic: string
+    value_template: string
+    command_topic: string
+    min: number
+    max: number
+    step: number
+    unit?: string
+  }) {
+    const cfg: Record<string, unknown> = {
+      name: o.name,
+      unique_id: o.unique_id,
+      availability_topic: AVAIL,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: o.state_topic,
+      value_template: o.value_template,
+      command_topic: o.command_topic,
+      min: o.min,
+      max: o.max,
+      step: o.step,
+      mode: 'slider',
+      device: DEVICE,
+    }
+    if (o.unit) cfg.unit_of_measurement = o.unit
+    return cfg
+  }
+
+  function switchCfg(o: { name: string, unique_id: string, state_topic: string, value_template: string, command_topic: string }) {
+    return {
+      name: o.name,
+      unique_id: o.unique_id,
+      availability_topic: AVAIL,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: o.state_topic,
+      value_template: o.value_template,
+      command_topic: o.command_topic,
+      payload_on: 'ON',
+      payload_off: 'OFF',
+      state_on: 'ON',
+      state_off: 'OFF',
+      device: DEVICE,
+    }
+  }
+
+  function textCfg(o: { name: string, unique_id: string, state_topic: string, value_template: string, command_topic: string }) {
+    return {
+      name: o.name,
+      unique_id: o.unique_id,
+      availability_topic: AVAIL,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: o.state_topic,
+      value_template: o.value_template,
+      command_topic: o.command_topic,
+      pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$',
+      mode: 'text',
+      device: DEVICE,
+    }
+  }
+
+  function timestampSensorCfg(o: { name: string, unique_id: string, state_topic: string, value_template: string }) {
+    return {
+      name: o.name,
+      unique_id: o.unique_id,
+      availability_topic: AVAIL,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: o.state_topic,
+      value_template: o.value_template,
+      json_attributes_topic: o.state_topic,
+      device_class: 'timestamp',
+      device: DEVICE,
+    }
+  }
+
   function climateCfg(side: 'left' | 'right') {
     const Side = side === 'left' ? 'Left' : 'Right'
     const climateTopic = `sleepypod/${ID}/state/${side}/climate`
@@ -1794,6 +1873,17 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
         unique_id: `${ID}_water_level`,
         state_topic: `sleepypod/${ID}/state/water-level`,
         value_template: '{{ value_json.level }}',
+      }),
+      [`homeassistant/number/${ID}/led_brightness/config`]: numberCfg({
+        name: 'LED brightness',
+        unique_id: `${ID}_led_brightness`,
+        state_topic: `sleepypod/${ID}/state/settings`,
+        value_template: '{{ value_json.currentLedBrightness }}',
+        command_topic: `sleepypod/${ID}/cmd/led-brightness`,
+        min: 0,
+        max: 100,
+        step: 1,
+        unit: '%',
       }),
       [`homeassistant/sensor/${ID}/ambient_temperature/config`]: sensorCfg({
         name: 'Ambient temperature',
@@ -1861,6 +1951,54 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
         value_template: '{{ value_json.hrv }}',
         unit: 'ms',
       })
+      expected[`homeassistant/switch/${ID}/${side}_away_mode/config`] = switchCfg({
+        name: `${Side} away mode`,
+        unique_id: `${ID}_${side}_away_mode`,
+        state_topic: `sleepypod/${ID}/state/${side}/settings`,
+        value_template: '{{ "ON" if value_json.awayMode else "OFF" }}',
+        command_topic: `sleepypod/${ID}/cmd/${side}/away-mode`,
+      })
+      expected[`homeassistant/switch/${ID}/${side}_alarms_enabled/config`] = switchCfg({
+        name: `${Side} alarms enabled`,
+        unique_id: `${ID}_${side}_alarms_enabled`,
+        state_topic: `sleepypod/${ID}/state/${side}/schedule`,
+        value_template: '{{ "ON" if value_json.alarmsEnabled else "OFF" }}',
+        command_topic: `sleepypod/${ID}/cmd/${side}/alarms-enabled`,
+      })
+      expected[`homeassistant/text/${ID}/${side}_bedtime/config`] = textCfg({
+        name: `${Side} bedtime`,
+        unique_id: `${ID}_${side}_bedtime`,
+        state_topic: `sleepypod/${ID}/state/${side}/schedule`,
+        value_template: '{{ value_json.bedtime if value_json.bedtime else "" }}',
+        command_topic: `sleepypod/${ID}/cmd/${side}/schedule/bedtime`,
+      })
+      for (const stage of ['bedtime', 'asleep', 'dawn'] as const) {
+        expected[`homeassistant/number/${ID}/${side}_${stage}_temperature/config`] = numberCfg({
+          name: `${Side} ${stage[0].toUpperCase()}${stage.slice(1)} temperature`,
+          unique_id: `${ID}_${side}_${stage}_temperature`,
+          state_topic: `sleepypod/${ID}/state/${side}/schedule`,
+          value_template: `{{ value_json.stageTemperatures.${stage} }}`,
+          command_topic: `sleepypod/${ID}/cmd/${side}/schedule/${stage}-temperature`,
+          min: 55,
+          max: 110,
+          step: 1,
+          unit: '°F',
+        })
+      }
+      const summaryNames = {
+        nextPowerOn: 'Next power on',
+        nextPowerOff: 'Next power off',
+        nextAlarm: 'Next alarm',
+        nextTemperatureAdjustment: 'Next temperature adjustment',
+      }
+      for (const [key, name] of Object.entries(summaryNames)) {
+        expected[`homeassistant/sensor/${ID}/${side}_${key}/config`] = timestampSensorCfg({
+          name: `${Side} ${name}`,
+          unique_id: `${ID}_${side}_${key}`,
+          state_topic: `sleepypod/${ID}/state/${side}/schedule/summary`,
+          value_template: `{{ value_json.${key}.timestamp if value_json.${key} else '' }}`,
+        })
+      }
     }
 
     expect(got).toEqual(expected)
@@ -2060,7 +2198,7 @@ describe('mqttBridge — connect-option + lifecycle mutation coverage', () => {
     fake.connected = true
     fake.emit('connect')
 
-    expect(warn).toHaveBeenCalledWith('[mqtt] subscribe cmd/* failed:', 'sub failed')
+    expect(warn).toHaveBeenCalledWith('[mqtt] subscribe cmd/# failed:', 'sub failed')
     warn.mockRestore()
     await shutdownMqttBridge()
   })

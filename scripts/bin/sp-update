@@ -16,6 +16,7 @@ export PATH="/usr/local/bin:$PATH"
 # No git required — uses GitHub's tarball API.
 
 INSTALL_DIR="/home/dac/sleepypod-core"
+UPDATE_REPO_FILE="/etc/sleepypod/update-repo"
 # DATA_DIR pointer is written by scripts/install (storage-aware picker).
 # Legacy fallback keeps installs without the pointer file working.
 if [ -r /etc/sleepypod/data-dir ] && [ -s /etc/sleepypod/data-dir ]; then
@@ -23,7 +24,14 @@ if [ -r /etc/sleepypod/data-dir ] && [ -s /etc/sleepypod/data-dir ]; then
 else
   DATA_DIR="/persistent/sleepypod-data"
 fi
-GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-sleepypod/core}"
+DEFAULT_GITHUB_REPO="SFenton/sleepypod-core"
+if [ -n "${SLEEPYPOD_GITHUB_REPO:-}" ]; then
+  GITHUB_REPO="$SLEEPYPOD_GITHUB_REPO"
+elif [ -r "$UPDATE_REPO_FILE" ] && [ -s "$UPDATE_REPO_FILE" ]; then
+  GITHUB_REPO="$(head -n 1 "$UPDATE_REPO_FILE")"
+else
+  GITHUB_REPO="$DEFAULT_GITHUB_REPO"
+fi
 BRANCH="${1:-main}"
 
 echo "=== SleepyPod Update ==="

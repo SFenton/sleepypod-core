@@ -82,6 +82,11 @@ export const temperatureUnitSchema = z.enum(['F', 'C'])
 export const tapTypeSchema = z.enum(['doubleTap', 'tripleTap', 'quadTap'])
 
 /**
+ * Physical TTC cover button enum.
+ */
+export const coverButtonSchema = z.enum(['top', 'middle', 'bottom'])
+
+/**
  * ISO 8601 datetime string validation
  */
 export const isoDatetimeSchema = z

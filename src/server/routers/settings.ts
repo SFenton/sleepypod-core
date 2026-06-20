@@ -2,11 +2,12 @@ import { z } from 'zod'
 import { TRPCError } from '@trpc/server'
 import { publicProcedure, router } from '@/src/server/trpc'
 import { db } from '@/src/db'
-import { deviceSettings, sideSettings, tapGestures } from '@/src/db/schema'
+import { coverButtonActions, deviceSettings, sideSettings, tapGestures } from '@/src/db/schema'
 import { eq, and } from 'drizzle-orm'
 import {
   isoDatetimeSchema,
   sideSchema,
+  coverButtonSchema,
   tapTypeSchema,
   temperatureUnitSchema,
   timeStringSchema,
@@ -66,6 +67,21 @@ const tapGestureSchema = z.object({
   updatedAt: timestampSchema,
 })
 
+const coverButtonActionSchema = z.object({
+  id: z.number(),
+  side: sideSchema,
+  button: coverButtonSchema,
+  actionType: z.enum(['temperature', 'alarm', 'power']),
+  temperatureChange: z.enum(['increment', 'decrement']).nullable().optional(),
+  temperatureAmount: z.number().nullable().optional(),
+  powerBehavior: z.enum(['toggle', 'on', 'off']).nullable().optional(),
+  alarmBehavior: z.enum(['snooze', 'dismiss']).nullable().optional(),
+  alarmSnoozeDuration: z.number().nullable().optional(),
+  alarmInactiveBehavior: z.enum(['power', 'none']).nullable().optional(),
+  createdAt: timestampSchema,
+  updatedAt: timestampSchema,
+})
+
 const getAllSettingsResponse = z.object({
   device: deviceSettingsSchema,
   sides: z.object({
@@ -76,11 +92,16 @@ const getAllSettingsResponse = z.object({
     left: z.array(tapGestureSchema),
     right: z.array(tapGestureSchema),
   }),
+  coverButtons: z.object({
+    left: z.array(coverButtonActionSchema),
+    right: z.array(coverButtonActionSchema),
+  }),
 })
 import { getJobManager } from '@/src/scheduler'
 import { startKeepalive, stopKeepalive } from '@/src/services/temperatureKeepalive'
 import { restartAutoOffTimers } from '@/src/services/autoOffWatcher'
 import { invalidateGuardSettingsCache } from '@/src/hardware/pumpStallGuard'
+import { notifyMqttStateChanged } from '@/src/streaming/mqttEvents'
 
 const REBOOT_KEYS = ['rebootDaily', 'rebootTime'] as const
 const PRIME_KEYS = ['primePodDaily', 'primePodTime'] as const
@@ -157,6 +178,7 @@ export const settingsRouter = router({
         const [device] = await db.select().from(deviceSettings).limit(1)
         const sides = await db.select().from(sideSettings)
         const gestures = await db.select().from(tapGestures)
+        const coverButtons = await db.select().from(coverButtonActions)
 
         return {
           device: device ?? {
@@ -190,6 +212,10 @@ export const settingsRouter = router({
           gestures: {
             left: gestures.filter(g => g.side === 'left'),
             right: gestures.filter(g => g.side === 'right'),
+          },
+          coverButtons: {
+            left: coverButtons.filter(g => g.side === 'left'),
+            right: coverButtons.filter(g => g.side === 'right'),
           },
         }
       }
@@ -400,6 +426,7 @@ export const settingsRouter = router({
           }
         }
 
+        notifyMqttStateChanged('settings')
         return updated
       }
       catch (error) {
@@ -541,6 +568,7 @@ export const settingsRouter = router({
           }
         }
 
+        notifyMqttStateChanged('settings')
         return updated
       }
       catch (error) {
@@ -608,6 +636,7 @@ export const settingsRouter = router({
           stopKeepalive(input.side)
         }
 
+        notifyMqttStateChanged('settings')
         return updated
       }
       catch (error) {
@@ -718,6 +747,174 @@ export const settingsRouter = router({
         throw new TRPCError({
           code: 'INTERNAL_SERVER_ERROR',
           message: `Failed to set gesture: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          cause: error,
+        })
+      }
+    }),
+
+  /**
+   * Create or update physical TTC cover-button action.
+   */
+  setCoverButtonAction: publicProcedure
+    .input(
+      z.discriminatedUnion('actionType', [
+        z
+          .object({
+            side: sideSchema,
+            button: coverButtonSchema,
+            actionType: z.literal('temperature'),
+            temperatureChange: z.enum(['increment', 'decrement']),
+            temperatureAmount: z.number().int().min(0).max(10),
+          })
+          .strict(),
+        z
+          .object({
+            side: sideSchema,
+            button: coverButtonSchema,
+            actionType: z.literal('power'),
+            powerBehavior: z.enum(['toggle', 'on', 'off']).default('toggle'),
+          })
+          .strict(),
+        z
+          .object({
+            side: sideSchema,
+            button: coverButtonSchema,
+            actionType: z.literal('alarm'),
+            alarmBehavior: z.enum(['snooze', 'dismiss']),
+            alarmSnoozeDuration: z.number().int().min(60).max(600).optional(),
+            alarmInactiveBehavior: z.enum(['power', 'none']).optional(),
+          })
+          .strict(),
+      ])
+    )
+    .output(coverButtonActionSchema)
+    .mutation(async ({ input }) => {
+      try {
+        const result = db.transaction((tx) => {
+          const existing = tx
+            .select()
+            .from(coverButtonActions)
+            .where(
+              and(
+                eq(coverButtonActions.side, input.side),
+                eq(coverButtonActions.button, input.button)
+              )
+            )
+            .limit(1)
+            .all()
+
+          if (existing.length > 0) {
+            const [updated] = tx
+              .update(coverButtonActions)
+              .set({
+                actionType: input.actionType,
+                temperatureChange: input.actionType === 'temperature' ? input.temperatureChange : null,
+                temperatureAmount: input.actionType === 'temperature' ? input.temperatureAmount : null,
+                powerBehavior: input.actionType === 'power' ? input.powerBehavior : null,
+                alarmBehavior: input.actionType === 'alarm' ? input.alarmBehavior : null,
+                alarmSnoozeDuration: input.actionType === 'alarm' ? input.alarmSnoozeDuration ?? null : null,
+                alarmInactiveBehavior: input.actionType === 'alarm' ? input.alarmInactiveBehavior ?? null : null,
+                updatedAt: new Date(),
+              })
+              .where(eq(coverButtonActions.id, existing[0].id))
+              .returning()
+              .all()
+
+            if (!updated) {
+              throw new TRPCError({
+                code: 'INTERNAL_SERVER_ERROR',
+                message: 'Failed to update cover button action - no record returned',
+              })
+            }
+
+            return updated
+          }
+
+          const [created] = tx
+            .insert(coverButtonActions)
+            .values({
+              side: input.side,
+              button: input.button,
+              actionType: input.actionType,
+              temperatureChange: input.actionType === 'temperature' ? input.temperatureChange : null,
+              temperatureAmount: input.actionType === 'temperature' ? input.temperatureAmount : null,
+              powerBehavior: input.actionType === 'power' ? input.powerBehavior : null,
+              alarmBehavior: input.actionType === 'alarm' ? input.alarmBehavior : null,
+              alarmSnoozeDuration: input.actionType === 'alarm' ? input.alarmSnoozeDuration ?? null : null,
+              alarmInactiveBehavior: input.actionType === 'alarm' ? input.alarmInactiveBehavior ?? null : null,
+            })
+            .returning()
+            .all()
+
+          if (!created) {
+            throw new TRPCError({
+              code: 'INTERNAL_SERVER_ERROR',
+              message: 'Failed to create cover button action - no record returned',
+            })
+          }
+
+          return created
+        })
+
+        notifyMqttStateChanged('settings')
+        return result
+      }
+      catch (error) {
+        if (error instanceof TRPCError) throw error
+
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: `Failed to set cover button action: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          cause: error,
+        })
+      }
+    }),
+
+  /**
+   * Delete physical TTC cover-button action.
+   */
+  deleteCoverButtonAction: publicProcedure
+    .meta({ openapi: { method: 'DELETE', path: '/settings/cover-button', protect: false, tags: ['Settings'] } })
+    .input(
+      z
+        .object({
+          side: sideSchema,
+          button: coverButtonSchema,
+        })
+        .strict()
+    )
+    .output(z.object({ success: z.boolean() }))
+    .mutation(async ({ input }) => {
+      try {
+        db.transaction((tx) => {
+          const [deleted] = tx
+            .delete(coverButtonActions)
+            .where(
+              and(
+                eq(coverButtonActions.side, input.side),
+                eq(coverButtonActions.button, input.button)
+              )
+            )
+            .returning()
+            .all()
+
+          if (!deleted) {
+            throw new TRPCError({
+              code: 'NOT_FOUND',
+              message: `Cover button action for ${input.side} ${input.button} not found`,
+            })
+          }
+        })
+
+        notifyMqttStateChanged('settings')
+        return { success: true }
+      }
+      catch (error) {
+        if (error instanceof TRPCError) throw error
+
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: `Failed to delete cover button action: ${error instanceof Error ? error.message : 'Unknown error'}`,
           cause: error,
         })
       }

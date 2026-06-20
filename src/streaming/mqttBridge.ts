@@ -44,6 +44,19 @@ import { getPumpStallNotice } from '@/src/hardware/pumpStallNotification'
 import { centiDegreesToC, centiPercentToPercent } from '@/src/lib/tempUtils'
 import { onServerFrame } from './piezoStream'
 import { getDacMonitorIfRunning } from '@/src/hardware/dacMonitor.instance'
+import {
+  buildMqttScheduleState,
+  SCHEDULE_STAGE_KEYS,
+  SCHEDULE_SUMMARY_KEYS,
+  setAlarmsEnabled,
+  setAwayMode,
+  setLedBrightness,
+  setScheduleBedtime,
+  setScheduleStageTemperature,
+  type ScheduleStage,
+  type Side,
+} from '@/src/schedules/mqttScheduleState'
+import { notifyMqttStateChanged, onMqttStateChanged } from '@/src/streaming/mqttEvents'
 
 // ---------------------------------------------------------------------------
 // Configuration resolution
@@ -165,7 +178,9 @@ interface BridgeState {
   runState: BridgeRunState
   lastError: string | null
   publishTimer: ReturnType<typeof setInterval> | null
+  queuedPublishTimer: ReturnType<typeof setTimeout> | null
   unsubscribeFrame: (() => void) | null
+  unsubscribeMqttState: (() => void) | null
   resolved: ResolvedMqttConfig | null
   messagesPublished: number
   lastPublishAt: Date | null
@@ -176,7 +191,9 @@ const state: BridgeState = {
   runState: 'stopped',
   lastError: null,
   publishTimer: null,
+  queuedPublishTimer: null,
   unsubscribeFrame: null,
+  unsubscribeMqttState: null,
   resolved: null,
   messagesPublished: 0,
   lastPublishAt: null,
@@ -299,9 +316,83 @@ function publishHaDiscovery(): void {
       state_class: 'measurement',
       device: dev,
     }
+    if (unit) {
+      cfg.unit_of_measurement = unit
+    }
+    return cfg
+  }
+
+  const number = (
+    objectId: string,
+    name: string,
+    stateTopic: string,
+    template: string,
+    commandTopic: string,
+    min: number,
+    max: number,
+    step: number,
+    unit?: string,
+  ) => {
+    const cfg: Record<string, unknown> = {
+      name,
+      unique_id: `${id}_${objectId}`,
+      availability_topic: availability,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: stateTopic,
+      value_template: template,
+      command_topic: commandTopic,
+      min,
+      max,
+      step,
+      mode: 'slider',
+      device: dev,
+    }
     if (unit) cfg.unit_of_measurement = unit
     return cfg
   }
+
+  const switchEntity = (
+    objectId: string,
+    name: string,
+    stateTopic: string,
+    template: string,
+    commandTopic: string,
+  ) => ({
+    name,
+    unique_id: `${id}_${objectId}`,
+    availability_topic: availability,
+    payload_available: 'online',
+    payload_not_available: 'offline',
+    state_topic: stateTopic,
+    value_template: template,
+    command_topic: commandTopic,
+    payload_on: 'ON',
+    payload_off: 'OFF',
+    state_on: 'ON',
+    state_off: 'OFF',
+    device: dev,
+  })
+
+  const textEntity = (
+    objectId: string,
+    name: string,
+    stateTopic: string,
+    template: string,
+    commandTopic: string,
+  ) => ({
+    name,
+    unique_id: `${id}_${objectId}`,
+    availability_topic: availability,
+    payload_available: 'online',
+    payload_not_available: 'offline',
+    state_topic: stateTopic,
+    value_template: template,
+    command_topic: commandTopic,
+    pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$',
+    mode: 'text',
+    device: dev,
+  })
 
   safePublish(
     `${haPrefix}/climate/${id}/left/config`,
@@ -316,6 +407,22 @@ function publishHaDiscovery(): void {
   safePublish(
     `${haPrefix}/sensor/${id}/water_level/config`,
     JSON.stringify(sensor('water_level', 'Water level', topic('state', 'water-level'), '{{ value_json.level }}')),
+    RETAINED_QOS_0,
+  )
+
+  safePublish(
+    `${haPrefix}/number/${id}/led_brightness/config`,
+    JSON.stringify(number(
+      'led_brightness',
+      'LED brightness',
+      topic('state', 'settings'),
+      '{{ value_json.currentLedBrightness }}',
+      topic('cmd', 'led-brightness'),
+      0,
+      100,
+      1,
+      '%',
+    )),
     RETAINED_QOS_0,
   )
 
@@ -417,6 +524,89 @@ function publishHaDiscovery(): void {
   }
 
   for (const side of ['left', 'right'] as const) {
+    const label = side === 'left' ? 'Left' : 'Right'
+    const scheduleTopic = topic('state', side, 'schedule')
+    const settingsTopic = topic('state', side, 'settings')
+    const summaryTopic = topic('state', side, 'schedule', 'summary')
+
+    safePublish(
+      `${haPrefix}/switch/${id}/${side}_away_mode/config`,
+      JSON.stringify(switchEntity(
+        `${side}_away_mode`,
+        `${label} away mode`,
+        settingsTopic,
+        '{{ "ON" if value_json.awayMode else "OFF" }}',
+        topic('cmd', side, 'away-mode'),
+      )),
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      `${haPrefix}/switch/${id}/${side}_alarms_enabled/config`,
+      JSON.stringify(switchEntity(
+        `${side}_alarms_enabled`,
+        `${label} alarms enabled`,
+        scheduleTopic,
+        '{{ "ON" if value_json.alarmsEnabled else "OFF" }}',
+        topic('cmd', side, 'alarms-enabled'),
+      )),
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      `${haPrefix}/text/${id}/${side}_bedtime/config`,
+      JSON.stringify(textEntity(
+        `${side}_bedtime`,
+        `${label} bedtime`,
+        scheduleTopic,
+        '{{ value_json.bedtime if value_json.bedtime else "" }}',
+        topic('cmd', side, 'schedule', 'bedtime'),
+      )),
+      RETAINED_QOS_0,
+    )
+
+    for (const stage of SCHEDULE_STAGE_KEYS) {
+      const stageLabel = stage[0].toUpperCase() + stage.slice(1)
+      safePublish(
+        `${haPrefix}/number/${id}/${side}_${stage}_temperature/config`,
+        JSON.stringify(number(
+          `${side}_${stage}_temperature`,
+          `${label} ${stageLabel} temperature`,
+          scheduleTopic,
+          `{{ value_json.stageTemperatures.${stage} }}`,
+          topic('cmd', side, 'schedule', `${stage}-temperature`),
+          55,
+          110,
+          1,
+          '°F',
+        )),
+        RETAINED_QOS_0,
+      )
+    }
+
+    const summaryNames: Record<(typeof SCHEDULE_SUMMARY_KEYS)[number], string> = {
+      nextPowerOn: 'Next power on',
+      nextPowerOff: 'Next power off',
+      nextAlarm: 'Next alarm',
+      nextTemperatureAdjustment: 'Next temperature adjustment',
+    }
+    for (const key of SCHEDULE_SUMMARY_KEYS) {
+      safePublish(
+        `${haPrefix}/sensor/${id}/${side}_${key}/config`,
+        JSON.stringify({
+          name: `${label} ${summaryNames[key]}`,
+          unique_id: `${id}_${side}_${key}`,
+          availability_topic: availability,
+          payload_available: 'online',
+          payload_not_available: 'offline',
+          state_topic: summaryTopic,
+          value_template: `{{ value_json.${key}.timestamp if value_json.${key} else '' }}`,
+          json_attributes_topic: summaryTopic,
+          device_class: 'timestamp',
+          device: dev,
+        }),
+        RETAINED_QOS_0,
+      )
+    }
+
     safePublish(
       `${haPrefix}/sensor/${id}/${side}_heart_rate/config`,
       JSON.stringify(sensor(`${side}_heart_rate`, `${side === 'left' ? 'Left' : 'Right'} heart rate`,
@@ -481,6 +671,46 @@ async function publishState(): Promise<void> {
   }
   catch (err) {
     console.warn('[mqtt] device_state publish failed:', err instanceof Error ? err.message : err)
+  }
+
+  try {
+    const scheduleState = await buildMqttScheduleState()
+    const ts = Date.now()
+    safePublish(topic('state', 'settings'), JSON.stringify({
+      ts,
+      timezone: scheduleState.timezone,
+      currentLedBrightness: scheduleState.currentLedBrightness,
+      ledDayBrightness: scheduleState.ledDayBrightness,
+      ledNightBrightness: scheduleState.ledNightBrightness,
+    }), RETAINED_QOS_0)
+    safePublish(topic('state', 'schedules'), JSON.stringify({
+      ts,
+      timezone: scheduleState.timezone,
+      sides: scheduleState.sides,
+    }), RETAINED_QOS_0)
+    for (const side of ['left', 'right'] as const) {
+      const sideState = scheduleState.sides[side]
+      safePublish(topic('state', side, 'settings'), JSON.stringify({
+        ts,
+        side,
+        awayMode: sideState.awayMode,
+      }), RETAINED_QOS_0)
+      safePublish(topic('state', side, 'schedule'), JSON.stringify({
+        ts,
+        side,
+        awayMode: sideState.awayMode,
+        alarmsEnabled: sideState.alarmsEnabled,
+        bedtime: sideState.bedtime,
+        stageTemperatures: sideState.stageTemperatures,
+      }), RETAINED_QOS_0)
+      safePublish(topic('state', side, 'schedule', 'summary'), JSON.stringify({
+        ts,
+        ...sideState.summary,
+      }), RETAINED_QOS_0)
+    }
+  }
+  catch (err) {
+    console.warn('[mqtt] schedule state publish failed:', err instanceof Error ? err.message : err)
   }
 
   for (const side of ['left', 'right'] as const) {
@@ -569,6 +799,50 @@ async function publishState(): Promise<void> {
   }
 }
 
+function queueStatePublish(delayMs = 250): void {
+  if (state.queuedPublishTimer) return
+  state.queuedPublishTimer = setTimeout(() => {
+    state.queuedPublishTimer = null
+    void publishState()
+  }, delayMs)
+}
+
+function isSideStatus(value: unknown): value is {
+  currentTemperature: number | null
+  targetTemperature: number | null
+  isAlarmVibrating?: boolean
+} {
+  return typeof value === 'object' && value !== null
+    && 'currentTemperature' in value
+    && 'targetTemperature' in value
+}
+
+function publishClimateFromStatusFrame(frame: Record<string, unknown>): void {
+  const sides: Array<{ side: Side, value: unknown }> = [
+    { side: 'left', value: frame.leftSide },
+    { side: 'right', value: frame.rightSide },
+  ]
+  for (const { side, value } of sides) {
+    if (!isSideStatus(value)) continue
+    const isPowered = value.targetTemperature !== null
+    safePublish(topic('state', side, 'climate'), JSON.stringify({
+      ts: typeof frame.ts === 'number' ? frame.ts : Date.now(),
+      currentTemperature: value.currentTemperature,
+      targetTemperature: value.targetTemperature,
+      isPowered,
+      isAlarmVibrating: value.isAlarmVibrating ?? false,
+      mode: isPowered ? 'heat' : 'off',
+      waterLevel: frame.waterLevel,
+    }), RETAINED_QOS_0)
+  }
+  if (typeof frame.waterLevel === 'string') {
+    safePublish(topic('state', 'water-level'), JSON.stringify({
+      ts: typeof frame.ts === 'number' ? frame.ts : Date.now(),
+      level: frame.waterLevel,
+    }), RETAINED_QOS_0)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Command dispatch
 // ---------------------------------------------------------------------------
@@ -592,6 +866,8 @@ async function getCaller(): Promise<AppCaller> {
 }
 
 interface CommandPayload {
+  raw?: string
+  value?: unknown
   side?: unknown
   temperature?: unknown
   duration?: unknown
@@ -612,25 +888,117 @@ function parsePayload(buf: Buffer): CommandPayload {
   }
 }
 
+function parseCommandPayload(buf: Buffer): CommandPayload {
+  const parsed = parsePayload(buf)
+  if (Object.keys(parsed).length > 0) return parsed
+
+  const text = buf.toString('utf-8').trim()
+  if (text.length === 0) return {}
+  try {
+    return { value: JSON.parse(text), raw: text }
+  }
+  catch {
+    return { value: text, raw: text }
+  }
+}
+
+function isSide(value: string): value is Side {
+  return value === 'left' || value === 'right'
+}
+
+function isStage(value: string): value is ScheduleStage {
+  return value === 'bedtime' || value === 'asleep' || value === 'dawn'
+}
+
+function payloadValue(payload: CommandPayload, fallbackKey?: keyof CommandPayload): unknown {
+  if (payload.value !== undefined) return payload.value
+  if (fallbackKey && payload[fallbackKey] !== undefined) return payload[fallbackKey]
+  return payload.raw
+}
+
+function payloadNumber(payload: CommandPayload, fallbackKey?: keyof CommandPayload): number {
+  const value = payloadValue(payload, fallbackKey)
+  const number = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(number)) throw new Error(`invalid numeric payload: ${String(value)}`)
+  return number
+}
+
+function payloadBoolean(payload: CommandPayload): boolean {
+  const value = payloadValue(payload)
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase()
+    if (['on', 'true', '1', 'yes', 'enabled'].includes(normalized)) return true
+    if (['off', 'false', '0', 'no', 'disabled'].includes(normalized)) return false
+  }
+  throw new Error(`invalid boolean payload: ${String(value)}`)
+}
+
+function payloadTime(payload: CommandPayload): string {
+  const value = payloadValue(payload)
+  if (typeof value !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(value.trim())) {
+    throw new Error(`invalid HH:mm payload: ${String(value)}`)
+  }
+  return value.trim()
+}
+
 async function handleCommand(verb: string, payload: CommandPayload): Promise<void> {
   // Each branch hands the payload straight to the tRPC procedure — its Zod
   // schema rejects malformed input. No client-side validation duplicated here.
+  const parts = verb.split('/')
+  if (isSide(parts[0])) {
+    const [side, ...rest] = parts
+    const sideVerb = rest.join('/')
+    switch (sideVerb) {
+      case 'away-mode':
+        await setAwayMode(side, payloadBoolean(payload))
+        notifyMqttStateChanged('settings')
+        return
+      case 'alarms-enabled':
+        await setAlarmsEnabled(side, payloadBoolean(payload))
+        notifyMqttStateChanged('schedules')
+        return
+      case 'schedule/bedtime':
+        await setScheduleBedtime(side, payloadTime(payload))
+        notifyMqttStateChanged('schedules')
+        return
+      default: {
+        const stageMatch = sideVerb.match(/^schedule\/([a-z]+)-temperature$/)
+        if (stageMatch && isStage(stageMatch[1])) {
+          await setScheduleStageTemperature(side, stageMatch[1], payloadNumber(payload, 'temperature'))
+          notifyMqttStateChanged('schedules')
+          return
+        }
+      }
+    }
+  }
+
   const caller = await getCaller()
   switch (verb) {
     case 'set-temperature':
       await caller.device.setTemperature(payload as never)
+      notifyMqttStateChanged('device')
       return
     case 'set-power':
       await caller.device.setPower(payload as never)
+      notifyMqttStateChanged('device')
       return
     case 'set-alarm':
       await caller.device.setAlarm(payload as never)
+      notifyMqttStateChanged('device')
       return
     case 'clear-alarm':
       await caller.device.clearAlarm(payload as never)
+      notifyMqttStateChanged('device')
       return
     case 'start-priming':
       await caller.device.startPriming({})
+      notifyMqttStateChanged('device')
+      return
+    case 'led-brightness':
+      await setLedBrightness(payloadNumber(payload))
+      notifyMqttStateChanged('settings')
       return
     default:
       console.warn(`[mqtt] unknown command verb: ${verb}`)
@@ -749,8 +1117,8 @@ export async function startMqttBridge(): Promise<void> {
     console.log(`[mqtt] connected to ${config.url} (deviceId=${id}, prefix=${config.topicPrefix})`)
     safePublish(availabilityTopic, 'online', RETAINED_QOS_0)
     publishHaDiscovery()
-    client.subscribe(topic('cmd', '+'), { qos: 0 }, (err: Error | null) => {
-      if (err) console.warn('[mqtt] subscribe cmd/* failed:', err.message)
+    client.subscribe(topic('cmd', '#'), { qos: 0 }, (err: Error | null) => {
+      if (err) console.warn('[mqtt] subscribe cmd/# failed:', err.message)
     })
     void publishState()
   })
@@ -773,7 +1141,7 @@ export async function startMqttBridge(): Promise<void> {
     const cmdPrefix = topic('cmd') + '/'
     if (!incomingTopic.startsWith(cmdPrefix)) return
     const verb = incomingTopic.slice(cmdPrefix.length)
-    const parsed = parsePayload(payload)
+    const parsed = parseCommandPayload(payload)
     void handleCommand(verb, parsed).catch((err) => {
       console.warn(`[mqtt] command ${verb} failed:`, err instanceof Error ? err.message : err)
     })
@@ -789,6 +1157,11 @@ export async function startMqttBridge(): Promise<void> {
     if (frame.type !== 'deviceStatus') return
     if (!state.client?.connected) return
     safePublish(topic('state', 'device-status'), JSON.stringify(frame), RETAINED_QOS_0)
+    publishClimateFromStatusFrame(frame)
+  })
+
+  state.unsubscribeMqttState = onMqttStateChanged(() => {
+    queueStatePublish()
   })
 }
 
@@ -800,12 +1173,23 @@ export async function shutdownMqttBridge(): Promise<void> {
     clearInterval(state.publishTimer)
     state.publishTimer = null
   }
+  if (state.queuedPublishTimer) {
+    clearTimeout(state.queuedPublishTimer)
+    state.queuedPublishTimer = null
+  }
   if (state.unsubscribeFrame) {
     try {
       state.unsubscribeFrame()
     }
     catch { /* ignore */ }
     state.unsubscribeFrame = null
+  }
+  if (state.unsubscribeMqttState) {
+    try {
+      state.unsubscribeMqttState()
+    }
+    catch { /* ignore */ }
+    state.unsubscribeMqttState = null
   }
 
   const c = state.client

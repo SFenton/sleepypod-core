@@ -15,6 +15,7 @@ import { getSharedHardwareClient } from '@/src/hardware/dacMonitor.instance'
 import { encode as cborEncode } from 'cbor-x'
 import { fahrenheitToLevel, HardwareCommand } from '@/src/hardware/types'
 import { broadcastMutationStatus } from '@/src/streaming/broadcastMutationStatus'
+import { notifyMqttStateChanged } from '@/src/streaming/mqttEvents'
 import { cancelAutoOffTimer } from '@/src/services/autoOffWatcher'
 import { markSideMutated } from '@/src/hardware/deviceStateSync'
 import { withSideLock } from '@/src/hardware/sideLock'
@@ -633,6 +634,7 @@ export class JobManager {
                 .where(eq(sideSettings.side, side))
                 .run()
             })
+            notifyMqttStateChanged('settings')
             // Power off the side
             try {
               const client = getSharedHardwareClient()
@@ -664,6 +666,7 @@ export class JobManager {
                 .where(eq(sideSettings.side, side))
                 .run()
             })
+            notifyMqttStateChanged('settings')
             // Restore power for the side
             try {
               const client = getSharedHardwareClient()

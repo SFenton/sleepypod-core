@@ -585,7 +585,15 @@ for bin in node npm npx pnpm; do
 done
 
 INSTALL_DIR="/home/dac/sleepypod-core"
-GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-sleepypod/core}"
+UPDATE_REPO_FILE="/etc/sleepypod/update-repo"
+DEFAULT_GITHUB_REPO="SFenton/sleepypod-core"
+if [ -n "${SLEEPYPOD_GITHUB_REPO:-}" ]; then
+  GITHUB_REPO="$SLEEPYPOD_GITHUB_REPO"
+elif [ -r "$UPDATE_REPO_FILE" ] && [ -s "$UPDATE_REPO_FILE" ]; then
+  GITHUB_REPO="$(head -n 1 "$UPDATE_REPO_FILE")"
+else
+  GITHUB_REPO="$DEFAULT_GITHUB_REPO"
+fi
 SCRIPT_DEFAULT_BRANCH="__BRANCH__"  # substituted at release time by .github/workflows/{release,dev-release}.yml
 # Guard for users curling the raw source from main: the substitution only
 # happens inside the release tarball, so the file at raw.githubusercontent
@@ -684,6 +692,8 @@ fi
 mkdir -p /etc/sleepypod
 printf '%s\n' "$DATA_DIR" > /etc/sleepypod/data-dir
 chmod 0644 /etc/sleepypod/data-dir
+printf '%s\n' "$GITHUB_REPO" > "$UPDATE_REPO_FILE"
+chmod 0644 "$UPDATE_REPO_FILE"
 # Ensure ReadWritePaths directories exist — systemd's ProtectSystem=strict
 # requires all listed paths to exist or the namespace setup fails.
 # /run/dac is handled by RuntimeDirectory=dac in the service unit.
@@ -1798,6 +1808,7 @@ echo "Files:"
 echo "  Config DB:      $DATA_DIR/sleepypod.db"
 echo "  Biometrics DB:  $DATA_DIR/biometrics.db"
 echo "  Config:         $INSTALL_DIR/.env"
+echo "  Update repo:    $GITHUB_REPO"
 echo "  Module logs:    journalctl -u sleepypod-piezo-processor.service"
 echo "                  journalctl -u sleepypod-sleep-detector.service"
 echo "                  journalctl -u sleepypod-environment-monitor.service"
