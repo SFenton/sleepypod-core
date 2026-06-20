@@ -79,6 +79,19 @@ class FakeGestureActionHandler {
   }
 }
 
+const coverButtonCleanupMock = vi.fn()
+const coverButtonHandleMock = vi.fn()
+class FakeCoverButtonActionHandler {
+  socketPath: string
+  deps: unknown
+  cleanup = coverButtonCleanupMock
+  handle = coverButtonHandleMock
+  constructor(socketPath: string, deps: unknown) {
+    this.socketPath = socketPath
+    this.deps = deps
+  }
+}
+
 const stateSyncSyncMock = vi.fn(async () => {})
 const stateSyncRecordFlowMock = vi.fn()
 class FakeDeviceStateSync {
@@ -118,6 +131,14 @@ vi.mock('../gestureActionHandler', () => ({
 
 vi.mock('../gestureActionHandler.deps', () => ({
   defaultGestureActionDeps: { _stub: true },
+}))
+
+vi.mock('../coverButtonActionHandler', () => ({
+  CoverButtonActionHandler: FakeCoverButtonActionHandler,
+}))
+
+vi.mock('../coverButtonActionHandler.deps', () => ({
+  defaultCoverButtonActionDeps: { _stub: true },
 }))
 
 vi.mock('../deviceStateSync', () => ({
@@ -160,7 +181,9 @@ const GLOBAL_KEYS = [
   '__sp_hw_client__',
   '__sp_dac_monitor__',
   '__sp_gesture_handler__',
+  '__sp_cover_button_handler__',
   '__sp_unsub_flow__',
+  '__sp_unsub_cover_buttons__',
 ] as const
 
 function clearGlobals() {
@@ -196,6 +219,8 @@ describe('hardware/dacMonitor.instance', () => {
     parseSimpleResponseMock.mockReset().mockReturnValue({ success: true, message: 'ok' })
     gestureCleanupMock.mockClear()
     gestureHandleMock.mockClear()
+    coverButtonCleanupMock.mockClear()
+    coverButtonHandleMock.mockClear()
     stateSyncSyncMock.mockReset().mockResolvedValue(undefined)
     stateSyncRecordFlowMock.mockClear()
     cancelSnoozeMock.mockClear()
@@ -686,10 +711,40 @@ describe('hardware/dacMonitor.instance', () => {
       await mod.getDacMonitor()
       await flushMicrotasks()
 
-      expect(onServerFrameMock).toHaveBeenCalledTimes(1)
+      expect(onServerFrameMock).toHaveBeenCalledTimes(2)
       const cb = (onServerFrameMock.mock.calls[0]?.[0]) as ((frame: unknown) => void) | undefined
       cb?.({ type: 'frzHealth', flow: 42 })
       expect(stateSyncRecordFlowMock).toHaveBeenCalledWith({ type: 'frzHealth', flow: 42 })
+    })
+
+    it('subscribes to cover-button server frames and normalizes nested aliases', async () => {
+      const mod = await freshModule()
+      await mod.getDacMonitor()
+      await flushMicrotasks()
+
+      expect(onServerFrameMock).toHaveBeenCalledTimes(2)
+      const cb = (onServerFrameMock.mock.calls[1]?.[0]) as ((frame: unknown) => void) | undefined
+      cb?.({
+        type: 'buttonEvent',
+        ts: 123,
+        l: { plus: 2, center: { count: 1 } },
+        right: { buttons: { minus: 'quadTap' } },
+      })
+
+      expect(coverButtonHandleMock).toHaveBeenCalledWith({ side: 'left', button: 'top', count: 2, ts: 123 })
+      expect(coverButtonHandleMock).toHaveBeenCalledWith({ side: 'left', button: 'middle', count: 1, ts: 123 })
+      expect(coverButtonHandleMock).toHaveBeenCalledWith({ side: 'right', button: 'bottom', count: 4, ts: 123 })
+    })
+
+    it('normalizes flat cover-button events', async () => {
+      const mod = await freshModule()
+      await mod.getDacMonitor()
+      await flushMicrotasks()
+
+      const cb = (onServerFrameMock.mock.calls[1]?.[0]) as ((frame: unknown) => void) | undefined
+      cb?.({ type: 'coverButton', side: 'r', button: 'minus', tapType: 'doubleTap', ts: 456 })
+
+      expect(coverButtonHandleMock).toHaveBeenCalledWith({ side: 'right', button: 'bottom', count: 2, ts: 456 })
     })
 
     it('isolates DeviceStateSync.sync rejections (logged, not thrown)', async () => {

@@ -31,6 +31,7 @@ interface GestureActionDeps {
   findGestureConfig: (side: Side, tapType: GestureEvent['tapType']) => Promise<TapGestureRow | null>
   findDeviceState: (side: Side) => Promise<DeviceStateRow | null>
   newHardwareClient: (socketPath: string) => HardwareClient
+  recordTemperatureChange?: (side: Side, targetTemperature: number) => Promise<void>
 }
 
 /**
@@ -116,6 +117,7 @@ export class GestureActionHandler {
         getAutomationEngineIfRunning()?.registerManualOverride(event.side)
         await client.connect()
         await client.setTemperature(event.side, newTemp)
+        await this.deps.recordTemperatureChange?.(event.side, newTemp)
       }
       finally {
         client.disconnect()

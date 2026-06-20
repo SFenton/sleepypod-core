@@ -19,6 +19,10 @@ export interface CoverButtonActionRow {
   alarmBehavior: 'snooze' | 'dismiss' | null
   alarmSnoozeDuration: number | null
   alarmInactiveBehavior: 'power' | 'none' | null
+  feedbackVibrationEnabled: boolean
+  feedbackVibrationIntensity: number | null
+  feedbackVibrationPattern: 'double' | 'rise' | null
+  feedbackVibrationDuration: number | null
 }
 
 export interface CoverButtonDeviceStateRow {
@@ -31,7 +35,11 @@ export interface CoverButtonActionDeps {
   findActionConfig: (side: Side, button: CoverButton, tapType: CoverButtonTapType) => Promise<CoverButtonActionRow | null>
   findDeviceState: (side: Side) => Promise<CoverButtonDeviceStateRow | null>
   newHardwareClient: (socketPath: string) => HardwareClient
+  triggerFeedbackHaptic: (side: Side) => Promise<void>
+  recordTemperatureChange?: (side: Side, targetTemperature: number) => Promise<void>
 }
+
+const TAP_AGGREGATION_WINDOW_MS = 650
 
 function tapTypeFromCount(count: number): CoverButtonTapType | null {
   if (count === 1) return 'singleTap'
@@ -41,8 +49,15 @@ function tapTypeFromCount(count: number): CoverButtonTapType | null {
   return null
 }
 
+interface PendingCoverTap {
+  count: number
+  event: CoverButtonEvent
+  timer: ReturnType<typeof setTimeout>
+}
+
 export class CoverButtonActionHandler {
   private readonly snoozeTimeouts: Set<ReturnType<typeof setTimeout>> = new Set()
+  private readonly pendingTaps = new Map<string, PendingCoverTap>()
 
   constructor(
     private readonly socketPath: string,
@@ -50,9 +65,24 @@ export class CoverButtonActionHandler {
   ) {}
 
   handle = async (event: CoverButtonEvent): Promise<void> => {
-    const tapType = tapTypeFromCount(event.count)
-    if (!tapType) return
+    if (event.count === 1) {
+      await this.queueSingleTap(event)
+      return
+    }
 
+    const key = this.pendingTapKey(event)
+    const pending = this.pendingTaps.get(key)
+    if (pending) {
+      clearTimeout(pending.timer)
+      this.pendingTaps.delete(key)
+    }
+
+    await this.handleResolvedTap(event, event.count)
+  }
+
+  private handleResolvedTap = async (event: CoverButtonEvent, count: number): Promise<void> => {
+    const tapType = tapTypeFromCount(count)
+    if (!tapType) return
     try {
       await this.executeSingle(event, tapType)
     }
@@ -65,13 +95,79 @@ export class CoverButtonActionHandler {
   }
 
   cleanup = (): void => {
+    for (const pending of this.pendingTaps.values()) clearTimeout(pending.timer)
+    this.pendingTaps.clear()
     for (const id of this.snoozeTimeouts) clearTimeout(id)
     this.snoozeTimeouts.clear()
   }
 
-  private executeSingle = async (event: CoverButtonEvent, tapType: CoverButtonTapType): Promise<void> => {
+  private queueSingleTap = async (event: CoverButtonEvent): Promise<void> => {
+    const key = this.pendingTapKey(event)
+    const existing = this.pendingTaps.get(key)
+    if (existing) clearTimeout(existing.timer)
+
+    const count = Math.min(4, (existing?.count ?? 0) + 1)
+    const pendingEvent = { ...event, count }
+
+    if (count >= 4) {
+      this.pendingTaps.delete(key)
+      void this.handleResolvedTap(pendingEvent, count)
+      return
+    }
+
+    const timer = setTimeout(() => {
+      this.pendingTaps.delete(key)
+      void this.handleResolvedTap(pendingEvent, count)
+    }, TAP_AGGREGATION_WINDOW_MS)
+
+    this.pendingTaps.set(key, { count, event: pendingEvent, timer })
+
+    if (count > 1) {
+      const immediateAction = await this.findImmediateAggregatedAction(pendingEvent, count)
+      const current = this.pendingTaps.get(key)
+      if (immediateAction && current?.event === pendingEvent) {
+        clearTimeout(current.timer)
+        this.pendingTaps.delete(key)
+        await this.executeSingle(pendingEvent, immediateAction.tapType, immediateAction.action)
+      }
+    }
+  }
+
+  private pendingTapKey = (event: Pick<CoverButtonEvent, 'side' | 'button'>): string => {
+    return `${event.side}:${event.button}`
+  }
+
+  private findImmediateAggregatedAction = async (
+    event: CoverButtonEvent,
+    count: number,
+  ): Promise<{ tapType: CoverButtonTapType, action: CoverButtonActionRow } | null> => {
+    const tapType = tapTypeFromCount(count)
+    if (!tapType) return null
+
     const action = await this.deps.findActionConfig(event.side, event.button, tapType)
+    if (!action) return null
+
+    for (let higherCount = count + 1; higherCount <= 4; higherCount += 1) {
+      const higherTapType = tapTypeFromCount(higherCount)
+      if (!higherTapType) continue
+      const higherAction = await this.deps.findActionConfig(event.side, event.button, higherTapType)
+      if (higherAction) return null
+    }
+
+    return { tapType, action }
+  }
+
+  private executeSingle = async (
+    event: CoverButtonEvent,
+    tapType: CoverButtonTapType,
+    resolvedAction?: CoverButtonActionRow,
+  ): Promise<void> => {
+    const action = resolvedAction ?? await this.deps.findActionConfig(event.side, event.button, tapType)
     if (!action) return
+
+    if (action.actionType !== 'alarm') {
+      await this.handleFeedbackVibration(event.side, action)
+    }
 
     if (action.actionType === 'temperature') {
       await this.handleTemperatureAction(event.side, action)
@@ -81,6 +177,26 @@ export class CoverButtonActionHandler {
     }
     else if (action.actionType === 'alarm') {
       await this.handleAlarmAction(event.side, action)
+    }
+  }
+
+  private handleFeedbackVibration = async (
+    side: Side,
+    action: CoverButtonActionRow,
+  ): Promise<void> => {
+    if (!action.feedbackVibrationEnabled) return
+
+    const state = await this.deps.findDeviceState(side)
+    if (state?.isAlarmVibrating) return
+
+    try {
+      await this.deps.triggerFeedbackHaptic(side)
+    }
+    catch (error) {
+      console.error(
+        `CoverButtonActionHandler: feedback vibration failed for ${side}:`,
+        error instanceof Error ? error.message : error
+      )
     }
   }
 
@@ -99,6 +215,7 @@ export class CoverButtonActionHandler {
     try {
       await client.connect()
       await client.setTemperature(side, newTemp)
+      await this.deps.recordTemperatureChange?.(side, newTemp)
     }
     finally {
       client.disconnect()

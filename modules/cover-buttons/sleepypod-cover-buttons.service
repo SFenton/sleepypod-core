@@ -1,5 +1,5 @@
 [Unit]
-Description=SleepyPod Cover Buttons (TTC button press observability)
+Description=SleepyPod Cover Buttons (TTC button press dispatch)
 Documentation=https://github.com/sleepypod/core/tree/main/modules/cover-buttons
 After=network.target sleepypod.service
 Wants=sleepypod.service

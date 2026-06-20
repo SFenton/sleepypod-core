@@ -7,8 +7,8 @@ const probes = [
   { label: 'cmd5 LEFT + CBOR', cmd: 'ALARM_LEFT', args: cborPayload },
   { label: 'cmd6 RIGHT + comma', cmd: 'ALARM_RIGHT', args: '80,0,30' },
   { label: 'cmd6 RIGHT + CBOR', cmd: 'ALARM_RIGHT', args: cborPayload },
-  { label: 'cmd2 SOLO + comma', cmd: 'ALARM_SOLO', args: '80,0,30' },
-  { label: 'cmd2 SOLO + CBOR', cmd: 'ALARM_SOLO', args: cborPayload },
+  { label: 'cmd17 SOLO + comma', cmd: 'ALARM_SOLO', args: '80,0,30' },
+  { label: 'cmd17 SOLO + CBOR', cmd: 'ALARM_SOLO', args: cborPayload },
   { label: 'cmd5 LEFT + alt comma 80,1,30 (rise)', cmd: 'ALARM_LEFT', args: '80,1,30' },
 ]
 

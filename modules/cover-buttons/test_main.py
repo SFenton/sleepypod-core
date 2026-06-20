@@ -14,7 +14,7 @@ _stubs = {
 _stubs["common.raw_follower"].RawFileFollower = None
 sys.modules.update(_stubs)
 
-from main import iter_presses  # noqa: E402
+from main import iter_presses, parse_firmware_button_event  # noqa: E402
 
 
 def test_real_sample_two_buttons_left():
@@ -92,3 +92,31 @@ def test_missing_side_ok():
     rec = {"type": "buttonEvent", "ts": 0, "right": {"top": 1}}
     out = list(iter_presses(rec))
     assert out == [("right", "top", 1, 0)]
+
+
+def test_parse_firmware_button_event_top_left():
+    line = "[TTC] processing [button] side left { button: top, type: short, count: 1 }"
+    assert parse_firmware_button_event(line) == ("left", "top", 1)
+
+
+def test_parse_firmware_button_event_bottom_right():
+    line = "[TTC] processing [button] side right { button: bottom, type: short, count: 3 }"
+    assert parse_firmware_button_event(line) == ("right", "bottom", 3)
+
+
+def test_parse_firmware_button_event_numeric_fallback():
+    line = "[buttons] sent button event s0x01 i0x02 c0x03"
+    assert parse_firmware_button_event(line) == ("right", "bottom", 3)
+
+
+def test_parse_firmware_button_event_unknown_indices_skipped():
+    assert parse_firmware_button_event(
+        "[buttons] sent button event s0x09 i0x00 c0x01"
+    ) is None
+    assert parse_firmware_button_event(
+        "[buttons] sent button event s0x00 i0x09 c0x01"
+    ) is None
+
+
+def test_parse_firmware_button_event_unrelated_line_skipped():
+    assert parse_firmware_button_event("[buttons] top button clicked") is None

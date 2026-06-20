@@ -92,9 +92,9 @@ class DacHardwareClient {
     // `[alarm io] side N power P pattern X for D` writes to the cover MCU and
     // the motor engages. The `Pillow.cpp:383 ... label uninitialized` log that
     // appears alongside is the SEPARATE pillow-accessory code path and does NOT
-    // gate the cover motor. ALARM_SOLO (cmd 2) appears in the wire protocol but
-    // frank has no registered spark function at that opcode on this firmware —
-    // commands are silently dropped (no `sparkAlarmS` log, no motor write).
+    // gate the cover motor. ALARM_SOLO (cmd 17) reaches `sparkAlarmS` on this
+    // firmware, but live probing showed it clears both alarm channels without an
+    // `[alarm io] ... start` write, so it is not used for feedback or alarms.
     const cmd = side === 'left' ? HardwareCommand.ALARM_LEFT : HardwareCommand.ALARM_RIGHT
     const response = await sendCommand(cmd, encodeAlarmPayload(config))
     const parsed = parseSimpleResponse(response)

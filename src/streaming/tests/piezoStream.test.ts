@@ -824,6 +824,25 @@ describe('piezoStream — server lifecycle and protocol', () => {
     await client.close()
   })
 
+  it('tails an existing RAW file from EOF and only streams appended frames', async () => {
+    const filePath = path.join(tmpRawDir, 'existing.RAW')
+    const oldRec = buildOuterRecord(1, [{ type: 'capSense', ts: 90, left: 0, right: 0 }])
+    const newRec = buildOuterRecord(2, [{ type: 'capSense', ts: 91, left: 1, right: 1 }])
+    fs.writeFileSync(filePath, oldRec)
+
+    const port = startAndPort()
+    const client = await connectClient(port)
+
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(client.messages.some(m => m.type === 'capSense' && m.ts === 90)).toBe(false)
+
+    fs.appendFileSync(filePath, newRec)
+    await client.waitFor(m => m.type === 'capSense' && m.ts === 91)
+
+    expect(client.messages.some(m => m.type === 'capSense' && m.ts === 90)).toBe(false)
+    await client.close()
+  })
+
   it('seek with non-numeric timestamp → returns error', async () => {
     const port = startAndPort()
     const client = await connectClient(port)

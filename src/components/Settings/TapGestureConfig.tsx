@@ -3,7 +3,7 @@
 import { useState, useCallback } from 'react'
 import { trpc } from '@/src/utils/trpc'
 import { useSideNames } from '@/src/hooks/useSideNames'
-import { Bell, ChevronDown, Circle, Hand, Minus, Plus, Power, Thermometer, Trash2 } from 'lucide-react'
+import { Bell, ChevronDown, Hand, Minus, Plus, Power, Thermometer, Trash2 } from 'lucide-react'
 import clsx from 'clsx'
 
 type TapType = 'singleTap' | 'doubleTap' | 'tripleTap' | 'quadTap'
@@ -29,11 +29,8 @@ interface GestureRecord extends ActionRecord {
   tapType: TapType
 }
 
-const TAP_TYPES: { key: TapType, label: string, taps: number }[] = [
-  { key: 'singleTap', label: 'Single Tap', taps: 1 },
-  { key: 'doubleTap', label: 'Double Tap', taps: 2 },
-  { key: 'tripleTap', label: 'Triple Tap', taps: 3 },
-  { key: 'quadTap', label: 'Quad Tap', taps: 4 },
+const COVER_BUTTON_TAP_TYPES: { key: TapType, label: string }[] = [
+  { key: 'doubleTap', label: 'Double Tap' },
 ]
 
 const COVER_BUTTONS: {
@@ -43,7 +40,6 @@ const COVER_BUTTONS: {
   icon: typeof Plus
 }[] = [
   { key: 'top', label: 'Plus Button', description: 'Top cover button', icon: Plus },
-  { key: 'middle', label: 'Center Button', description: 'Middle cover button', icon: Circle },
   { key: 'bottom', label: 'Minus Button', description: 'Bottom cover button', icon: Minus },
 ]
 
@@ -77,7 +73,7 @@ const defaultEditState = (side: Side, button: CoverButton, tapType: TapType): Ed
   side,
   button,
   tapType,
-  actionType: tapType === 'singleTap' && button === 'middle' ? 'power' : 'temperature',
+  actionType: 'temperature',
   temperatureChange: button === 'bottom' ? 'decrement' : 'increment',
   temperatureAmount: 1,
   powerBehavior: 'toggle',
@@ -120,7 +116,7 @@ function defaultGestureAction(side: Side, button: CoverButton, tapType: TapType)
 
 /**
  * Gesture configuration component.
- * Allows configuring single/double/triple/quad tap actions per physical cover button.
+ * Allows configuring double-tap actions for the physical top/bottom cover buttons.
  */
 export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right' } = {}) {
   const { sideName } = useSideNames()
@@ -210,7 +206,7 @@ export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right'
           </p>
         </div>
 
-        {TAP_TYPES.map(({ key, label }) => {
+        {COVER_BUTTON_TAP_TYPES.map(({ key, label }) => {
           const gesture = findGesture(side, button, key)
           const displayAction = gesture ?? defaultGestureAction(side, button, key)
           const isEditing
@@ -316,8 +312,8 @@ export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right'
       <div>
         <h3 className="text-sm font-medium text-white">Gestures</h3>
         <p className="mt-1 text-xs text-zinc-500">
-          Assign single, double, triple, or quad taps on each Pod 5 cover button
-          to temperature, power, or alarm actions
+          Assign double taps on the Pod 5 plus/minus cover buttons to
+          temperature, power, or alarm actions.
         </p>
       </div>
 

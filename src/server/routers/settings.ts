@@ -12,9 +12,18 @@ import {
   tapTypeSchema,
   temperatureUnitSchema,
   timeStringSchema,
+  vibrationIntensitySchema,
+  vibrationPatternSchema,
 } from '@/src/server/validation-schemas'
 
 const timestampSchema = z.coerce.date()
+const feedbackVibrationDurationSchema = z.number().int().min(1).max(10)
+const feedbackVibrationInputShape = {
+  feedbackVibrationEnabled: z.boolean().optional(),
+  feedbackVibrationIntensity: vibrationIntensitySchema.optional(),
+  feedbackVibrationPattern: vibrationPatternSchema.optional(),
+  feedbackVibrationDuration: feedbackVibrationDurationSchema.optional(),
+}
 
 const deviceSettingsSchema = z.object({
   id: z.number(),
@@ -66,6 +75,10 @@ const tapGestureSchema = z.object({
   alarmBehavior: z.enum(['snooze', 'dismiss']).nullable().optional(),
   alarmSnoozeDuration: z.number().nullable().optional(),
   alarmInactiveBehavior: z.enum(['power', 'none']).nullable().optional(),
+  feedbackVibrationEnabled: z.boolean().default(false),
+  feedbackVibrationIntensity: z.number().nullable().optional(),
+  feedbackVibrationPattern: z.enum(['double', 'rise']).nullable().optional(),
+  feedbackVibrationDuration: z.number().nullable().optional(),
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
 })
@@ -81,6 +94,10 @@ const coverButtonActionSchema = z.object({
   alarmBehavior: z.enum(['snooze', 'dismiss']).nullable().optional(),
   alarmSnoozeDuration: z.number().nullable().optional(),
   alarmInactiveBehavior: z.enum(['power', 'none']).nullable().optional(),
+  feedbackVibrationEnabled: z.boolean().default(false),
+  feedbackVibrationIntensity: z.number().nullable().optional(),
+  feedbackVibrationPattern: z.enum(['double', 'rise']).nullable().optional(),
+  feedbackVibrationDuration: z.number().nullable().optional(),
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
 })
@@ -121,6 +138,21 @@ type CoverButtonValue = z.infer<typeof coverButtonSchema>
 
 function isCoverButtonValue(button: string): button is CoverButtonValue {
   return button === 'top' || button === 'middle' || button === 'bottom'
+}
+
+function isSupportedCoverButtonGesture(button: string, tapType: string): boolean {
+  return (button === 'top' || button === 'bottom') && tapType === 'doubleTap'
+}
+
+function assertSupportedGesture(button: string, tapType: string): void {
+  if (button === 'surface' || isSupportedCoverButtonGesture(button, tapType)) {
+    return
+  }
+
+  throw new TRPCError({
+    code: 'BAD_REQUEST',
+    message: 'Cover button gestures are only supported for double-tap on the plus/minus buttons',
+  })
 }
 
 /**
@@ -191,8 +223,8 @@ export const settingsRouter = router({
         const sides = await db.select().from(sideSettings)
         const gestures = await db.select().from(tapGestures)
         const coverButtons = gestures.filter(
-          (g): g is typeof g & { button: CoverButtonValue, tapType: 'singleTap' } =>
-            isCoverButtonValue(g.button) && g.tapType === 'singleTap'
+          (g): g is typeof g & { button: CoverButtonValue, tapType: 'doubleTap' } =>
+            isCoverButtonValue(g.button) && isSupportedCoverButtonGesture(g.button, g.tapType)
         )
 
         return {
@@ -705,6 +737,7 @@ export const settingsRouter = router({
             actionType: z.literal('temperature'),
             temperatureChange: z.enum(['increment', 'decrement']),
             temperatureAmount: z.number().int().min(0).max(10),
+            ...feedbackVibrationInputShape,
           })
           .strict(),
         z
@@ -714,6 +747,7 @@ export const settingsRouter = router({
             tapType: tapTypeSchema,
             actionType: z.literal('power'),
             powerBehavior: z.enum(['toggle', 'on', 'off']).default('toggle'),
+            ...feedbackVibrationInputShape,
           })
           .strict(),
         z
@@ -725,12 +759,15 @@ export const settingsRouter = router({
             alarmBehavior: z.enum(['snooze', 'dismiss']),
             alarmSnoozeDuration: z.number().int().min(60).max(600).optional(),
             alarmInactiveBehavior: z.enum(['power', 'none']).optional(),
+            ...feedbackVibrationInputShape,
           })
           .strict(),
       ])
     )
     .output(tapGestureSchema)
     .mutation(async ({ input }) => {
+      assertSupportedGesture(input.button, input.tapType)
+
       try {
         const result = db.transaction((tx) => {
           const values = {
@@ -744,6 +781,10 @@ export const settingsRouter = router({
             alarmBehavior: input.actionType === 'alarm' ? input.alarmBehavior : null,
             alarmSnoozeDuration: input.actionType === 'alarm' ? input.alarmSnoozeDuration ?? null : null,
             alarmInactiveBehavior: input.actionType === 'alarm' ? input.alarmInactiveBehavior ?? null : null,
+            feedbackVibrationEnabled: input.feedbackVibrationEnabled ?? false,
+            feedbackVibrationIntensity: input.feedbackVibrationEnabled ? input.feedbackVibrationIntensity ?? 30 : null,
+            feedbackVibrationPattern: input.feedbackVibrationEnabled ? input.feedbackVibrationPattern ?? 'double' : null,
+            feedbackVibrationDuration: input.feedbackVibrationEnabled ? input.feedbackVibrationDuration ?? 1 : null,
           }
 
           // Check if gesture already exists
@@ -815,7 +856,7 @@ export const settingsRouter = router({
 
   /**
    * Deprecated compatibility endpoint: physical Pod 5 cover-button actions are
-   * now single-tap gestures assigned to a button.
+   * now double-tap gestures assigned to the plus/minus buttons.
    */
   setCoverButtonAction: publicProcedure
     .input(
@@ -827,6 +868,7 @@ export const settingsRouter = router({
             actionType: z.literal('temperature'),
             temperatureChange: z.enum(['increment', 'decrement']),
             temperatureAmount: z.number().int().min(0).max(10),
+            ...feedbackVibrationInputShape,
           })
           .strict(),
         z
@@ -835,6 +877,7 @@ export const settingsRouter = router({
             button: coverButtonSchema,
             actionType: z.literal('power'),
             powerBehavior: z.enum(['toggle', 'on', 'off']).default('toggle'),
+            ...feedbackVibrationInputShape,
           })
           .strict(),
         z
@@ -845,12 +888,15 @@ export const settingsRouter = router({
             alarmBehavior: z.enum(['snooze', 'dismiss']),
             alarmSnoozeDuration: z.number().int().min(60).max(600).optional(),
             alarmInactiveBehavior: z.enum(['power', 'none']).optional(),
+            ...feedbackVibrationInputShape,
           })
           .strict(),
       ])
     )
     .output(coverButtonActionSchema)
     .mutation(async ({ input }) => {
+      assertSupportedGesture(input.button, 'doubleTap')
+
       try {
         const result = db.transaction((tx) => {
           const existing = tx
@@ -860,7 +906,7 @@ export const settingsRouter = router({
               and(
                 eq(tapGestures.side, input.side),
                 eq(tapGestures.button, input.button),
-                eq(tapGestures.tapType, 'singleTap')
+                eq(tapGestures.tapType, 'doubleTap')
               )
             )
             .limit(1)
@@ -869,7 +915,7 @@ export const settingsRouter = router({
           const values = {
             side: input.side,
             button: input.button,
-            tapType: 'singleTap' as const,
+            tapType: 'doubleTap' as const,
             actionType: input.actionType,
             temperatureChange: input.actionType === 'temperature' ? input.temperatureChange : null,
             temperatureAmount: input.actionType === 'temperature' ? input.temperatureAmount : null,
@@ -877,6 +923,10 @@ export const settingsRouter = router({
             alarmBehavior: input.actionType === 'alarm' ? input.alarmBehavior : null,
             alarmSnoozeDuration: input.actionType === 'alarm' ? input.alarmSnoozeDuration ?? null : null,
             alarmInactiveBehavior: input.actionType === 'alarm' ? input.alarmInactiveBehavior ?? null : null,
+            feedbackVibrationEnabled: input.feedbackVibrationEnabled ?? false,
+            feedbackVibrationIntensity: input.feedbackVibrationEnabled ? input.feedbackVibrationIntensity ?? 30 : null,
+            feedbackVibrationPattern: input.feedbackVibrationEnabled ? input.feedbackVibrationPattern ?? 'double' : null,
+            feedbackVibrationDuration: input.feedbackVibrationEnabled ? input.feedbackVibrationDuration ?? 1 : null,
           }
 
           if (existing.length > 0) {
