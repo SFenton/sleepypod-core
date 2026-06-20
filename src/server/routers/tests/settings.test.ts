@@ -160,24 +160,23 @@ describe('settings.getAll', () => {
       { side: 'left', name: 'L', awayMode: false, alwaysOn: false, autoOffEnabled: false, autoOffMinutes: 30, awayStart: null, awayReturn: null, createdAt: new Date(0), updatedAt: new Date(0) },
       { side: 'right', name: 'R', awayMode: false, alwaysOn: false, autoOffEnabled: false, autoOffMinutes: 30, awayStart: null, awayReturn: null, createdAt: new Date(0), updatedAt: new Date(0) },
     ]
-    const gestures: unknown[] = []
-    const coverButtons = [
-      { id: 1, side: 'left', button: 'top', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
-      { id: 2, side: 'right', button: 'middle', actionType: 'power', powerBehavior: 'toggle', createdAt: new Date(0), updatedAt: new Date(0) },
+    const gestures = [
+      { id: 1, side: 'left', button: 'top', tapType: 'singleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: 2, side: 'right', button: 'middle', tapType: 'singleTap', actionType: 'power', powerBehavior: 'toggle', createdAt: new Date(0), updatedAt: new Date(0) },
     ]
-    dbState.topRowsQueue.push([device], sides, gestures, coverButtons)
+    dbState.topRowsQueue.push([device], sides, gestures)
 
     const result = await caller.getAll({})
     expect(result.device.timezone).toBe('UTC')
     expect(result.sides.left.name).toBe('L')
     expect(result.sides.right.name).toBe('R')
-    expect(result.gestures.left).toEqual([])
+    expect(result.gestures.left).toHaveLength(1)
     expect(result.coverButtons.left).toHaveLength(1)
     expect(result.coverButtons.right).toHaveLength(1)
   })
 
   it('returns synthetic defaults when device row is missing', async () => {
-    dbState.topRowsQueue.push([], [], [], [])
+    dbState.topRowsQueue.push([], [], [])
     const result = await caller.getAll({})
     expect(result.device.timezone).toBe('America/Los_Angeles')
     expect(result.sides.left.side).toBe('left')
@@ -191,10 +190,10 @@ describe('settings.getAll', () => {
       { side: 'right', name: 'R', awayMode: false, alwaysOn: false, autoOffEnabled: false, autoOffMinutes: 30, awayStart: null, awayReturn: null, createdAt: new Date(0), updatedAt: new Date(0) },
     ]
     const gestures = [
-      { id: 1, side: 'left', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
-      { id: 2, side: 'right', tapType: 'doubleTap', actionType: 'alarm', alarmBehavior: 'snooze', createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: 1, side: 'left', button: 'top', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: 2, side: 'right', button: 'bottom', tapType: 'doubleTap', actionType: 'alarm', alarmBehavior: 'snooze', createdAt: new Date(0), updatedAt: new Date(0) },
     ]
-    dbState.topRowsQueue.push([device], sides, gestures, [])
+    dbState.topRowsQueue.push([device], sides, gestures)
     const result = await caller.getAll({})
     expect(result.gestures.left).toHaveLength(1)
     expect(result.gestures.right).toHaveLength(1)
@@ -540,10 +539,10 @@ describe('settings.setAlwaysOn', () => {
 })
 
 describe('settings.setGesture / deleteGesture', () => {
-  it('creates a temperature gesture when none exists', async () => {
+  it('creates a temperature gesture for a button/tap combination when none exists', async () => {
     // tx.select existing → empty; tx.insert.values.returning.all → [created]
     const created = {
-      id: 1, side: 'left', tapType: 'doubleTap', actionType: 'temperature',
+      id: 1, side: 'left', button: 'top', tapType: 'doubleTap', actionType: 'temperature',
       temperatureChange: 'increment', temperatureAmount: 2,
       createdAt: new Date(0), updatedAt: new Date(0),
     }
@@ -551,6 +550,7 @@ describe('settings.setGesture / deleteGesture', () => {
 
     const out = await caller.setGesture({
       side: 'left',
+      button: 'top',
       tapType: 'doubleTap',
       actionType: 'temperature',
       temperatureChange: 'increment',
@@ -559,10 +559,10 @@ describe('settings.setGesture / deleteGesture', () => {
     expect(out.id).toBe(1)
   })
 
-  it('updates an alarm gesture when one already exists', async () => {
-    const existing = { id: 5, side: 'left', tapType: 'doubleTap' }
+  it('updates an alarm gesture when the same button/tap already exists', async () => {
+    const existing = { id: 5, side: 'left', button: 'bottom', tapType: 'doubleTap' }
     const updated = {
-      id: 5, side: 'left', tapType: 'doubleTap', actionType: 'alarm',
+      id: 5, side: 'left', button: 'bottom', tapType: 'doubleTap', actionType: 'alarm',
       alarmBehavior: 'snooze',
       createdAt: new Date(0), updatedAt: new Date(0),
     }
@@ -570,6 +570,7 @@ describe('settings.setGesture / deleteGesture', () => {
 
     const out = await caller.setGesture({
       side: 'left',
+      button: 'bottom',
       tapType: 'doubleTap',
       actionType: 'alarm',
       alarmBehavior: 'snooze',
@@ -579,12 +580,12 @@ describe('settings.setGesture / deleteGesture', () => {
 
   it('deleteGesture throws NOT_FOUND when no row deleted', async () => {
     dbState.txRowsQueue.push([])
-    await expect(caller.deleteGesture({ side: 'left', tapType: 'doubleTap' })).rejects.toThrow(/not found/)
+    await expect(caller.deleteGesture({ side: 'left', button: 'top', tapType: 'doubleTap' })).rejects.toThrow(/not found/)
   })
 
   it('deleteGesture returns success when a row was deleted', async () => {
     dbState.txRowsQueue.push([{ id: 1 }])
-    const out = await caller.deleteGesture({ side: 'left', tapType: 'doubleTap' })
+    const out = await caller.deleteGesture({ side: 'left', button: 'top', tapType: 'doubleTap' })
     expect(out).toEqual({ success: true })
   })
 })
@@ -592,7 +593,7 @@ describe('settings.setGesture / deleteGesture', () => {
 describe('settings.setCoverButtonAction', () => {
   it('creates a temperature cover-button action when none exists', async () => {
     const created = {
-      id: 1, side: 'left', button: 'top', actionType: 'temperature',
+      id: 1, side: 'left', button: 'top', tapType: 'singleTap', actionType: 'temperature',
       temperatureChange: 'increment', temperatureAmount: 1,
       createdAt: new Date(0), updatedAt: new Date(0),
     }
@@ -609,9 +610,9 @@ describe('settings.setCoverButtonAction', () => {
   })
 
   it('updates a center cover button to toggle power', async () => {
-    const existing = { id: 5, side: 'right', button: 'middle' }
+    const existing = { id: 5, side: 'right', button: 'middle', tapType: 'singleTap' }
     const updated = {
-      id: 5, side: 'right', button: 'middle', actionType: 'power',
+      id: 5, side: 'right', button: 'middle', tapType: 'singleTap', actionType: 'power',
       powerBehavior: 'toggle',
       createdAt: new Date(0), updatedAt: new Date(0),
     }
@@ -803,9 +804,10 @@ describe('settings.setGesture — extra branches', () => {
   it('throws INTERNAL_SERVER_ERROR when update returning() yields no row', async () => {
     // Existing gesture found, but the update inside the same tx returns no
     // row (theoretically impossible with a returning() chain — guarded anyway).
-    dbState.txRowsQueue.push([{ id: 9, side: 'left', tapType: 'doubleTap' }], [])
+    dbState.txRowsQueue.push([{ id: 9, side: 'left', button: 'top', tapType: 'doubleTap' }], [])
     await expect(caller.setGesture({
       side: 'left',
+      button: 'top',
       tapType: 'doubleTap',
       actionType: 'temperature',
       temperatureChange: 'increment',
@@ -817,6 +819,7 @@ describe('settings.setGesture — extra branches', () => {
     dbState.txRowsQueue.push([], []) // no existing, insert returned nothing
     await expect(caller.setGesture({
       side: 'left',
+      button: 'top',
       tapType: 'doubleTap',
       actionType: 'temperature',
       temperatureChange: 'increment',
@@ -830,6 +833,7 @@ describe('settings.setGesture — extra branches', () => {
     })
     await expect(caller.setGesture({
       side: 'left',
+      button: 'top',
       tapType: 'doubleTap',
       actionType: 'temperature',
       temperatureChange: 'increment',
@@ -843,7 +847,7 @@ describe('settings.deleteGesture — extra branches', () => {
     dbMock.transaction.mockImplementationOnce(() => {
       throw new Error('delete boom')
     })
-    await expect(caller.deleteGesture({ side: 'left', tapType: 'doubleTap' })).rejects.toThrow(/Failed to delete gesture: delete boom/)
+    await expect(caller.deleteGesture({ side: 'left', button: 'top', tapType: 'doubleTap' })).rejects.toThrow(/Failed to delete gesture: delete boom/)
   })
 })
 

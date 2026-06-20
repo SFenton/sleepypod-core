@@ -186,6 +186,18 @@ describe('GestureActionHandler', () => {
     })
   })
 
+  describe('power action', () => {
+    test('toggles power and preserves cached target when powering on', async () => {
+      const gesture = { actionType: 'power', powerBehavior: 'toggle' }
+      const state = { targetTemperature: 72, isPowered: false, isAlarmVibrating: false }
+      const { deps, client } = makeDeps(gesture, state)
+
+      await new GestureActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'doubleTap'))
+
+      expect(client.setPower).toHaveBeenCalledWith('left', true, 72)
+    })
+  })
+
   describe('alarm action — active alarm', () => {
     test('dismisses active alarm', async () => {
       const gesture = { actionType: 'alarm', alarmBehavior: 'dismiss' }

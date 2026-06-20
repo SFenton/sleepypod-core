@@ -2,6 +2,7 @@ import type { HardwareClient } from './client'
 import { MAX_TEMP, MIN_TEMP, TEMP_NEUTRAL, type Side } from './types'
 
 export type CoverButton = 'top' | 'middle' | 'bottom'
+export type CoverButtonTapType = 'singleTap' | 'doubleTap' | 'tripleTap' | 'quadTap'
 
 export interface CoverButtonEvent {
   side: Side
@@ -27,9 +28,17 @@ export interface CoverButtonDeviceStateRow {
 }
 
 export interface CoverButtonActionDeps {
-  findActionConfig: (side: Side, button: CoverButton) => Promise<CoverButtonActionRow | null>
+  findActionConfig: (side: Side, button: CoverButton, tapType: CoverButtonTapType) => Promise<CoverButtonActionRow | null>
   findDeviceState: (side: Side) => Promise<CoverButtonDeviceStateRow | null>
   newHardwareClient: (socketPath: string) => HardwareClient
+}
+
+function tapTypeFromCount(count: number): CoverButtonTapType | null {
+  if (count === 1) return 'singleTap'
+  if (count === 2) return 'doubleTap'
+  if (count === 3) return 'tripleTap'
+  if (count === 4) return 'quadTap'
+  return null
 }
 
 export class CoverButtonActionHandler {
@@ -41,16 +50,17 @@ export class CoverButtonActionHandler {
   ) {}
 
   handle = async (event: CoverButtonEvent): Promise<void> => {
-    for (let i = 0; i < Math.max(1, event.count); i++) {
-      try {
-        await this.executeSingle(event)
-      }
-      catch (error) {
-        console.error(
-          `CoverButtonActionHandler: error executing action for ${event.side} ${event.button}:`,
-          error instanceof Error ? error.message : error
-        )
-      }
+    const tapType = tapTypeFromCount(event.count)
+    if (!tapType) return
+
+    try {
+      await this.executeSingle(event, tapType)
+    }
+    catch (error) {
+      console.error(
+        `CoverButtonActionHandler: error executing action for ${event.side} ${event.button} ${tapType}:`,
+        error instanceof Error ? error.message : error
+      )
     }
   }
 
@@ -59,8 +69,8 @@ export class CoverButtonActionHandler {
     this.snoozeTimeouts.clear()
   }
 
-  private executeSingle = async (event: CoverButtonEvent): Promise<void> => {
-    const action = await this.deps.findActionConfig(event.side, event.button)
+  private executeSingle = async (event: CoverButtonEvent, tapType: CoverButtonTapType): Promise<void> => {
+    const action = await this.deps.findActionConfig(event.side, event.button, tapType)
     if (!action) return
 
     if (action.actionType === 'temperature') {

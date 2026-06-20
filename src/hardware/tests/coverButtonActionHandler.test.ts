@@ -52,15 +52,25 @@ describe('CoverButtonActionHandler', () => {
     expect(client.clearAlarm).not.toHaveBeenCalled()
   })
 
-  test('executes temperature action once per count', async () => {
+  test('executes the gesture matching the button tap count', async () => {
     const action = { actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 }
     const state = { targetTemperature: 70, isPowered: true, isAlarmVibrating: false }
     const { deps, client } = makeDeps(action, state)
 
     await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'top', 2))
 
-    expect(client.setTemperature).toHaveBeenNthCalledWith(1, 'left', 71)
-    expect(client.setTemperature).toHaveBeenNthCalledWith(2, 'left', 71)
+    expect(deps.findActionConfig).toHaveBeenCalledWith('left', 'top', 'doubleTap')
+    expect(client.setTemperature).toHaveBeenCalledTimes(1)
+    expect(client.setTemperature).toHaveBeenCalledWith('left', 71)
+  })
+
+  test('ignores unsupported button tap counts', async () => {
+    const { deps, client } = makeDeps({ actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 })
+
+    await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'top', 5))
+
+    expect(deps.findActionConfig).not.toHaveBeenCalled()
+    expect(client.setTemperature).not.toHaveBeenCalled()
   })
 
   test('decrements and clamps temperature', async () => {

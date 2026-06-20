@@ -16,7 +16,11 @@ export const defaultGestureActionDeps: GestureActionDeps = {
     const [row] = await db
       .select()
       .from(tapGestures)
-      .where(and(eq(tapGestures.side, side), eq(tapGestures.tapType, tapType)))
+      .where(and(
+        eq(tapGestures.side, side),
+        eq(tapGestures.button, 'surface'),
+        eq(tapGestures.tapType, tapType)
+      ))
       .limit(1)
     return row ?? null
   },

@@ -32,7 +32,7 @@ export async function runMigrations() {
  */
 export async function seedDefaultData() {
   try {
-    const { coverButtonActions, deviceSettings, sideSettings, deviceState } = await import('./schema')
+    const { coverButtonActions, deviceSettings, sideSettings, deviceState, tapGestures } = await import('./schema')
 
     // Check if device settings exist
     const existingSettings = await db.select().from(deviceSettings).limit(1)
@@ -82,6 +82,15 @@ export async function seedDefaultData() {
           { side: 'right', button: 'top', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 },
           { side: 'right', button: 'middle', actionType: 'power', powerBehavior: 'toggle' },
           { side: 'right', button: 'bottom', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1 },
+        ]).onConflictDoNothing().run()
+
+        tx.insert(tapGestures).values([
+          { side: 'left', button: 'top', tapType: 'singleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 },
+          { side: 'left', button: 'middle', tapType: 'singleTap', actionType: 'power', powerBehavior: 'toggle' },
+          { side: 'left', button: 'bottom', tapType: 'singleTap', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1 },
+          { side: 'right', button: 'top', tapType: 'singleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 },
+          { side: 'right', button: 'middle', tapType: 'singleTap', actionType: 'power', powerBehavior: 'toggle' },
+          { side: 'right', button: 'bottom', tapType: 'singleTap', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1 },
         ]).onConflictDoNothing().run()
       })
 
