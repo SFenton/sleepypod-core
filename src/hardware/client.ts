@@ -245,8 +245,8 @@ export class HardwareClient {
 
     // Route per-side: ALARM_LEFT (5) or ALARM_RIGHT (6) with hex-CBOR.
     // See sharedClient.ts for the live-verification details on Pod 5 J55
-    // firmware. ALARM_SOLO (cmd 2) is not registered on that firmware and
-    // silently drops.
+    // firmware. ALARM_SOLO (cmd 17) reaches sparkAlarmS but does not produce a
+    // usable cover-motor start, so per-side commands remain the alarm path.
     const cmd = side === 'left' ? HardwareCommand.ALARM_LEFT : HardwareCommand.ALARM_RIGHT
     const response = await client.executeCommand(cmd, encodeAlarmPayload(config))
     const parsed = parseSimpleResponse(response)

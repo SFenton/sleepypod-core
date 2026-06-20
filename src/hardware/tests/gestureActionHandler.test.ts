@@ -30,14 +30,19 @@ const makeDeps = (
   gestureRow: object | null = null,
   stateRow: object | null = null,
   client: HardwareClient = makeMockClient()
-): { deps: GestureActionDeps, client: HardwareClient } => ({
-  client,
-  deps: {
-    findGestureConfig: vi.fn().mockResolvedValue(gestureRow),
-    findDeviceState: vi.fn().mockResolvedValue(stateRow),
-    newHardwareClient: vi.fn().mockReturnValue(client),
-  },
-})
+): { deps: GestureActionDeps, client: HardwareClient, recordTemperatureChange: ReturnType<typeof vi.fn> } => {
+  const recordTemperatureChange = vi.fn().mockResolvedValue(undefined)
+  return {
+    client,
+    deps: {
+      findGestureConfig: vi.fn().mockResolvedValue(gestureRow),
+      findDeviceState: vi.fn().mockResolvedValue(stateRow),
+      newHardwareClient: vi.fn().mockReturnValue(client),
+      recordTemperatureChange,
+    },
+    recordTemperatureChange,
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -64,11 +69,15 @@ describe('GestureActionHandler', () => {
     test('increments temperature', async () => {
       const gesture = { actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 5 }
       const state = { targetTemperature: 70, isPowered: true, isAlarmVibrating: false }
-      const { deps, client } = makeDeps(gesture, state)
+      const { deps, client, recordTemperatureChange } = makeDeps(gesture, state)
 
       await new GestureActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'doubleTap'))
 
       expect(client.setTemperature).toHaveBeenCalledWith('left', 75)
+      expect(recordTemperatureChange).toHaveBeenCalledWith('left', 75)
+      expect(vi.mocked(client.setTemperature).mock.invocationCallOrder[0]).toBeLessThan(
+        recordTemperatureChange.mock.invocationCallOrder[0],
+      )
     })
 
     test('decrements temperature', async () => {

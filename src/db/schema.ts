@@ -120,6 +120,13 @@ export const tapGestures = sqliteTable('tap_gestures', {
   }),
   // For power actions
   powerBehavior: text('power_behavior', { enum: ['toggle', 'on', 'off'] }),
+  // Optional short haptic feedback after the action executes
+  feedbackVibrationEnabled: integer('feedback_vibration_enabled', { mode: 'boolean' })
+    .notNull()
+    .default(false),
+  feedbackVibrationIntensity: integer('feedback_vibration_intensity'), // 1-100
+  feedbackVibrationPattern: text('feedback_vibration_pattern', { enum: ['double', 'rise'] }),
+  feedbackVibrationDuration: integer('feedback_vibration_duration'), // 1-10 seconds
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`),
@@ -148,6 +155,13 @@ export const coverButtonActions = sqliteTable('cover_button_actions', {
   alarmInactiveBehavior: text('alarm_inactive_behavior', {
     enum: ['power', 'none'],
   }),
+  // Optional short haptic feedback after the action executes
+  feedbackVibrationEnabled: integer('feedback_vibration_enabled', { mode: 'boolean' })
+    .notNull()
+    .default(false),
+  feedbackVibrationIntensity: integer('feedback_vibration_intensity'), // 1-100
+  feedbackVibrationPattern: text('feedback_vibration_pattern', { enum: ['double', 'rise'] }),
+  feedbackVibrationDuration: integer('feedback_vibration_duration'), // 1-10 seconds
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`),

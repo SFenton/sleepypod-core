@@ -199,10 +199,12 @@ the bridge resolves config in this order: `device_settings` row > env var > buil
 | `<prefix>/<device-id>/availability` | pod → broker | `online` / `offline` (LWT) |
 | `<prefix>/<device-id>/state/device-status` | pod → broker | full deviceStatus JSON |
 | `<prefix>/<device-id>/state/<side>/climate` | pod → broker | per-side temp / mode |
+| `<prefix>/<device-id>/state/<side>/target-level` | pod → broker | `{"level": -10..10, "targetTemperature": <°F>, "isPowered": <boolean>}` |
 | `<prefix>/<device-id>/state/water-level` | pod → broker | `low` / `ok` / `unknown` |
 | `<prefix>/<device-id>/state/biometrics/<side>` | pod → broker | latest HR / HRV / BR |
 | `<prefix>/<device-id>/state/environment/ambient` | pod → broker | `{"ts": <epoch_ms>, "temperature": <number\|null>, "humidity": <number\|null>}` (°C, %) |
 | `<prefix>/<device-id>/cmd/set-temperature` | broker → pod | `{"side","temperature","duration?"}` |
+| `<prefix>/<device-id>/cmd/set-target-level` | broker → pod | `{"side","level","duration?"}` where level is normalized `-10..10` |
 | `<prefix>/<device-id>/cmd/set-power` | broker → pod | `{"side","powered","temperature?"}` |
 | `<prefix>/<device-id>/cmd/set-alarm` | broker → pod | `{"side","vibrationIntensity","vibrationPattern","duration"}` |
 | `<prefix>/<device-id>/cmd/clear-alarm` | broker → pod | `{"side"}` |

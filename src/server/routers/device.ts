@@ -476,7 +476,7 @@ export const deviceRouter = router({
 
         broadcastMutationStatus(input.side, input.powered
           ? { targetTemperature: input.temperature ?? 75, targetLevel: fahrenheitToLevel(input.temperature ?? 75) }
-          : { targetLevel: 0 },
+          : { targetTemperature: null, targetLevel: 0 },
         )
         return { success: true }
       }, 'Failed to set power')

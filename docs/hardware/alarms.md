@@ -75,13 +75,12 @@ flowchart TB
 
 ### Reality check: Pod 5 J55 firmware
 
-- **`ALARM_SOLO` (cmd 2) silently drops.** The strings
+- **`ALARM_SOLO` (cmd 17) is not a usable cover-motor path.** The strings
   `sparkAlarmS`, `[alarm] vib. solo`, `setHighCurrentVibration`,
   `enabling Pod 2.0 vibration (simultaneous motors)` are present in the
-  binary, but the spark function is not registered with the DAC on this
-  firmware. frank's `dac_loop` logs the incoming frame and nothing else
-  — no motor write. The DAC response is `0` (default for an unregistered
-  opcode), which makes the call look successful to the API layer.
+  binary, and cmd 17 reaches `sparkAlarmS`, but live probing shows it
+  immediately clears both alarm channels without an `[alarm io] ... start`
+  motor write. It also does not enter the center-button haptic confirm path.
 - **`ALARM_LEFT` / `ALARM_RIGHT` (cmd 5 / 6) fire the cover motor on
   cover-only pods.** The pillow label gate (`Pillow.cpp:383`) only
   affects the separate pillow-accessory motor; it runs AFTER the cover
@@ -95,6 +94,47 @@ flowchart TB
 `side: 'left'` and `ALARM_RIGHT` (cmd 6) for `side: 'right'`, both with
 the hex-CBOR payload from `encodeAlarmPayload()`. Per-side independence
 is real.
+
+## Hidden center-confirm haptic command
+
+The exact center-button confirmation buzz is **not** a DAC alarm command. Live
+binary analysis and Sensor USART probing on Pod 5 J55 firmware found a hidden
+Sensor command used by the native haptic path:
+
+| Field | Value for exact confirm | Meaning |
+|-------|--------------------------|---------|
+| opcode | `0x40` | Hidden Sensor haptic command |
+| side | `0x00` left, `0x01` right | Cover side |
+| power | `0x19` (`25`) | Same power as center double-click |
+| pattern | `0x07` | Same firmware haptic pattern as center double-click |
+| pulse count | `0x02` | Two quick pulses; firmware expands this to 750ms |
+
+The command uses the normal Sensor/Frozen USART frame wrapper: `0x7E`, payload
+length, payload bytes, CRC16-CCITT (`0x1D0F` seed) over the payload. Exact frames:
+
+```text
+left:  payload 40 00 19 07 02 → frame 7e 05 40 00 19 07 02 84 81
+right: payload 40 01 19 07 02 → frame 7e 05 40 01 19 07 02 f2 35
+```
+
+Live proof:
+
+```text
+FW: ... alarm[left] haptic mode--dur 2->750
+FW: ... alarm[left] start: power 25, pattern 7, dur 750 ms
+```
+
+This is now the cover-button feedback path (`src/hardware/sensorHaptics.ts`).
+It writes one short frame to `/dev/ttyS2` without changing tty settings, while
+frankenfirmware remains the Sensor owner/reader. Normal wake alarms still use
+`ALARM_LEFT` / `ALARM_RIGHT`; this hidden command is only for fast confirmation
+haptics.
+
+**Retrigger behavior:** the Sensor MCU ignores a second same-side haptic command
+while the 750ms confirm is still running. SleepyPod queues same-side feedback
+for the next available slot (~760ms after the previous start) so quick top then
+bottom actions get deterministic confirmation instead of a silently dropped
+second buzz. Opposite sides are independent and can fire immediately.
 
 ## CBOR payload
 
@@ -236,11 +276,12 @@ handler. If `alarm[left] start` appears followed quickly by
 ## Why two layers of motor drivers?
 
 The cover has two **LP5009** chips — one per side — that drive both LEDs
-and the vibration motor on that side. Button-press haptic feedback is
-generated locally by the cover MCU writing to the LP5009; the pod never
-sees those motor commands. The alarm path is the other direction: the pod
-tells the cover MCU "vibrate now", and the cover MCU writes the
-intensity/pattern envelope to its local LP5009.
+and the vibration motor on that side. Physical center-button haptic feedback
+is generated locally by the cover MCU writing to the LP5009. The hidden Sensor
+`0x40` command above lets the pod request that same haptic envelope directly.
+The alarm path is separate: the pod tells the cover MCU "vibrate now" through
+`ALARM_LEFT` / `ALARM_RIGHT`, and the cover MCU writes the alarm envelope to its
+local LP5009.
 
 The Pillow accessory has its own MCU and its own motor on a separate
 UART link. The firmware's `Pillow.cpp` path is what drives it. The cover
@@ -251,11 +292,13 @@ pods (a warning logs but the cover motor has already started).
 ## Files
 
 - `src/hardware/alarmPayload.ts` — `encodeAlarmPayload()` (single source of truth)
+- `src/hardware/sensorHaptics.ts` — hidden Sensor `0x40` center-confirm haptic
+  frame and same-side retrigger queue
 - `src/hardware/sharedClient.ts` — production write path (`getSharedHardwareClient`)
 - `src/hardware/client.ts` — dev/test write path
 - `src/hardware/types.ts` — `HardwareCommand.ALARM_LEFT/RIGHT/CLEAR` (the
-  enum's `ALARM_SOLO` entry maps to cmd 2 but is a dead opcode on the
-  current firmware — see [Reality check](#reality-check-pod-5-j55-firmware))
+  enum's `ALARM_SOLO` entry maps to cmd 17 but is not a usable cover-motor path
+  on the current firmware — see [Reality check](#reality-check-pod-5-j55-firmware))
 - `src/server/routers/device.ts` — `setAlarm` / `clearAlarm` / `snoozeAlarm` tRPC procedures + `execute` raw passthrough
 - `src/scheduler/jobManager.ts` — fires scheduled `alarm_schedules` rows
 - `src/components/Schedule/AlarmEditor.tsx` — UI Test button + persistence
@@ -264,6 +307,32 @@ pods (a warning logs but the cover motor has already started).
 
 - Confirm `ALARM_LEFT` / `ALARM_RIGHT` cover-motor write works on Pod 3
   and Pod 4 firmware (verified on Pod 5 J55 only).
-- Investigate why `sparkAlarmS` (cmd 2) is unregistered. Strings remain
-  in the binary but no spark function attaches. Could be an 8 Sleep
-  firmware change between releases; worth re-probing if firmware updates.
+- Confirm hidden Sensor opcode `0x40` on Pod 3 / Pod 4 firmware before enabling
+  exact confirm haptics on those generations.
+
+## Rejected DAC paths for center-confirm haptics
+
+The center-button double-click confirm buzz is not an alarm pattern. On Pod 5
+J55, a physical center double-tap logs:
+
+```text
+[TTC] processing [button] side left { button: middle, type: short, count: 2 }
+[buttons] sent button event s0x00 i0x01 c0x02
+alarm[left] haptic mode--dur 2->750
+alarm[left] start: power 25, pattern 7, dur 750 ms
+```
+
+The DAC command surface cannot currently trigger that path:
+
+- `ALARM_LEFT` / `ALARM_RIGHT` with normal CBOR payloads route through alarm
+  parsing and enforce the 10s alarm duration floor.
+- Raw `ALARM_LEFT` payloads with `du: 2` and `pi` values `double`, `rise`,
+  `testdrive`, or `luna` log `sparkAlarmL` and then `alarm[left] off`; they do
+  not enter haptic mode.
+- Raw `pi: "haptic"` and `pi: "7"` are rejected by `parseAlarmPattern`; raw
+  numeric `pi: 7` does not produce the center haptic path.
+- `ALARM_SOLO` / cmd 17 reaches `sparkAlarmS`, but clears both alarm channels
+  without an `[alarm io] ... start` write.
+
+SleepyPod Core therefore bypasses the DAC alarm command surface for cover-button
+feedback and writes the hidden Sensor `0x40` frame documented above.

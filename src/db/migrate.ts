@@ -85,12 +85,10 @@ export async function seedDefaultData() {
         ]).onConflictDoNothing().run()
 
         tx.insert(tapGestures).values([
-          { side: 'left', button: 'top', tapType: 'singleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 },
-          { side: 'left', button: 'middle', tapType: 'singleTap', actionType: 'power', powerBehavior: 'toggle' },
-          { side: 'left', button: 'bottom', tapType: 'singleTap', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1 },
-          { side: 'right', button: 'top', tapType: 'singleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 },
-          { side: 'right', button: 'middle', tapType: 'singleTap', actionType: 'power', powerBehavior: 'toggle' },
-          { side: 'right', button: 'bottom', tapType: 'singleTap', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1 },
+          { side: 'left', button: 'top', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 },
+          { side: 'left', button: 'bottom', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1 },
+          { side: 'right', button: 'top', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 },
+          { side: 'right', button: 'bottom', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1 },
         ]).onConflictDoNothing().run()
       })
 

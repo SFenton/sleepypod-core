@@ -47,6 +47,7 @@ const WS_PORT = Number(process.env.PIEZO_WS_PORT ?? 3001)
 const RAW_DATA_DIR = process.env.RAW_DATA_DIR ?? '/persistent'
 const FILE_POLL_INTERVAL_MS = 10 // match Python's 10 ms poll for new data
 const SEEK_MAX_DURATION_S = 30 // max seconds of data to replay on seek
+const MAX_LIVE_READ_BYTES_PER_TICK = 1024 * 1024
 // Keep frame-index entries within the seek window plus a small margin so the
 // index stays bounded on long-running streams (24h at 50fps was ~70MB).
 const FRAME_INDEX_RETENTION_S = SEEK_MAX_DURATION_S + 10
@@ -638,6 +639,13 @@ export function startPiezoStreamServer(): WebSocketServer {
   let currentPath: string | null = null
   let fileBuffer = Buffer.alloc(0)
   let readOffset = 0 // offset into the actual file (not the buffer)
+  const rawFilesAtStartup = new Set<string>()
+  try {
+    for (const entry of fs.readdirSync(RAW_DATA_DIR)) {
+      if (entry.endsWith('.RAW')) rawFilesAtStartup.add(path.join(RAW_DATA_DIR, entry))
+    }
+  }
+  catch { /* RAW dir may not exist yet */ }
 
   wss.on('connection', (ws) => {
     console.log('[sensorStream] Client connected')
@@ -675,10 +683,19 @@ export function startPiezoStreamServer(): WebSocketServer {
 
     // Switch files if a newer one appeared
     if (latest !== currentPath) {
-      console.log(`[sensorStream] Switched to RAW file: ${path.basename(latest)}`)
+      const startOffset = (() => {
+        if (!rawFilesAtStartup.has(latest)) return 0
+        try {
+          return fs.statSync(latest).size
+        }
+        catch {
+          return 0
+        }
+      })()
+      console.log(`[sensorStream] Switched to RAW file: ${path.basename(latest)} (tailing from ${startOffset} bytes)`)
       currentPath = latest
       fileBuffer = Buffer.alloc(0)
-      readOffset = 0
+      readOffset = startOffset
       // Reset the sidecar frame index for the new file
       frameIndex.length = 0
       indexedFilePath = latest
@@ -701,7 +718,16 @@ export function startPiezoStreamServer(): WebSocketServer {
         return // no new data
       }
 
-      const newBytes = Buffer.alloc(fileSize - readOffset)
+      let bytesToRead = fileSize - readOffset
+      if (bytesToRead > MAX_LIVE_READ_BYTES_PER_TICK) {
+        const skipped = bytesToRead - MAX_LIVE_READ_BYTES_PER_TICK
+        readOffset += skipped
+        fileBuffer = Buffer.alloc(0)
+        bytesToRead = MAX_LIVE_READ_BYTES_PER_TICK
+        console.warn('[sensorStream] Skipped %d stale RAW bytes to keep live tail bounded', skipped)
+      }
+
+      const newBytes = Buffer.alloc(bytesToRead)
       fs.readSync(fd, newBytes, 0, newBytes.length, readOffset)
       fs.closeSync(fd)
       fd = null

@@ -148,8 +148,8 @@ describe('settings.getAll', () => {
       { side: 'right', name: 'R', awayMode: false, alwaysOn: false, autoOffEnabled: false, autoOffMinutes: 30, awayStart: null, awayReturn: null, createdAt: new Date(0), updatedAt: new Date(0) },
     ]
     const gestures = [
-      { id: 1, side: 'left', button: 'top', tapType: 'singleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
-      { id: 2, side: 'right', button: 'middle', tapType: 'singleTap', actionType: 'power', powerBehavior: 'toggle', createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: 1, side: 'left', button: 'top', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: 2, side: 'right', button: 'bottom', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
     ]
     dbState.topRowsQueue.push([device], sides, gestures)
 
@@ -529,12 +529,31 @@ describe('settings.setGesture / deleteGesture', () => {
     const out = await caller.deleteGesture({ side: 'left', button: 'top', tapType: 'doubleTap' })
     expect(out).toEqual({ success: true })
   })
+
+  it('rejects unsupported cover-button gestures', async () => {
+    await expect(caller.setGesture({
+      side: 'left',
+      button: 'middle',
+      tapType: 'doubleTap',
+      actionType: 'power',
+      powerBehavior: 'toggle',
+    })).rejects.toThrow(/only supported for double-tap on the plus\/minus buttons/)
+
+    await expect(caller.setGesture({
+      side: 'left',
+      button: 'top',
+      tapType: 'singleTap',
+      actionType: 'temperature',
+      temperatureChange: 'increment',
+      temperatureAmount: 1,
+    })).rejects.toThrow(/only supported for double-tap on the plus\/minus buttons/)
+  })
 })
 
 describe('settings.setCoverButtonAction', () => {
-  it('creates a temperature cover-button action when none exists', async () => {
+  it('creates a double-tap temperature cover-button action when none exists', async () => {
     const created = {
-      id: 1, side: 'left', button: 'top', tapType: 'singleTap', actionType: 'temperature',
+      id: 1, side: 'left', button: 'top', tapType: 'doubleTap', actionType: 'temperature',
       temperatureChange: 'increment', temperatureAmount: 1,
       createdAt: new Date(0), updatedAt: new Date(0),
     }
@@ -550,22 +569,13 @@ describe('settings.setCoverButtonAction', () => {
     expect(out.id).toBe(1)
   })
 
-  it('updates a center cover button to toggle power', async () => {
-    const existing = { id: 5, side: 'right', button: 'middle', tapType: 'singleTap' }
-    const updated = {
-      id: 5, side: 'right', button: 'middle', tapType: 'singleTap', actionType: 'power',
-      powerBehavior: 'toggle',
-      createdAt: new Date(0), updatedAt: new Date(0),
-    }
-    dbState.txRowsQueue.push([existing], [updated])
-
-    const out = await caller.setCoverButtonAction({
+  it('rejects center cover button actions', async () => {
+    await expect(caller.setCoverButtonAction({
       side: 'right',
       button: 'middle',
       actionType: 'power',
       powerBehavior: 'toggle',
-    })
-    expect(out.powerBehavior).toBe('toggle')
+    })).rejects.toThrow(/only supported for double-tap on the plus\/minus buttons/)
   })
 
   it('wraps transaction errors for cover-button actions', async () => {
