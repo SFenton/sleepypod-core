@@ -102,7 +102,8 @@ const streamState = streamGlobal.__sleepypodSensorStream ??= createStreamState()
 
 const NATS_SOURCE_DISABLED = process.env.PIEZO_NATS_DISABLED === '1'
 function natsTiming(value: string | undefined, fallback: number, allowZero: boolean): number {
-  const parsed = Number(value ?? fallback)
+  if (value === undefined || value.trim() === '') return fallback
+  const parsed = Number(value)
   return Number.isFinite(parsed) && (allowZero ? parsed >= 0 : parsed > 0) ? parsed : fallback
 }
 const NATS_GRACE_MS = natsTiming(process.env.PIEZO_NATS_GRACE_MS, 60_000, true)

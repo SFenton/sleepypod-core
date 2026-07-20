@@ -934,6 +934,8 @@ def main() -> None:
 
     try:
         for record in follower.read_records():
+            if not isinstance(record, dict):
+                continue
             rtype = record.get("type")
 
             # Surface genuinely-new firmware types once (blanketReadings, log,

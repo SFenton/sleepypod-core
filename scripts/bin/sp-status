@@ -24,9 +24,10 @@ active_or() {
   state=$(systemctl is-active "$unit" 2>/dev/null || true)
   if [ -z "$state" ]; then
     echo "missing"
-  else
-    echo "$state"
+    return
   fi
+  state=$(systemctl is-active "$unit" 2>/dev/null || true)
+  echo "${state:-inactive}"
 }
 
 port_open() {
