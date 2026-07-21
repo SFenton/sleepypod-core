@@ -805,8 +805,14 @@ async function startNatsSource(expectedServer: WebSocketServer): Promise<boolean
     const source = await startNatsFrameSource({
       decode: decodeSensorFrames,
       onFrame: (frame) => { if (streamState.wss === expectedServer) dispatchSensorFrame(frame) },
-      onReady: () => console.log('[sensorStream] NATS frame source active'),
-      onClose: err => console.error('[sensorStream] NATS frame source closed', err ?? ''),
+      onReady: () => {
+        if (streamState.wss === expectedServer) console.log('[sensorStream] NATS frame source active')
+      },
+      onClose: (err) => {
+        if (streamState.wss === expectedServer) {
+          console.error('[sensorStream] NATS frame source closed', err ?? '')
+        }
+      },
     })
     if (streamState.wss !== expectedServer) {
       // Server shut down while we were connecting — don't leak the connection.
