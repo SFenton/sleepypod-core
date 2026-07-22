@@ -14,6 +14,7 @@ const sqlMock = vi.hoisted(() => ({
   eq: vi.fn((left: unknown, right: unknown) => ({ op: 'eq', left, right })),
   gte: vi.fn((left: unknown, right: unknown) => ({ op: 'gte', left, right })),
   lte: vi.fn((left: unknown, right: unknown) => ({ op: 'lte', left, right })),
+  ne: vi.fn((left: unknown, right: unknown) => ({ op: 'ne', left, right })),
 }))
 
 vi.mock('drizzle-orm', async (importOriginal) => {
@@ -203,7 +204,6 @@ describe('calibration.triggerCalibration', () => {
     expect(renameSrc).toBe(tmpPath)
     expect(renameDst).toBe('/persistent/sleepypod-data/.calibrate-trigger.1700000000123')
 
-    // Pending row inserted with onConflictDoUpdate
     expect(dbMock.insert).toHaveBeenCalledTimes(1)
     expect(dbMock.onConflict).toHaveBeenCalledTimes(1)
     expect(dbMock.values).toHaveBeenCalledWith({
@@ -216,10 +216,21 @@ describe('calibration.triggerCalibration', () => {
     expect(dbMock.onConflict).toHaveBeenCalledWith({
       target: [expect.anything(), expect.anything()],
       set: { status: 'pending', createdAt: expect.any(Date), errorMessage: null },
+      setWhere: { op: 'ne', left: expect.anything(), right: 'completed' },
     })
 
     expect(result.triggered).toBe(true)
     expect(result.message).toBe('Calibration queued for left/piezo. The calibrator module will process it within 10 seconds.')
+  })
+
+  it('atomically keeps a completed profile active while its replacement is queued', async () => {
+    await caller.triggerCalibration({ side: 'left', sensorType: 'capacitance' })
+
+    expect(dbMock.insert).toHaveBeenCalledTimes(1)
+    expect(dbMock.onConflict).toHaveBeenCalledWith(expect.objectContaining({
+      setWhere: { op: 'ne', left: expect.anything(), right: 'completed' },
+    }))
+    expect(dbMock.select).not.toHaveBeenCalled()
   })
 
   it('uses Unknown error for a non-Error trigger failure', async () => {
