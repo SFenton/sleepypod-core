@@ -40,6 +40,15 @@ function resetSchema(): void {
       target_temperature REAL,
       is_powered INTEGER NOT NULL DEFAULT 0,
       is_alarm_vibrating INTEGER NOT NULL DEFAULT 0,
+      alarm_state TEXT NOT NULL DEFAULT 'idle',
+      alarm_occurrence_id TEXT,
+      alarm_schedule_id INTEGER,
+      alarm_scheduled_for INTEGER,
+      alarm_snoozed_until INTEGER,
+      alarm_ringing_until INTEGER,
+      alarm_vibration_intensity INTEGER,
+      alarm_vibration_pattern TEXT,
+      alarm_duration INTEGER,
       water_level TEXT DEFAULT 'unknown',
       powered_on_at INTEGER,
       last_updated INTEGER NOT NULL DEFAULT (unixepoch())
@@ -730,6 +739,25 @@ describe('DeviceStateSync — sync targetTemperature behaviour without mutation'
     const row = readSide('right')
     expect(row?.target_temperature).toBeNull()
     expect(row?.is_powered).toBe(0)
+  })
+
+  it('keeps residual currentLevel from re-powering a neutral target', async () => {
+    seedSide('left', true, 85)
+
+    await sync.sync(status({
+      side: 'left',
+      currentTemperature: 84,
+      targetTemperature: null,
+      currentLevel: 5,
+      targetLevel: 0,
+      heatingDuration: 100,
+    }))
+
+    const row = readSide('left')
+    expect(row?.current_temperature).toBe(84)
+    expect(row?.target_temperature).toBeNull()
+    expect(row?.is_powered).toBe(0)
+    expect(row?.powered_on_at).toBeNull()
   })
 
   it('writes targetTemperature from firmware when actively heating', async () => {

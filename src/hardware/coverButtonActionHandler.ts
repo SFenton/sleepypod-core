@@ -1,5 +1,6 @@
 import type { HardwareClient } from './client'
-import { MAX_TEMP, MIN_TEMP, TEMP_NEUTRAL, type Side } from './types'
+import { fahrenheitToLevel, levelToFahrenheit, MAX_TEMP, MIN_TEMP, TEMP_NEUTRAL, type Side } from './types'
+import { getAlarmStatus, snoozeAlarm, stopAlarm } from './snoozeManager'
 
 export type CoverButton = 'top' | 'middle' | 'bottom'
 export type CoverButtonTapType = 'singleTap' | 'doubleTap' | 'tripleTap' | 'quadTap'
@@ -15,6 +16,7 @@ export interface CoverButtonActionRow {
   actionType: 'temperature' | 'alarm' | 'power'
   temperatureChange: 'increment' | 'decrement' | null
   temperatureAmount: number | null
+  temperatureStepMode?: 'degree' | 'level' | null
   powerBehavior: 'toggle' | 'on' | 'off' | null
   alarmBehavior: 'snooze' | 'dismiss' | null
   alarmSnoozeDuration: number | null
@@ -40,6 +42,8 @@ export interface CoverButtonActionDeps {
 }
 
 const TAP_AGGREGATION_WINDOW_MS = 650
+const MIN_USER_LEVEL = -10
+const MAX_USER_LEVEL = 10
 
 function tapTypeFromCount(count: number): CoverButtonTapType | null {
   if (count === 1) return 'singleTap'
@@ -56,7 +60,6 @@ interface PendingCoverTap {
 }
 
 export class CoverButtonActionHandler {
-  private readonly snoozeTimeouts: Set<ReturnType<typeof setTimeout>> = new Set()
   private readonly pendingTaps = new Map<string, PendingCoverTap>()
 
   constructor(
@@ -97,8 +100,6 @@ export class CoverButtonActionHandler {
   cleanup = (): void => {
     for (const pending of this.pendingTaps.values()) clearTimeout(pending.timer)
     this.pendingTaps.clear()
-    for (const id of this.snoozeTimeouts) clearTimeout(id)
-    this.snoozeTimeouts.clear()
   }
 
   private queueSingleTap = async (event: CoverButtonEvent): Promise<void> => {
@@ -187,7 +188,7 @@ export class CoverButtonActionHandler {
     if (!action.feedbackVibrationEnabled) return
 
     const state = await this.deps.findDeviceState(side)
-    if (state?.isAlarmVibrating) return
+    if (getAlarmStatus(side).active || state?.isAlarmVibrating) return
 
     try {
       await this.deps.triggerFeedbackHaptic(side)
@@ -205,11 +206,13 @@ export class CoverButtonActionHandler {
     action: CoverButtonActionRow,
   ): Promise<void> => {
     const state = await this.deps.findDeviceState(side)
-    const currentTemp = state?.targetTemperature ?? 75
+    const currentTemp = state?.targetTemperature ?? TEMP_NEUTRAL
     const amount = action.temperatureAmount ?? 0
     if (!action.temperatureChange) return
-    const delta = action.temperatureChange === 'increment' ? amount : -amount
-    const newTemp = Math.min(MAX_TEMP, Math.max(MIN_TEMP, currentTemp + delta))
+    const direction = action.temperatureChange === 'increment' ? 1 : -1
+    const newTemp = action.temperatureStepMode === 'level'
+      ? this.temperatureForLevelStep(currentTemp, amount * direction)
+      : Math.min(MAX_TEMP, Math.max(MIN_TEMP, currentTemp + (amount * direction)))
 
     const client = this.deps.newHardwareClient(this.socketPath)
     try {
@@ -220,6 +223,18 @@ export class CoverButtonActionHandler {
     finally {
       client.disconnect()
     }
+  }
+
+  private temperatureForLevelStep = (currentTemp: number, delta: number): number => {
+    const currentUserLevel = Math.min(
+      MAX_USER_LEVEL,
+      Math.max(MIN_USER_LEVEL, Math.round(fahrenheitToLevel(currentTemp) / 10))
+    )
+    const nextUserLevel = Math.min(
+      MAX_USER_LEVEL,
+      Math.max(MIN_USER_LEVEL, currentUserLevel + delta)
+    )
+    return levelToFahrenheit(nextUserLevel * 10)
   }
 
   private handlePowerAction = async (
@@ -248,9 +263,9 @@ export class CoverButtonActionHandler {
     action: CoverButtonActionRow,
   ): Promise<void> => {
     const state = await this.deps.findDeviceState(side)
-    const isAlarmVibrating = state?.isAlarmVibrating ?? false
+    const alarmActive = getAlarmStatus(side).active || (state?.isAlarmVibrating ?? false)
 
-    if (!isAlarmVibrating) {
+    if (!alarmActive) {
       if (action.alarmInactiveBehavior === 'power') {
         await this.handlePowerAction(side, { ...action, actionType: 'power', powerBehavior: 'toggle' })
       }
@@ -261,26 +276,17 @@ export class CoverButtonActionHandler {
     try {
       await client.connect()
       if (action.alarmBehavior === 'dismiss') {
-        await client.clearAlarm(side)
-        const { cancelSnooze } = await import('./snoozeManager')
-        cancelSnooze(side)
+        await stopAlarm(side, { client })
       }
       else if (action.alarmBehavior === 'snooze') {
-        await client.clearAlarm(side)
-        const snoozeDuration = action.alarmSnoozeDuration ?? 300
-        const timeoutId = setTimeout(() => {
-          this.snoozeTimeouts.delete(timeoutId)
-          const restartClient = this.deps.newHardwareClient(this.socketPath)
-          restartClient.connect()
-            .then(() => restartClient.setAlarm(side, {
-              vibrationIntensity: 50,
-              vibrationPattern: 'rise',
-              duration: 180,
-            }))
-            .catch(err => console.error('CoverButtonActionHandler: snooze restart failed:', err))
-            .finally(() => restartClient.disconnect())
-        }, snoozeDuration * 1000)
-        this.snoozeTimeouts.add(timeoutId)
+        await snoozeAlarm(side, action.alarmSnoozeDuration ?? 300, {
+          client,
+          fallbackConfig: {
+            vibrationIntensity: 50,
+            vibrationPattern: 'rise',
+            duration: 180,
+          },
+        })
       }
     }
     finally {

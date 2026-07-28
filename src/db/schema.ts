@@ -112,6 +112,7 @@ export const tapGestures = sqliteTable('tap_gestures', {
     enum: ['increment', 'decrement'],
   }),
   temperatureAmount: integer('temperature_amount'), // 0-10
+  temperatureStepMode: text('temperature_step_mode', { enum: ['degree', 'level'] }),
   // For alarm actions
   alarmBehavior: text('alarm_behavior', { enum: ['snooze', 'dismiss'] }),
   alarmSnoozeDuration: integer('alarm_snooze_duration'), // 60-600 seconds
@@ -147,6 +148,7 @@ export const coverButtonActions = sqliteTable('cover_button_actions', {
     enum: ['increment', 'decrement'],
   }),
   temperatureAmount: integer('temperature_amount'), // 0-10
+  temperatureStepMode: text('temperature_step_mode', { enum: ['degree', 'level'] }),
   // For power actions
   powerBehavior: text('power_behavior', { enum: ['toggle', 'on', 'off'] }),
   // For alarm actions
@@ -275,6 +277,17 @@ export const deviceState = sqliteTable('device_state', {
   isAlarmVibrating: integer('is_alarm_vibrating', { mode: 'boolean' })
     .notNull()
     .default(false),
+  alarmState: text('alarm_state', { enum: ['idle', 'ringing', 'snoozed'] })
+    .notNull()
+    .default('idle'),
+  alarmOccurrenceId: text('alarm_occurrence_id'),
+  alarmScheduleId: integer('alarm_schedule_id'),
+  alarmScheduledFor: integer('alarm_scheduled_for', { mode: 'timestamp' }),
+  alarmSnoozedUntil: integer('alarm_snoozed_until', { mode: 'timestamp' }),
+  alarmRingingUntil: integer('alarm_ringing_until', { mode: 'timestamp' }),
+  alarmVibrationIntensity: integer('alarm_vibration_intensity'),
+  alarmVibrationPattern: text('alarm_vibration_pattern', { enum: ['double', 'rise'] }),
+  alarmDuration: integer('alarm_duration'),
   waterLevel: text('water_level', { enum: ['low', 'ok', 'unknown'] }).default(
     'unknown'
   ),

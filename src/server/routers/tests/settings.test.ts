@@ -48,6 +48,8 @@ const dbState = vi.hoisted(() => ({
   txRowsQueue: [] as unknown[][],
   // Sequential queue for db.update().set().where() awaitable result (lifecycle revert path)
   topUpdateQueue: [] as Array<unknown>,
+  txValuesCalls: [] as unknown[],
+  txSetCalls: [] as unknown[],
   popTop(): unknown[] { return dbState.topRowsQueue.shift() ?? [] },
   popTx(): unknown[] { return dbState.txRowsQueue.shift() ?? [] },
 }))
@@ -70,8 +72,14 @@ const dbMock = vi.hoisted(() => {
     chain.where = vi.fn(() => chain)
     chain.limit = vi.fn(() => chain)
     chain.from = vi.fn(() => chain)
-    chain.values = vi.fn(() => chain)
-    chain.set = vi.fn(() => chain)
+    chain.values = vi.fn((value: unknown) => {
+      dbState.txValuesCalls.push(value)
+      return chain
+    })
+    chain.set = vi.fn((value: unknown) => {
+      dbState.txSetCalls.push(value)
+      return chain
+    })
     chain.returning = vi.fn(() => chain)
     chain.all = vi.fn(() => dbState.popTx())
     chain.run = vi.fn(() => undefined)
@@ -124,6 +132,8 @@ beforeEach(() => {
   homekitMock.disable.mockReset().mockResolvedValue(undefined)
   dbState.topRowsQueue.length = 0
   dbState.txRowsQueue.length = 0
+  dbState.txValuesCalls.length = 0
+  dbState.txSetCalls.length = 0
   dbMock.select.mockClear()
   dbMock.update.mockClear()
   dbMock.transaction.mockClear()
@@ -498,6 +508,29 @@ describe('settings.setGesture / deleteGesture', () => {
       temperatureAmount: 2,
     })
     expect(out.id).toBe(1)
+    expect(dbState.txValuesCalls[0]).toMatchObject({ temperatureStepMode: 'level' })
+  })
+
+  it('persists custom degree-step temperature gestures', async () => {
+    const created = {
+      id: 2, side: 'left', button: 'bottom', tapType: 'doubleTap', actionType: 'temperature',
+      temperatureChange: 'decrement', temperatureAmount: 2, temperatureStepMode: 'degree',
+      createdAt: new Date(0), updatedAt: new Date(0),
+    }
+    dbState.txRowsQueue.push([], [created])
+
+    const out = await caller.setGesture({
+      side: 'left',
+      button: 'bottom',
+      tapType: 'doubleTap',
+      actionType: 'temperature',
+      temperatureChange: 'decrement',
+      temperatureAmount: 2,
+      temperatureStepMode: 'degree',
+    })
+
+    expect(out.temperatureStepMode).toBe('degree')
+    expect(dbState.txValuesCalls[0]).toMatchObject({ temperatureStepMode: 'degree' })
   })
 
   it('updates an alarm gesture when the same button/tap already exists', async () => {
@@ -567,6 +600,7 @@ describe('settings.setCoverButtonAction', () => {
       temperatureAmount: 1,
     })
     expect(out.id).toBe(1)
+    expect(dbState.txValuesCalls[0]).toMatchObject({ temperatureStepMode: 'level' })
   })
 
   it('rejects center cover button actions', async () => {

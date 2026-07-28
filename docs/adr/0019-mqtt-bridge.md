@@ -124,6 +124,15 @@ On `connect` we publish retained discovery payloads under
   `bed_temp` row from biometrics.db. One state topic
   (`state/environment/ambient`) feeds both entities so HA's two cards
   stay coherent on each retained refresh.
+- Per-side alarm controls:
+  - an enum sensor with `idle`, `ringing`, and `snoozed` states plus the
+    current occurrence, schedule, and snooze-until metadata;
+  - a five-minute Snooze button;
+  - a side-specific Stop Alarm button.
+
+The Pod owns the alarm occurrence and snooze timer. Home Assistant only
+exposes the state and command buttons, so a Home Assistant restart cannot
+lose or duplicate a pending snooze.
 
 Discovery prefix is overridable via `MQTT_HA_DISCOVERY_PREFIX` for users
 who run a non-default HA install.
@@ -132,10 +141,13 @@ who run a non-default HA install.
 
 Commands arriving on `cmd/<verb>` are dispatched to the same `appRouter`
 procedures the iOS app calls (`device.setTemperature`, `setPower`,
-`setAlarm`, `clearAlarm`, `startPriming`). The bridge does *no* input
-validation of its own — Zod input schemas on the procedures are the single
-source of truth. A malformed payload throws inside the caller and the error
-is logged; we do not surface command failures back over MQTT in v1.
+`setAlarm`, `snoozeAlarm`, `clearAlarm`, `startPriming`). `snooze-alarm`
+uses the same persisted occurrence lifecycle as the web app and physical
+controls; `stop-alarm` routes through the side-specific clear path. The
+bridge does *no* input validation of its own — Zod input schemas on the
+procedures are the single source of truth. A malformed payload throws inside
+the caller and the error is logged; we do not surface command failures back
+over MQTT in v1.
 
 This matters: it means the bridge cannot accidentally diverge from the iOS
 app's safety envelope. Every constraint (temperature range, alarm

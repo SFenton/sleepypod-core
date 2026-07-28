@@ -134,6 +134,20 @@
       "when": 1781935065731,
       "tag": "0018_focus_cover_button_double_taps",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1782084800000,
+      "tag": "0019_temperature_step_mode",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1785256112741,
+      "tag": "0020_alarm_lifecycle",
+      "breakpoints": true
     }
   ]
 }

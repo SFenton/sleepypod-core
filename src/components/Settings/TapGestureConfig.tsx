@@ -11,6 +11,7 @@ type CoverButton = 'top' | 'middle' | 'bottom'
 type GestureButton = 'surface' | CoverButton
 type ActionType = 'temperature' | 'alarm' | 'power'
 type Side = 'left' | 'right'
+type TemperatureStepMode = 'degree' | 'level'
 
 interface ActionRecord {
   id: number
@@ -18,6 +19,7 @@ interface ActionRecord {
   actionType: ActionType
   temperatureChange: 'increment' | 'decrement' | null
   temperatureAmount: number | null
+  temperatureStepMode?: TemperatureStepMode | null
   powerBehavior?: 'toggle' | 'on' | 'off' | null
   alarmBehavior: 'snooze' | 'dismiss' | null
   alarmSnoozeDuration: number | null
@@ -46,7 +48,11 @@ const COVER_BUTTONS: {
 function actionDescription(action: ActionRecord): string {
   if (action.actionType === 'temperature') {
     const dir = action.temperatureChange === 'increment' ? '+' : '-'
-    return `${dir}${action.temperatureAmount}° temp`
+    const amount = action.temperatureAmount ?? 1
+    if ((action.temperatureStepMode ?? 'level') === 'level') {
+      return `${dir}${amount} HA level${amount === 1 ? '' : 's'}`
+    }
+    return `${dir}${amount}° temp`
   }
   if (action.actionType === 'power') {
     if (action.powerBehavior === 'on') return 'Power on'
@@ -63,6 +69,7 @@ interface EditState {
   actionType: ActionType
   temperatureChange: 'increment' | 'decrement'
   temperatureAmount: number
+  temperatureStepMode: TemperatureStepMode
   powerBehavior: 'toggle' | 'on' | 'off'
   alarmBehavior: 'snooze' | 'dismiss'
   alarmSnoozeDuration: number
@@ -76,6 +83,7 @@ const defaultEditState = (side: Side, button: CoverButton, tapType: TapType): Ed
   actionType: 'temperature',
   temperatureChange: button === 'bottom' ? 'decrement' : 'increment',
   temperatureAmount: 1,
+  temperatureStepMode: 'level',
   powerBehavior: 'toggle',
   alarmBehavior: 'snooze',
   alarmSnoozeDuration: 300,
@@ -90,6 +98,7 @@ function editStateFromGesture(g: GestureRecord): EditState {
     actionType: g.actionType,
     temperatureChange: g.temperatureChange ?? 'increment',
     temperatureAmount: g.temperatureAmount ?? 1,
+    temperatureStepMode: g.temperatureStepMode ?? 'level',
     powerBehavior: g.powerBehavior ?? 'toggle',
     alarmBehavior: g.alarmBehavior ?? 'snooze',
     alarmSnoozeDuration: g.alarmSnoozeDuration ?? 300,
@@ -107,6 +116,7 @@ function defaultGestureAction(side: Side, button: CoverButton, tapType: TapType)
     actionType: state.actionType,
     temperatureChange: state.actionType === 'temperature' ? state.temperatureChange : null,
     temperatureAmount: state.actionType === 'temperature' ? state.temperatureAmount : null,
+    temperatureStepMode: state.actionType === 'temperature' ? state.temperatureStepMode : null,
     powerBehavior: state.actionType === 'power' ? state.powerBehavior : null,
     alarmBehavior: null,
     alarmSnoozeDuration: null,
@@ -158,6 +168,7 @@ export function TapGestureConfig({ filterSide }: { filterSide?: 'left' | 'right'
         actionType: 'temperature',
         temperatureChange: editing.temperatureChange,
         temperatureAmount: editing.temperatureAmount,
+        temperatureStepMode: editing.temperatureStepMode,
       })
       return
     }
@@ -422,8 +433,38 @@ function GestureEditPanel({
           </div>
 
           {/* Amount */}
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <span className="text-xs text-zinc-400">Step Mode</span>
+              <p className="mt-0.5 text-[11px] text-zinc-600">
+                HA levels follow the -10 to 10 scale.
+              </p>
+            </div>
+            <div className="flex rounded-lg bg-zinc-800 p-0.5">
+              {([
+                ['level', 'HA Levels'],
+                ['degree', 'Degrees'],
+              ] as const).map(([mode, label]) => (
+                <button
+                  key={mode}
+                  onClick={() => onChange({ ...state, temperatureStepMode: mode })}
+                  className={clsx(
+                    'rounded-md px-3 min-h-[44px] flex items-center justify-center text-xs font-medium transition-colors',
+                    state.temperatureStepMode === mode
+                      ? 'bg-sky-500/20 text-sky-400'
+                      : 'text-zinc-500'
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <div className="flex items-center justify-between">
-            <span className="text-xs text-zinc-400">Amount</span>
+            <span className="text-xs text-zinc-400">
+              {state.temperatureStepMode === 'level' ? 'Level Steps' : 'Degrees'}
+            </span>
             <div className="flex items-center gap-2">
               <button
                 onClick={() =>
@@ -437,7 +478,7 @@ function GestureEditPanel({
               </button>
               <span className="w-8 text-center text-sm font-medium text-white">
                 {state.temperatureAmount}
-                °
+                {state.temperatureStepMode === 'degree' ? '°' : ''}
               </span>
               <button
                 onClick={() =>

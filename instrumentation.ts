@@ -26,10 +26,14 @@ import { startMqttBridge, shutdownMqttBridge } from '@/src/streaming/mqttBridge'
 import { initializeKeepalives, shutdownKeepalives } from '@/src/services/temperatureKeepalive'
 import { startAutoOffWatcher, stopAutoOffWatcher } from '@/src/services/autoOffWatcher'
 import { shutdownHomeKit, startHomeKitIfEnabled } from '@/src/homekit'
+import { initializeAlarmLifecycle, shutdownAlarmLifecycle } from '@/src/hardware/snoozeManager'
 
 let isInitialized = false
 let isShuttingDown = false
 let handlersRegistered = false
+let alarmLifecycleRetryTimer: ReturnType<typeof setTimeout> | null = null
+
+const ALARM_LIFECYCLE_RETRY_MS = 5_000
 
 /**
  * Centralized graceful shutdown coordinator.
@@ -38,6 +42,11 @@ let handlersRegistered = false
 async function gracefulShutdown(signal: string): Promise<void> {
   if (isShuttingDown) return
   isShuttingDown = true
+
+  if (alarmLifecycleRetryTimer) {
+    clearTimeout(alarmLifecycleRetryTimer)
+    alarmLifecycleRetryTimer = null
+  }
 
   console.log(`Received ${signal}, starting graceful shutdown...`)
 
@@ -114,6 +123,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   // Step 5: Shutdown DAC monitor
   try {
+    shutdownAlarmLifecycle()
     await shutdownDacMonitor()
   }
   catch (error) {
@@ -198,6 +208,25 @@ async function withRetry<T>(
     }
   }
   throw lastError
+}
+
+async function initializeAlarmLifecycleWithRecovery(): Promise<void> {
+  try {
+    await withRetry(
+      () => initializeAlarmLifecycle(),
+      'Alarm lifecycle initialization',
+    )
+  }
+  catch (error) {
+    console.error('Failed to initialize alarm lifecycle:', error)
+    if (isShuttingDown || alarmLifecycleRetryTimer) return
+
+    alarmLifecycleRetryTimer = setTimeout(() => {
+      alarmLifecycleRetryTimer = null
+      void initializeAlarmLifecycleWithRecovery()
+    }, ALARM_LIFECYCLE_RETRY_MS)
+    alarmLifecycleRetryTimer.unref?.()
+  }
 }
 
 /**
@@ -290,8 +319,6 @@ export async function initializeScheduler(): Promise<void> {
       }
     }
 
-    isInitialized = true
-
     // Start DAC socket server FIRST — this is the single listener on dac.sock.
     // frankenfirmware will connect to it. Everything else (DacMonitor, device
     // router, health checks) uses this server's connection.
@@ -302,6 +329,9 @@ export async function initializeScheduler(): Promise<void> {
     catch (error) {
       console.warn('[DAC] Socket server failed to start:', error instanceof Error ? error.message : error)
     }
+
+    await initializeAlarmLifecycleWithRecovery()
+    isInitialized = true
 
     // Start DAC monitor (non-blocking — waits for frankenfirmware to connect)
     initializeDacMonitor()
