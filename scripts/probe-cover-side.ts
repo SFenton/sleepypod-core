@@ -1,9 +1,10 @@
 /**
  * Probe Pod 5 cover for a per-side vibration command.
  *
- * Background: ALARM_SOLO (cmd 2) buzzes both LP5009 motor drivers
- * simultaneously. ALARM_LEFT/RIGHT (5/6) reject on cover-only pods
- * (pillow label gate). docs/hardware/alarms.md "Open work" section flags
+ * Background: ALARM_SOLO (cmd 17) reaches sparkAlarmS on Pod 5, but live
+ * probing showed it clears both channels without a cover-motor start.
+ * ALARM_LEFT/RIGHT (5/6) are the usable cover-motor paths. The
+ * docs/hardware/alarms.md "Open work" section flags
  * "probe additional CBOR field names (s, m, side, motor) to see if
  * ALARM_SOLO quietly respects a side hint we haven't found yet" — this
  * script does that, plus probes undocumented opcodes near the known ones.
@@ -55,11 +56,11 @@ const probes: Probe[] = [
   { label: 'ALARM_LEFT (expected: err:-1 on cover-only Pod 5)', command: 'ALARM_LEFT', payload: base() },
 
   // ── undocumented opcodes between known commands ──────────────────────
-  { label: 'opcode 3 (between SOLO=2 and ALARM_LEFT=5)', command: '3', payload: base() },
+  { label: 'opcode 3 (between SET_ALARM=2 and ALARM_LEFT=5)', command: '3', payload: base() },
   { label: 'opcode 4', command: '4', payload: base() },
   { label: 'opcode 7 (after ALARM_RIGHT=6)', command: '7', payload: base() },
   { label: 'opcode 15 (between DEVICE_STATUS=14 and ALARM_CLEAR=16)', command: '15', payload: base() },
-  { label: 'opcode 17 (free-sleep had ALARM_SOLO commented at 17)', command: '17', payload: base() },
+  { label: 'opcode 17 (ALARM_SOLO)', command: '17', payload: base() },
   { label: 'opcode 18', command: '18', payload: base() },
   { label: 'opcode 19', command: '19', payload: base() },
   { label: 'opcode 20', command: '20', payload: base() },

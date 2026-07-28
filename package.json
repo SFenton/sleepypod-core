@@ -17,7 +17,7 @@
     "db:reset:all": "rm -f sleepypod.dev.db sleepypod.dev.db-shm sleepypod.dev.db-wal biometrics.dev.db biometrics.dev.db-shm biometrics.dev.db-wal && pnpm db:migrate && pnpm db:biometrics:migrate",
     "db:reset:biometrics": "rm -f biometrics.dev.db biometrics.dev.db-shm biometrics.dev.db-wal && pnpm db:biometrics:migrate",
     "db:reset:schedules": "sqlite3 sleepypod.dev.db \"BEGIN; DELETE FROM temperature_schedules; DELETE FROM power_schedules; DELETE FROM alarm_schedules; DELETE FROM run_once_sessions; COMMIT;\"",
-    "db:reset:settings": "sqlite3 sleepypod.dev.db \"BEGIN; DELETE FROM device_settings; DELETE FROM side_settings; DELETE FROM tap_gestures; COMMIT;\"",
+    "db:reset:settings": "sqlite3 sleepypod.dev.db \"BEGIN; DELETE FROM device_settings; DELETE FROM side_settings; DELETE FROM tap_gestures; DELETE FROM cover_button_actions; COMMIT;\"",
     "db:reset:state": "sqlite3 sleepypod.dev.db \"BEGIN; DELETE FROM device_state; DELETE FROM system_health; COMMIT;\"",
     "lingui:extract": "lingui extract --clean",
     "lint:fix": "eslint . --fix",
@@ -106,7 +106,7 @@
     "@types/react-dom": "^19.2.3",
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^5.1.4",
-    "@vitest/coverage-v8": "4.1.7",
+    "@vitest/coverage-v8": "4.1.8",
     "conventional-changelog-conventionalcommits": "^9.1.0",
     "drizzle-kit": "^0.31.9",
     "eslint": "^9.39.3",
@@ -119,12 +119,12 @@
     "semantic-release": "^25.0.3",
     "tailwindcss": "4.3.0",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3",
+    "typescript": "^6.0.0",
     "typescript-eslint": "^8.56.1",
     "vite-tsconfig-paths": "^6.1.1",
     "vitest": "^4.0.18"
   },
-  "packageManager": "pnpm@10.34.1",
+  "packageManager": "pnpm@10.34.3",
   "pnpm": {
     "onlyBuiltDependencies": [
       "cbor-extract",

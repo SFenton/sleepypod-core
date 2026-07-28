@@ -2,7 +2,7 @@
  * Tests for the settings router — getAll merges defaults, updateDevice
  * persists + reloads scheduler + mirrors homekit lifecycle, updateSide
  * rejects mutually-exclusive flags + validates away window, setAlwaysOn
- * starts/stops keepalive, gesture CRUD.
+ * starts/stops keepalive, gesture and cover-button CRUD.
  *
  * The DB transaction(cb) pattern is mocked synchronously: tx exposes
  * select/update/insert/delete chains terminating in .all() which returns
@@ -48,6 +48,8 @@ const dbState = vi.hoisted(() => ({
   txRowsQueue: [] as unknown[][],
   // Sequential queue for db.update().set().where() awaitable result (lifecycle revert path)
   topUpdateQueue: [] as Array<unknown>,
+  txValuesCalls: [] as unknown[],
+  txSetCalls: [] as unknown[],
   popTop(): unknown[] { return dbState.topRowsQueue.shift() ?? [] },
   popTx(): unknown[] { return dbState.txRowsQueue.shift() ?? [] },
 }))
@@ -70,8 +72,14 @@ const dbMock = vi.hoisted(() => {
     chain.where = vi.fn(() => chain)
     chain.limit = vi.fn(() => chain)
     chain.from = vi.fn(() => chain)
-    chain.values = vi.fn(() => chain)
-    chain.set = vi.fn(() => chain)
+    chain.values = vi.fn((value: unknown) => {
+      dbState.txValuesCalls.push(value)
+      return chain
+    })
+    chain.set = vi.fn((value: unknown) => {
+      dbState.txSetCalls.push(value)
+      return chain
+    })
     chain.returning = vi.fn(() => chain)
     chain.all = vi.fn(() => dbState.popTx())
     chain.run = vi.fn(() => undefined)
@@ -124,6 +132,8 @@ beforeEach(() => {
   homekitMock.disable.mockReset().mockResolvedValue(undefined)
   dbState.topRowsQueue.length = 0
   dbState.txRowsQueue.length = 0
+  dbState.txValuesCalls.length = 0
+  dbState.txSetCalls.length = 0
   dbMock.select.mockClear()
   dbMock.update.mockClear()
   dbMock.transaction.mockClear()
@@ -147,14 +157,19 @@ describe('settings.getAll', () => {
       { side: 'left', name: 'L', awayMode: false, alwaysOn: false, autoOffEnabled: false, autoOffMinutes: 30, awayStart: null, awayReturn: null, createdAt: new Date(0), updatedAt: new Date(0) },
       { side: 'right', name: 'R', awayMode: false, alwaysOn: false, autoOffEnabled: false, autoOffMinutes: 30, awayStart: null, awayReturn: null, createdAt: new Date(0), updatedAt: new Date(0) },
     ]
-    const gestures: unknown[] = []
+    const gestures = [
+      { id: 1, side: 'left', button: 'top', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: 2, side: 'right', button: 'bottom', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
+    ]
     dbState.topRowsQueue.push([device], sides, gestures)
 
     const result = await caller.getAll({})
     expect(result.device.timezone).toBe('UTC')
     expect(result.sides.left.name).toBe('L')
     expect(result.sides.right.name).toBe('R')
-    expect(result.gestures.left).toEqual([])
+    expect(result.gestures.left).toHaveLength(1)
+    expect(result.coverButtons.left).toHaveLength(1)
+    expect(result.coverButtons.right).toHaveLength(1)
   })
 
   it('returns synthetic defaults when device row is missing', async () => {
@@ -172,8 +187,8 @@ describe('settings.getAll', () => {
       { side: 'right', name: 'R', awayMode: false, alwaysOn: false, autoOffEnabled: false, autoOffMinutes: 30, awayStart: null, awayReturn: null, createdAt: new Date(0), updatedAt: new Date(0) },
     ]
     const gestures = [
-      { id: 1, side: 'left', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
-      { id: 2, side: 'right', tapType: 'doubleTap', actionType: 'alarm', alarmBehavior: 'snooze', createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: 1, side: 'left', button: 'top', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: 2, side: 'right', button: 'bottom', tapType: 'doubleTap', actionType: 'alarm', alarmBehavior: 'snooze', createdAt: new Date(0), updatedAt: new Date(0) },
     ]
     dbState.topRowsQueue.push([device], sides, gestures)
     const result = await caller.getAll({})
@@ -475,10 +490,10 @@ describe('settings.setAlwaysOn', () => {
 })
 
 describe('settings.setGesture / deleteGesture', () => {
-  it('creates a temperature gesture when none exists', async () => {
+  it('creates a temperature gesture for a button/tap combination when none exists', async () => {
     // tx.select existing → empty; tx.insert.values.returning.all → [created]
     const created = {
-      id: 1, side: 'left', tapType: 'doubleTap', actionType: 'temperature',
+      id: 1, side: 'left', button: 'top', tapType: 'doubleTap', actionType: 'temperature',
       temperatureChange: 'increment', temperatureAmount: 2,
       createdAt: new Date(0), updatedAt: new Date(0),
     }
@@ -486,18 +501,42 @@ describe('settings.setGesture / deleteGesture', () => {
 
     const out = await caller.setGesture({
       side: 'left',
+      button: 'top',
       tapType: 'doubleTap',
       actionType: 'temperature',
       temperatureChange: 'increment',
       temperatureAmount: 2,
     })
     expect(out.id).toBe(1)
+    expect(dbState.txValuesCalls[0]).toMatchObject({ temperatureStepMode: 'level' })
   })
 
-  it('updates an alarm gesture when one already exists', async () => {
-    const existing = { id: 5, side: 'left', tapType: 'doubleTap' }
+  it('persists custom degree-step temperature gestures', async () => {
+    const created = {
+      id: 2, side: 'left', button: 'bottom', tapType: 'doubleTap', actionType: 'temperature',
+      temperatureChange: 'decrement', temperatureAmount: 2, temperatureStepMode: 'degree',
+      createdAt: new Date(0), updatedAt: new Date(0),
+    }
+    dbState.txRowsQueue.push([], [created])
+
+    const out = await caller.setGesture({
+      side: 'left',
+      button: 'bottom',
+      tapType: 'doubleTap',
+      actionType: 'temperature',
+      temperatureChange: 'decrement',
+      temperatureAmount: 2,
+      temperatureStepMode: 'degree',
+    })
+
+    expect(out.temperatureStepMode).toBe('degree')
+    expect(dbState.txValuesCalls[0]).toMatchObject({ temperatureStepMode: 'degree' })
+  })
+
+  it('updates an alarm gesture when the same button/tap already exists', async () => {
+    const existing = { id: 5, side: 'left', button: 'bottom', tapType: 'doubleTap' }
     const updated = {
-      id: 5, side: 'left', tapType: 'doubleTap', actionType: 'alarm',
+      id: 5, side: 'left', button: 'bottom', tapType: 'doubleTap', actionType: 'alarm',
       alarmBehavior: 'snooze',
       createdAt: new Date(0), updatedAt: new Date(0),
     }
@@ -505,6 +544,7 @@ describe('settings.setGesture / deleteGesture', () => {
 
     const out = await caller.setGesture({
       side: 'left',
+      button: 'bottom',
       tapType: 'doubleTap',
       actionType: 'alarm',
       alarmBehavior: 'snooze',
@@ -514,13 +554,76 @@ describe('settings.setGesture / deleteGesture', () => {
 
   it('deleteGesture throws NOT_FOUND when no row deleted', async () => {
     dbState.txRowsQueue.push([])
-    await expect(caller.deleteGesture({ side: 'left', tapType: 'doubleTap' })).rejects.toThrow(/not found/)
+    await expect(caller.deleteGesture({ side: 'left', button: 'top', tapType: 'doubleTap' })).rejects.toThrow(/not found/)
   })
 
   it('deleteGesture returns success when a row was deleted', async () => {
     dbState.txRowsQueue.push([{ id: 1 }])
-    const out = await caller.deleteGesture({ side: 'left', tapType: 'doubleTap' })
+    const out = await caller.deleteGesture({ side: 'left', button: 'top', tapType: 'doubleTap' })
     expect(out).toEqual({ success: true })
+  })
+
+  it('rejects unsupported cover-button gestures', async () => {
+    await expect(caller.setGesture({
+      side: 'left',
+      button: 'middle',
+      tapType: 'doubleTap',
+      actionType: 'power',
+      powerBehavior: 'toggle',
+    })).rejects.toThrow(/only supported for double-tap on the plus\/minus buttons/)
+
+    await expect(caller.setGesture({
+      side: 'left',
+      button: 'top',
+      tapType: 'singleTap',
+      actionType: 'temperature',
+      temperatureChange: 'increment',
+      temperatureAmount: 1,
+    })).rejects.toThrow(/only supported for double-tap on the plus\/minus buttons/)
+  })
+})
+
+describe('settings.setCoverButtonAction', () => {
+  it('creates a double-tap temperature cover-button action when none exists', async () => {
+    const created = {
+      id: 1, side: 'left', button: 'top', tapType: 'doubleTap', actionType: 'temperature',
+      temperatureChange: 'increment', temperatureAmount: 1,
+      createdAt: new Date(0), updatedAt: new Date(0),
+    }
+    dbState.txRowsQueue.push([], [created])
+
+    const out = await caller.setCoverButtonAction({
+      side: 'left',
+      button: 'top',
+      actionType: 'temperature',
+      temperatureChange: 'increment',
+      temperatureAmount: 1,
+    })
+    expect(out.id).toBe(1)
+    expect(dbState.txValuesCalls[0]).toMatchObject({ temperatureStepMode: 'level' })
+  })
+
+  it('rejects center cover button actions', async () => {
+    await expect(caller.setCoverButtonAction({
+      side: 'right',
+      button: 'middle',
+      actionType: 'power',
+      powerBehavior: 'toggle',
+    })).rejects.toThrow(/only supported for double-tap on the plus\/minus buttons/)
+  })
+
+  it('wraps transaction errors for cover-button actions', async () => {
+    dbMock.transaction.mockImplementationOnce(() => {
+      throw new Error('cover db down')
+    })
+
+    await expect(caller.setCoverButtonAction({
+      side: 'left',
+      button: 'bottom',
+      actionType: 'temperature',
+      temperatureChange: 'decrement',
+      temperatureAmount: 1,
+    })).rejects.toThrow(/Failed to set cover button action: cover db down/)
   })
 })
 
@@ -686,9 +789,10 @@ describe('settings.setGesture — extra branches', () => {
   it('throws INTERNAL_SERVER_ERROR when update returning() yields no row', async () => {
     // Existing gesture found, but the update inside the same tx returns no
     // row (theoretically impossible with a returning() chain — guarded anyway).
-    dbState.txRowsQueue.push([{ id: 9, side: 'left', tapType: 'doubleTap' }], [])
+    dbState.txRowsQueue.push([{ id: 9, side: 'left', button: 'top', tapType: 'doubleTap' }], [])
     await expect(caller.setGesture({
       side: 'left',
+      button: 'top',
       tapType: 'doubleTap',
       actionType: 'temperature',
       temperatureChange: 'increment',
@@ -700,6 +804,7 @@ describe('settings.setGesture — extra branches', () => {
     dbState.txRowsQueue.push([], []) // no existing, insert returned nothing
     await expect(caller.setGesture({
       side: 'left',
+      button: 'top',
       tapType: 'doubleTap',
       actionType: 'temperature',
       temperatureChange: 'increment',
@@ -713,6 +818,7 @@ describe('settings.setGesture — extra branches', () => {
     })
     await expect(caller.setGesture({
       side: 'left',
+      button: 'top',
       tapType: 'doubleTap',
       actionType: 'temperature',
       temperatureChange: 'increment',
@@ -726,6 +832,6 @@ describe('settings.deleteGesture — extra branches', () => {
     dbMock.transaction.mockImplementationOnce(() => {
       throw new Error('delete boom')
     })
-    await expect(caller.deleteGesture({ side: 'left', tapType: 'doubleTap' })).rejects.toThrow(/Failed to delete gesture: delete boom/)
+    await expect(caller.deleteGesture({ side: 'left', button: 'top', tapType: 'doubleTap' })).rejects.toThrow(/Failed to delete gesture: delete boom/)
   })
 })

@@ -79,6 +79,19 @@ class FakeGestureActionHandler {
   }
 }
 
+const coverButtonCleanupMock = vi.fn()
+const coverButtonHandleMock = vi.fn()
+class FakeCoverButtonActionHandler {
+  socketPath: string
+  deps: unknown
+  cleanup = coverButtonCleanupMock
+  handle = coverButtonHandleMock
+  constructor(socketPath: string, deps: unknown) {
+    this.socketPath = socketPath
+    this.deps = deps
+  }
+}
+
 const stateSyncSyncMock = vi.fn(async () => {})
 const stateSyncRecordFlowMock = vi.fn()
 class FakeDeviceStateSync {
@@ -86,11 +99,12 @@ class FakeDeviceStateSync {
   recordFlowData = stateSyncRecordFlowMock
 }
 
-const cancelSnoozeMock = vi.fn<(side: 'left' | 'right') => void>()
 const resetPrimingStateMock = vi.fn()
 const trackPrimingStateMock = vi.fn<(priming: boolean) => void>()
 const getPrimeCompletedAtMock = vi.fn(() => null as number | null)
-const getAlarmStateMock = vi.fn(() => ({ left: false, right: false }))
+const getAlarmStatusMock = vi.fn<(side: 'left' | 'right') => { state: 'idle' | 'ringing' }>(
+  () => ({ state: 'idle' }),
+)
 const getSnoozeStatusMock = vi.fn<(side: 'left' | 'right') => { active: boolean, snoozeUntil: number | null }>(
   () => ({ active: false, snoozeUntil: null }),
 )
@@ -119,9 +133,16 @@ vi.mock('../gestureActionHandler.deps', () => ({
   defaultGestureActionDeps: { _stub: true },
 }))
 
+vi.mock('../coverButtonActionHandler', () => ({
+  CoverButtonActionHandler: FakeCoverButtonActionHandler,
+}))
+
+vi.mock('../coverButtonActionHandler.deps', () => ({
+  defaultCoverButtonActionDeps: { _stub: true },
+}))
+
 vi.mock('../deviceStateSync', () => ({
   DeviceStateSync: FakeDeviceStateSync,
-  getAlarmState: () => getAlarmStateMock(),
 }))
 
 vi.mock('../primeNotification', () => ({
@@ -131,7 +152,7 @@ vi.mock('../primeNotification', () => ({
 }))
 
 vi.mock('../snoozeManager', () => ({
-  cancelSnooze: (side: 'left' | 'right') => cancelSnoozeMock(side),
+  getAlarmStatus: (side: 'left' | 'right') => getAlarmStatusMock(side),
   getSnoozeStatus: (side: 'left' | 'right') => getSnoozeStatusMock(side),
 }))
 
@@ -155,7 +176,9 @@ const GLOBAL_KEYS = [
   '__sp_hw_client__',
   '__sp_dac_monitor__',
   '__sp_gesture_handler__',
+  '__sp_cover_button_handler__',
   '__sp_unsub_flow__',
+  '__sp_unsub_cover_buttons__',
 ] as const
 
 function clearGlobals() {
@@ -191,13 +214,14 @@ describe('hardware/dacMonitor.instance', () => {
     parseSimpleResponseMock.mockReset().mockReturnValue({ success: true, message: 'ok' })
     gestureCleanupMock.mockClear()
     gestureHandleMock.mockClear()
+    coverButtonCleanupMock.mockClear()
+    coverButtonHandleMock.mockClear()
     stateSyncSyncMock.mockReset().mockResolvedValue(undefined)
     stateSyncRecordFlowMock.mockClear()
-    cancelSnoozeMock.mockClear()
     resetPrimingStateMock.mockClear()
     trackPrimingStateMock.mockClear()
     getPrimeCompletedAtMock.mockReset().mockReturnValue(null)
-    getAlarmStateMock.mockReset().mockReturnValue({ left: false, right: false })
+    getAlarmStatusMock.mockReset().mockReturnValue({ state: 'idle' })
     getSnoozeStatusMock.mockReset().mockReturnValue({ active: false, snoozeUntil: null })
     broadcastFrameMock.mockClear()
     onServerFrameMock.mockReset().mockImplementation(() => () => {})
@@ -524,6 +548,9 @@ describe('hardware/dacMonitor.instance', () => {
       await mod.getDacMonitor()
       await flushMicrotasks()
       const monitor = monitorInstances[0]
+      getAlarmStatusMock.mockImplementation(side => ({
+        state: side === 'right' ? 'ringing' : 'idle',
+      }))
 
       const status: DeviceStatus = parseDeviceStatusMock('raw') // shape from default mock
       const beforeCalls = broadcastFrameMock.mock.calls.length
@@ -535,6 +562,12 @@ describe('hardware/dacMonitor.instance', () => {
       // Allow for frames already emitted during init wiring; require at least
       // one additional broadcast triggered by the emit above.
       expect(broadcastFrameMock.mock.calls.length).toBeGreaterThan(beforeCalls)
+      const lastFrame = broadcastFrameMock.mock.calls.at(-1)?.[0] as {
+        leftSide: { isAlarmVibrating: boolean }
+        rightSide: { isAlarmVibrating: boolean }
+      }
+      expect(lastFrame.leftSide.isAlarmVibrating).toBe(false)
+      expect(lastFrame.rightSide.isAlarmVibrating).toBe(true)
     })
 
     it('status:updated includes primeCompletedNotification when getPrimeCompletedAt returns a value', async () => {
@@ -590,10 +623,40 @@ describe('hardware/dacMonitor.instance', () => {
       await mod.getDacMonitor()
       await flushMicrotasks()
 
-      expect(onServerFrameMock).toHaveBeenCalledTimes(1)
+      expect(onServerFrameMock).toHaveBeenCalledTimes(2)
       const cb = (onServerFrameMock.mock.calls[0]?.[0]) as ((frame: unknown) => void) | undefined
       cb?.({ type: 'frzHealth', flow: 42 })
       expect(stateSyncRecordFlowMock).toHaveBeenCalledWith({ type: 'frzHealth', flow: 42 })
+    })
+
+    it('subscribes to cover-button server frames and normalizes nested aliases', async () => {
+      const mod = await freshModule()
+      await mod.getDacMonitor()
+      await flushMicrotasks()
+
+      expect(onServerFrameMock).toHaveBeenCalledTimes(2)
+      const cb = (onServerFrameMock.mock.calls[1]?.[0]) as ((frame: unknown) => void) | undefined
+      cb?.({
+        type: 'buttonEvent',
+        ts: 123,
+        l: { plus: 2, center: { count: 1 } },
+        right: { buttons: { minus: 'quadTap' } },
+      })
+
+      expect(coverButtonHandleMock).toHaveBeenCalledWith({ side: 'left', button: 'top', count: 2, ts: 123 })
+      expect(coverButtonHandleMock).toHaveBeenCalledWith({ side: 'left', button: 'middle', count: 1, ts: 123 })
+      expect(coverButtonHandleMock).toHaveBeenCalledWith({ side: 'right', button: 'bottom', count: 4, ts: 123 })
+    })
+
+    it('normalizes flat cover-button events', async () => {
+      const mod = await freshModule()
+      await mod.getDacMonitor()
+      await flushMicrotasks()
+
+      const cb = (onServerFrameMock.mock.calls[1]?.[0]) as ((frame: unknown) => void) | undefined
+      cb?.({ type: 'coverButton', side: 'r', button: 'minus', tapType: 'doubleTap', ts: 456 })
+
+      expect(coverButtonHandleMock).toHaveBeenCalledWith({ side: 'right', button: 'bottom', count: 2, ts: 456 })
     })
 
     it('isolates DeviceStateSync.sync rejections (logged, not thrown)', async () => {
@@ -631,8 +694,6 @@ describe('hardware/dacMonitor.instance', () => {
       expect(monitor.removeAllListeners).toHaveBeenCalledWith('status:updated')
       expect(gestureCleanupMock).toHaveBeenCalled()
       expect(disconnectDacMock).toHaveBeenCalled()
-      expect(cancelSnoozeMock).toHaveBeenCalledWith('left')
-      expect(cancelSnoozeMock).toHaveBeenCalledWith('right')
       expect(resetPrimingStateMock).toHaveBeenCalled()
       expect(mod.getDacServer()).toBeNull()
       expect(mod.getDacMonitorIfRunning()).toBeNull()

@@ -1,15 +1,17 @@
 import type { HardwareClient } from './client'
 import { MAX_TEMP, MIN_TEMP, TEMP_NEUTRAL, type Side } from './types'
 import type { GestureEvent } from './dacMonitor'
+import { getAlarmStatus, snoozeAlarm, stopAlarm } from './snoozeManager'
 
 // Re-export for callers that need to build deps
 export type { GestureActionDeps }
 
 // These types mirror the DB row shapes without importing from @/src/db
 export interface TapGestureRow {
-  actionType: 'temperature' | 'alarm'
+  actionType: 'temperature' | 'alarm' | 'power'
   temperatureChange: 'increment' | 'decrement' | null
   temperatureAmount: number | null
+  powerBehavior: 'toggle' | 'on' | 'off' | null
   alarmBehavior: 'snooze' | 'dismiss' | null
   /** Duration in seconds before a snoozed alarm restarts. */
   alarmSnoozeDuration: number | null
@@ -27,6 +29,7 @@ interface GestureActionDeps {
   findGestureConfig: (side: Side, tapType: GestureEvent['tapType']) => Promise<TapGestureRow | null>
   findDeviceState: (side: Side) => Promise<DeviceStateRow | null>
   newHardwareClient: (socketPath: string) => HardwareClient
+  recordTemperatureChange?: (side: Side, targetTemperature: number) => Promise<void>
 }
 
 /**
@@ -44,7 +47,6 @@ interface GestureActionDeps {
  */
 export class GestureActionHandler {
   private readonly deps: GestureActionDeps
-  private readonly snoozeTimeouts: Set<ReturnType<typeof setTimeout>> = new Set()
 
   constructor(
     private readonly socketPath: string,
@@ -65,16 +67,7 @@ export class GestureActionHandler {
     }
   }
 
-  /**
-   * Cancel all pending snooze restart timers.
-   * Call this during application shutdown to allow clean process exit.
-   */
-  cleanup = (): void => {
-    for (const id of this.snoozeTimeouts) {
-      clearTimeout(id)
-    }
-    this.snoozeTimeouts.clear()
-  }
+  cleanup = (): void => {}
 
   private execute = async (event: GestureEvent): Promise<void> => {
     const gesture = await this.deps.findGestureConfig(event.side, event.tapType)
@@ -82,6 +75,9 @@ export class GestureActionHandler {
 
     if (gesture.actionType === 'temperature') {
       await this.handleTemperatureAction(event, gesture)
+    }
+    else if (gesture.actionType === 'power') {
+      await this.handlePowerAction(event, gesture)
     }
     else if (gesture.actionType === 'alarm') {
       await this.handleAlarmAction(event, gesture)
@@ -103,6 +99,7 @@ export class GestureActionHandler {
     try {
       await client.connect()
       await client.setTemperature(event.side, newTemp)
+      await this.deps.recordTemperatureChange?.(event.side, newTemp)
     }
     finally {
       client.disconnect()
@@ -114,35 +111,25 @@ export class GestureActionHandler {
     gesture: TapGestureRow
   ): Promise<void> => {
     const state = await this.deps.findDeviceState(event.side)
-    const isAlarmVibrating = state?.isAlarmVibrating ?? false
+    const alarmActive = getAlarmStatus(event.side).active || (state?.isAlarmVibrating ?? false)
 
-    if (isAlarmVibrating) {
+    if (alarmActive) {
       const client = this.deps.newHardwareClient(this.socketPath)
       try {
         await client.connect()
 
         if (gesture.alarmBehavior === 'dismiss') {
-          await client.clearAlarm(event.side)
-          // Lazy import to avoid circular dep chain (snoozeManager → dacMonitor.instance → db)
-          const { cancelSnooze } = await import('./snoozeManager')
-          cancelSnooze(event.side)
+          await stopAlarm(event.side, { client })
         }
         else if (gesture.alarmBehavior === 'snooze') {
-          await client.clearAlarm(event.side)
-          const snoozeDuration = gesture.alarmSnoozeDuration ?? 300
-          const timeoutId = setTimeout(() => {
-            this.snoozeTimeouts.delete(timeoutId)
-            const restartClient = this.deps.newHardwareClient(this.socketPath)
-            restartClient.connect()
-              .then(() => restartClient.setAlarm(event.side, {
-                vibrationIntensity: 50,
-                vibrationPattern: 'rise',
-                duration: 180,
-              }))
-              .catch(err => console.error('GestureActionHandler: snooze restart failed:', err))
-              .finally(() => restartClient.disconnect())
-          }, snoozeDuration * 1000)
-          this.snoozeTimeouts.add(timeoutId)
+          await snoozeAlarm(event.side, gesture.alarmSnoozeDuration ?? 300, {
+            client,
+            fallbackConfig: {
+              vibrationIntensity: 50,
+              vibrationPattern: 'rise',
+              duration: 180,
+            },
+          })
         }
       }
       finally {
@@ -167,6 +154,27 @@ export class GestureActionHandler {
         }
       }
       // alarmInactiveBehavior === 'none': no-op
+    }
+  }
+
+  private handlePowerAction = async (
+    event: GestureEvent,
+    gesture: TapGestureRow
+  ): Promise<void> => {
+    const state = await this.deps.findDeviceState(event.side)
+    const behavior = gesture.powerBehavior ?? 'toggle'
+    const nextPowered = behavior === 'toggle'
+      ? !(state?.isPowered ?? false)
+      : behavior === 'on'
+    const target = state?.targetTemperature ?? TEMP_NEUTRAL
+
+    const client = this.deps.newHardwareClient(this.socketPath)
+    try {
+      await client.connect()
+      await client.setPower(event.side, nextPowered, nextPowered ? target : undefined)
+    }
+    finally {
+      client.disconnect()
     }
   }
 }

@@ -18,6 +18,9 @@ const dbMock = vi.hoisted(() => {
     biometricsRow: any | null
     deviceStateRows: any[]
     bedTempRow: any | null
+    alarmScheduleRows: any[]
+    powerScheduleRows: any[]
+    temperatureScheduleRows: any[]
     throwOnBedTemp: false | true | string
     throwOnDeviceState: false | true | string
     throwOnBiometrics: false | true | string
@@ -27,25 +30,45 @@ const dbMock = vi.hoisted(() => {
     biometricsRow: null,
     deviceStateRows: [],
     bedTempRow: null,
+    alarmScheduleRows: [],
+    powerScheduleRows: [],
+    temperatureScheduleRows: [],
     throwOnBedTemp: false,
     throwOnDeviceState: false,
     throwOnBiometrics: false,
   }
-  // The bridge calls db.select() four ways:
+  // The bridge calls db.select() several ways:
   //   1. .from(deviceSettings).limit(1)         — resolveConfig
   //   2. .from(deviceState)                     — publishState (iterable of rows)
   //   3. .from(vitals).where(...).orderBy(...).limit(1) — biometrics fetch
   //   4. .from(bedTemp).orderBy(...).limit(1)   — ambient environment fetch
   // The mock returns a thenable from .from() so case 2 (await of the from()
   // result) iterates state.deviceStateRows; cases 1/3/4 chain through.
+  function tableName(table: unknown): string {
+    if (typeof table !== 'object' || table === null) return ''
+    const symbol = Object.getOwnPropertySymbols(table).find(s => String(s) === 'Symbol(drizzle:Name)')
+    return symbol ? String((table as Record<symbol, unknown>)[symbol]) : ''
+  }
+
+  function rowsForTable(name: string): any[] {
+    if (name === 'alarm_schedules') return state.alarmScheduleRows
+    if (name === 'power_schedules') return state.powerScheduleRows
+    if (name === 'temperature_schedules') return state.temperatureScheduleRows
+    if (name === 'device_state') return state.deviceStateRows
+    return []
+  }
+
   const select = vi.fn(() => ({
-    from: vi.fn(() => {
+    from: vi.fn((table: unknown) => {
+      const name = tableName(table)
       const fromObj: any = {
         limit: vi.fn(async () => {
           if (state.throwOnSelect) throw new Error('boom')
-          return state.row !== undefined ? [state.row] : []
+          if (name === 'device_settings') return state.row !== undefined ? [state.row] : []
+          return rowsForTable(name)
         }),
         where: vi.fn(() => ({
+          all: vi.fn(async () => rowsForTable(name)),
           orderBy: vi.fn(() => ({
             limit: vi.fn(async () => {
               if (state.throwOnBiometrics !== false) {
@@ -67,8 +90,9 @@ const dbMock = vi.hoisted(() => {
             return state.bedTempRow ? [state.bedTempRow] : []
           }),
         })),
-        // Make `.from(deviceState)` itself awaitable so `for (const row of
-        // sides)` after `await db.select().from(deviceState)` iterates rows.
+        all: vi.fn(async () => rowsForTable(name)),
+        // Make `.from(deviceState)` itself awaitable so
+        // bridge state publishers can iterate rows after `await db.select().from(...)`.
         then: (resolve: (rows: any[]) => any, reject?: (err: unknown) => any) => {
           if (state.throwOnDeviceState !== false) {
             const err = typeof state.throwOnDeviceState === 'string'
@@ -77,7 +101,7 @@ const dbMock = vi.hoisted(() => {
             if (reject) return reject(err)
             throw err as Error
           }
-          return resolve(state.deviceStateRows)
+          return resolve(rowsForTable(name))
         },
       }
       return fromObj
@@ -173,15 +197,43 @@ const deviceMock = vi.hoisted(() => ({
   setPower: vi.fn(async () => undefined),
   setAlarm: vi.fn(async () => undefined),
   clearAlarm: vi.fn(async () => undefined),
+  snoozeAlarm: vi.fn(async () => undefined),
   startPriming: vi.fn(async () => undefined),
+}))
+
+const hapticMock = vi.hoisted(() => ({
+  triggerHapticConfirm: vi.fn(async () => undefined),
+}))
+
+const schedulesMock = vi.hoisted(() => ({
+  batchUpdate: vi.fn(async () => undefined),
 }))
 
 // Stub the heavy app-router import — mqttBridge only needs createCaller({}) to
 // resolve at module load. Lifecycle tests below additionally exercise command
 // dispatch and so need real-looking spies.
 vi.mock('@/src/server/routers/app', () => ({
-  appRouter: { createCaller: () => ({ device: deviceMock }) },
+  appRouter: { createCaller: () => ({ device: deviceMock, schedules: schedulesMock }) },
 }))
+
+vi.mock('@/src/hardware/sensorHaptics', () => hapticMock)
+
+const alarmStateMock = vi.hoisted(() => ({
+  getAlarmStatus: vi.fn<() => any>(() => ({
+    state: 'idle',
+    active: false,
+    occurrenceId: null,
+    scheduleId: null,
+    scheduledFor: null,
+    snoozeUntil: null,
+    ringingUntil: null,
+    vibrationIntensity: null,
+    vibrationPattern: null,
+    duration: null,
+  })),
+}))
+
+vi.mock('@/src/hardware/snoozeManager', () => alarmStateMock)
 
 // Hoisted onServerFrame mock — lifecycle tests need to capture the frame
 // listener so they can assert frame-driven publishes.
@@ -209,7 +261,7 @@ vi.mock('@/src/hardware/dacMonitor.instance', () => ({
 }))
 
 const bridgeModule = await import('../mqttBridge')
-const { __test__, getBridgeStatus, startMqttBridge, shutdownMqttBridge, testConnection } = bridgeModule
+const { __test__, getBridgeStatus, publishAlarmState, startMqttBridge, shutdownMqttBridge, testConnection } = bridgeModule
 const { resolveConfig, slugify, deviceId, parsePayload, state: bridgeState } = __test__
 
 const MQTT_ENV_KEYS = [
@@ -235,6 +287,9 @@ beforeEach(() => {
   dbMock.state.biometricsRow = null
   dbMock.state.deviceStateRows = []
   dbMock.state.bedTempRow = null
+  dbMock.state.alarmScheduleRows = []
+  dbMock.state.powerScheduleRows = []
+  dbMock.state.temperatureScheduleRows = []
   dbMock.state.throwOnBedTemp = false
   dbMock.state.throwOnDeviceState = false
   dbMock.state.throwOnBiometrics = false
@@ -250,7 +305,22 @@ beforeEach(() => {
   deviceMock.setPower.mockClear()
   deviceMock.setAlarm.mockClear()
   deviceMock.clearAlarm.mockClear()
+  deviceMock.snoozeAlarm.mockClear()
   deviceMock.startPriming.mockClear()
+  alarmStateMock.getAlarmStatus.mockReset().mockReturnValue({
+    state: 'idle',
+    active: false,
+    occurrenceId: null,
+    scheduleId: null,
+    scheduledFor: null,
+    snoozeUntil: null,
+    ringingUntil: null,
+    vibrationIntensity: null,
+    vibrationPattern: null,
+    duration: null,
+  })
+  hapticMock.triggerHapticConfirm.mockClear()
+  schedulesMock.batchUpdate.mockClear()
 })
 
 afterEach(() => {
@@ -746,13 +816,30 @@ describe('mqttBridge — startMqttBridge connect flow', () => {
     await shutdownMqttBridge()
   })
 
-  it('skips HA discovery when disabled in config', async () => {
+  it('skips HA discovery when disabled in config except removed-entity tombstones', async () => {
     const fake = await startBridgeWithFake({ config: { haDiscovery: false } })
     fake.connected = true
     fake.emit('connect')
 
     const haPublishes = fake.publish.mock.calls.filter(([t]) => typeof t === 'string' && (t as string).startsWith('homeassistant/'))
-    expect(haPublishes.length).toBe(0)
+    expect(haPublishes).toHaveLength(1)
+    expect(haPublishes[0][0]).toMatch(/\/gesture_settings\/config$/)
+    expect(Buffer.isBuffer(haPublishes[0][1]) && (haPublishes[0][1] as Buffer).length === 0).toBe(true)
+
+    await shutdownMqttBridge()
+  })
+
+  it('clears retained gesture MQTT state and HA discovery on connect', async () => {
+    process.env.MQTT_DEVICE_ID = 'testpod'
+    const fake = await startBridgeWithFake({ config: { haDiscovery: true, topicPrefix: 'sleepypod' } })
+    fake.connected = true
+    fake.emit('connect')
+
+    const tombstones = fake.publish.mock.calls.filter(([, payload]) => Buffer.isBuffer(payload) && (payload as Buffer).length === 0)
+    expect(tombstones).toEqual(expect.arrayContaining([
+      expect.arrayContaining(['homeassistant/sensor/testpod/gesture_settings/config']),
+      expect.arrayContaining(['sleepypod/testpod/state/button-gestures']),
+    ]))
 
     await shutdownMqttBridge()
   })
@@ -814,6 +901,250 @@ describe('mqttBridge — startMqttBridge connect flow', () => {
   })
 })
 
+// The connect-flow test above only confirms *some* discovery topic lands.
+// These pin every field of every published HA discovery config so a single
+// changed string / template / unit / device-class fails a test. deviceId and
+// topicPrefix are fixed so the expected payloads are fully deterministic.
+describe('mqttBridge — HA discovery payload content', () => {
+  const DEVICE = {
+    identifiers: ['testpod'],
+    name: 'Sleepypod testpod',
+    manufacturer: 'Sleepypod',
+    model: 'Pod',
+  }
+  const AVAILABILITY = 'sleepypod/testpod/availability'
+
+  // Shared sensor shape; name + topic + template + unit/device_class vary per call.
+  function sensorCfg(
+    name: string,
+    objectId: string,
+    stateTopic: string,
+    template: string,
+    extra: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      name,
+      unique_id: `testpod_${objectId}`,
+      availability_topic: AVAILABILITY,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: stateTopic,
+      value_template: template,
+      state_class: 'measurement',
+      device: DEVICE,
+      ...extra,
+    }
+  }
+
+  function climateCfg(side: 'left' | 'right'): Record<string, unknown> {
+    const label = side === 'left' ? 'Left' : 'Right'
+    return {
+      name: `${label} side`,
+      unique_id: `testpod_${side}_climate`,
+      availability_topic: AVAILABILITY,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      current_temperature_topic: `sleepypod/testpod/state/${side}/climate`,
+      current_temperature_template: '{{ value_json.currentTemperature }}',
+      temperature_state_topic: `sleepypod/testpod/state/${side}/climate`,
+      temperature_state_template: '{{ value_json.targetTemperature }}',
+      mode_state_topic: `sleepypod/testpod/state/${side}/climate`,
+      mode_state_template: '{{ value_json.mode }}',
+      temperature_command_topic: 'sleepypod/testpod/cmd/set-temperature',
+      temperature_command_template: `{ "side": "${side}", "temperature": {{ value | int }} }`,
+      mode_command_topic: 'sleepypod/testpod/cmd/set-power',
+      mode_command_template: `{ "side": "${side}", "powered": {{ "true" if value == "heat" else "false" }} }`,
+      modes: ['off', 'heat'],
+      min_temp: 55,
+      max_temp: 110,
+      temp_step: 1,
+      temperature_unit: 'F',
+      device: DEVICE,
+    }
+  }
+
+  function targetLevelNumberCfg(side: 'left' | 'right'): Record<string, unknown> {
+    const label = side === 'left' ? 'Left' : 'Right'
+    return {
+      name: `${label} target level`,
+      unique_id: `testpod_${side}_target_level`,
+      availability_topic: AVAILABILITY,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: `sleepypod/testpod/state/${side}/target-level`,
+      value_template: '{{ value_json.level }}',
+      json_attributes_topic: `sleepypod/testpod/state/${side}/target-level`,
+      command_topic: 'sleepypod/testpod/cmd/set-target-level',
+      command_template: `{ "side": "${side}", "level": {{ value | float }} }`,
+      min: -10,
+      max: 10,
+      step: 1,
+      mode: 'slider',
+      icon: 'mdi:thermometer-lines',
+      device: DEVICE,
+    }
+  }
+
+  function alarmStateCfg(side: 'left' | 'right'): Record<string, unknown> {
+    const label = side === 'left' ? 'Left' : 'Right'
+    return {
+      name: `${label} alarm state`,
+      unique_id: `testpod_${side}_alarm_state`,
+      availability_topic: AVAILABILITY,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: `sleepypod/testpod/state/${side}/alarm`,
+      value_template: '{{ value_json.state }}',
+      json_attributes_topic: `sleepypod/testpod/state/${side}/alarm`,
+      device_class: 'enum',
+      options: ['idle', 'ringing', 'snoozed'],
+      icon: 'mdi:alarm',
+      device: DEVICE,
+    }
+  }
+
+  function alarmButtonCfg(side: 'left' | 'right', action: 'snooze' | 'stop'): Record<string, unknown> {
+    const label = side === 'left' ? 'Left' : 'Right'
+    return {
+      name: `${label} alarm ${action}`,
+      unique_id: `testpod_${side}_alarm_${action}`,
+      availability_topic: AVAILABILITY,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      command_topic: `sleepypod/testpod/cmd/${action}-alarm`,
+      payload_press: action === 'snooze'
+        ? `{"side":"${side}","duration":300}`
+        : `{"side":"${side}"}`,
+      icon: action === 'snooze' ? 'mdi:alarm-snooze' : 'mdi:alarm-off',
+      device: DEVICE,
+    }
+  }
+
+  function schedulesSensorCfg(): Record<string, unknown> {
+    return {
+      name: 'Schedules',
+      unique_id: 'testpod_schedules',
+      availability_topic: AVAILABILITY,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: 'sleepypod/testpod/state/schedules',
+      value_template: '{{ value_json.state }}',
+      json_attributes_topic: 'sleepypod/testpod/state/schedules',
+      icon: 'mdi:calendar-clock',
+      device: DEVICE,
+    }
+  }
+
+  function binaryCfg(side: 'left' | 'right', kind: 'stall' | 'clog'): Record<string, unknown> {
+    const label = side === 'left' ? 'Left' : 'Right'
+    return {
+      name: kind === 'stall' ? `${label} pump stall` : `${label} pump clog detected`,
+      unique_id: `testpod_pump_${side}_${kind}`,
+      availability_topic: AVAILABILITY,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: kind === 'stall'
+        ? `sleepypod/testpod/pump/${side}/stall`
+        : `sleepypod/testpod/pump/${side}/clog_detected`,
+      payload_on: 'on',
+      payload_off: 'off',
+      device_class: 'problem',
+      device: DEVICE,
+    }
+  }
+
+  let configs: Map<string, Record<string, unknown>>
+
+  beforeEach(async () => {
+    process.env.MQTT_DEVICE_ID = 'testpod'
+    const fake = await startBridgeWithFake({ config: { haDiscovery: true, topicPrefix: 'sleepypod' } })
+    fake.connected = true
+    fake.emit('connect')
+    configs = new Map()
+    for (const call of fake.publish.mock.calls) {
+      const [t, payload] = call as [string, unknown]
+      const text = Buffer.isBuffer(payload) ? payload.toString('utf-8') : typeof payload === 'string' ? payload : ''
+      if (typeof t === 'string' && t.startsWith('homeassistant/') && text) {
+        configs.set(t, JSON.parse(text))
+      }
+    }
+    await shutdownMqttBridge()
+  })
+
+  it.each(['left', 'right'] as const)('publishes the full %s climate config', (side) => {
+    expect(configs.get(`homeassistant/climate/testpod/${side}/config`)).toEqual(climateCfg(side))
+  })
+
+  it.each(['left', 'right'] as const)('publishes the full %s target-level number config', (side) => {
+    expect(configs.get(`homeassistant/number/testpod/${side}_target_level/config`)).toEqual(targetLevelNumberCfg(side))
+  })
+
+  it.each(['left', 'right'] as const)('publishes the full %s alarm entities', (side) => {
+    expect(configs.get(`homeassistant/sensor/testpod/${side}_alarm_state/config`)).toEqual(alarmStateCfg(side))
+    expect(configs.get(`homeassistant/button/testpod/${side}_alarm_snooze/config`)).toEqual(alarmButtonCfg(side, 'snooze'))
+    expect(configs.get(`homeassistant/button/testpod/${side}_alarm_stop/config`)).toEqual(alarmButtonCfg(side, 'stop'))
+  })
+
+  it('publishes the full water_level sensor config', () => {
+    expect(configs.get('homeassistant/sensor/testpod/water_level/config')).toEqual(
+      sensorCfg('Water level', 'water_level', 'sleepypod/testpod/state/water-level', '{{ value_json.level }}'),
+    )
+  })
+
+  it('publishes the full schedules sensor config', () => {
+    expect(configs.get('homeassistant/sensor/testpod/schedules/config')).toEqual(schedulesSensorCfg())
+  })
+
+  it('publishes the full ambient temperature + humidity sensor configs', () => {
+    expect(configs.get('homeassistant/sensor/testpod/ambient_temperature/config')).toEqual(
+      sensorCfg('Ambient temperature', 'ambient_temperature', 'sleepypod/testpod/state/environment/ambient',
+        '{{ value_json.temperature }}', { unit_of_measurement: '°C', device_class: 'temperature' }),
+    )
+    expect(configs.get('homeassistant/sensor/testpod/ambient_humidity/config')).toEqual(
+      sensorCfg('Ambient humidity', 'ambient_humidity', 'sleepypod/testpod/state/environment/ambient',
+        '{{ value_json.humidity }}', { unit_of_measurement: '%', device_class: 'humidity' }),
+    )
+  })
+
+  it.each(['left', 'right'] as const)('publishes the full %s pump rpm + loop-temp sensor configs', (side) => {
+    const label = side === 'left' ? 'Left' : 'Right'
+    expect(configs.get(`homeassistant/sensor/testpod/pump_${side}_rpm/config`)).toEqual(
+      sensorCfg(`${label} pump RPM`, `pump_${side}_rpm`, `sleepypod/testpod/pump/${side}/rpm`,
+        '{{ value_json.rpm }}', { unit_of_measurement: 'rpm' }),
+    )
+    expect(configs.get(`homeassistant/sensor/testpod/pump_${side}_loop_temp/config`)).toEqual(
+      sensorCfg(`${label} pump loop temp`, `pump_${side}_loop_temp`, `sleepypod/testpod/pump/${side}/loop_temp_c`,
+        '{{ value_json.temperature }}', { unit_of_measurement: '°C', device_class: 'temperature' }),
+    )
+  })
+
+  it.each(['left', 'right'] as const)('publishes the full %s pump stall + clog binary-sensor configs', (side) => {
+    expect(configs.get(`homeassistant/binary_sensor/testpod/pump_${side}_stall/config`)).toEqual(binaryCfg(side, 'stall'))
+    expect(configs.get(`homeassistant/binary_sensor/testpod/pump_${side}_clog/config`)).toEqual(binaryCfg(side, 'clog'))
+  })
+
+  it.each(['left', 'right'] as const)('publishes the full %s biometric sensor configs', (side) => {
+    const label = side === 'left' ? 'Left' : 'Right'
+    const bioTopic = `sleepypod/testpod/state/biometrics/${side}`
+    expect(configs.get(`homeassistant/sensor/testpod/${side}_heart_rate/config`)).toEqual(
+      sensorCfg(`${label} heart rate`, `${side}_heart_rate`, bioTopic, '{{ value_json.heartRate }}', { unit_of_measurement: 'bpm' }),
+    )
+    expect(configs.get(`homeassistant/sensor/testpod/${side}_breathing_rate/config`)).toEqual(
+      sensorCfg(`${label} breathing rate`, `${side}_breathing_rate`, bioTopic, '{{ value_json.breathingRate }}', { unit_of_measurement: 'br/min' }),
+    )
+    expect(configs.get(`homeassistant/sensor/testpod/${side}_hrv/config`)).toEqual(
+      sensorCfg(`${label} HRV`, `${side}_hrv`, bioTopic, '{{ value_json.hrv }}', { unit_of_measurement: 'ms' }),
+    )
+  })
+
+  it('attaches the shared device identity block to every published config', () => {
+    expect(configs.size).toBeGreaterThan(0)
+    for (const cfg of configs.values()) {
+      expect(cfg.device).toEqual(DEVICE)
+    }
+  })
+})
+
 describe('mqttBridge — message dispatch', () => {
   it('routes set-temperature payload to caller.device.setTemperature', async () => {
     const fake = await startBridgeWithFake()
@@ -825,6 +1156,21 @@ describe('mqttBridge — message dispatch', () => {
 
     await new Promise(r => setTimeout(r, 0))
     expect(deviceMock.setTemperature).toHaveBeenCalledWith({ side: 'left', temperature: 70 })
+    expect(hapticMock.triggerHapticConfirm).toHaveBeenCalledWith('left')
+
+    await shutdownMqttBridge()
+  })
+
+  it('routes set-target-level payload to caller.device.setTemperature with mapped Fahrenheit target', async () => {
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    fake.emit('message', `sleepypod/${deviceId()}/cmd/set-target-level`, Buffer.from(JSON.stringify({ side: 'left', level: -2 })))
+
+    await new Promise(r => setTimeout(r, 0))
+    expect(deviceMock.setTemperature).toHaveBeenCalledWith({ side: 'left', temperature: 77 })
+    expect(hapticMock.triggerHapticConfirm).toHaveBeenCalledWith('left')
 
     await shutdownMqttBridge()
   })
@@ -845,6 +1191,116 @@ describe('mqttBridge — message dispatch', () => {
     expect(deviceMock.setAlarm).toHaveBeenCalled()
     expect(deviceMock.clearAlarm).toHaveBeenCalled()
     expect(deviceMock.startPriming).toHaveBeenCalledWith({})
+    expect(hapticMock.triggerHapticConfirm).not.toHaveBeenCalled()
+
+    await shutdownMqttBridge()
+  })
+
+  it('routes per-side snooze and stop alarm verbs', async () => {
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    const id = deviceId()
+    fake.emit('message', `sleepypod/${id}/cmd/snooze-alarm`, Buffer.from(JSON.stringify({ side: 'right', duration: 300 })))
+    fake.emit('message', `sleepypod/${id}/cmd/stop-alarm`, Buffer.from(JSON.stringify({ side: 'right' })))
+
+    await new Promise(r => setTimeout(r, 0))
+    expect(deviceMock.snoozeAlarm).toHaveBeenCalledWith({ side: 'right', duration: 300 })
+    expect(deviceMock.clearAlarm).toHaveBeenCalledWith({ side: 'right' })
+
+    await shutdownMqttBridge()
+  })
+
+  it('routes set-schedules payloads to schedules.batchUpdate with normalized power, temperature, and alarm rows', async () => {
+    dbMock.state.alarmScheduleRows = [
+      { id: 9, side: 'left', dayOfWeek: 'monday', time: '06:30', vibrationIntensity: 100, vibrationPattern: 'rise', duration: 180, alarmTemperature: 82, enabled: true },
+    ]
+    dbMock.state.powerScheduleRows = [
+      { id: 8, side: 'left', dayOfWeek: 'monday', onTime: '21:30', offTime: '09:00', onTemperature: 74, enabled: true },
+    ]
+    dbMock.state.temperatureScheduleRows = [
+      { id: 7, side: 'left', dayOfWeek: 'monday', time: '01:00', temperature: 77, enabled: true },
+      { id: 6, side: 'left', dayOfWeek: 'monday', time: '05:00', temperature: 85, enabled: true },
+    ]
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    fake.emit('message', `sleepypod/${deviceId()}/cmd/set-schedules`, Buffer.from(JSON.stringify({
+      left: {
+        monday: {
+          power: { on: '21:30', off: '09:00', enabled: true, onTemperature: -3 },
+          temperatures: {
+            '01:00': -2,
+            '05:00': 1,
+          },
+          alarms: [
+            { time: '06:30:00', vibrationIntensity: 120, vibrationPattern: 'double', duration: 300, alarmTemperature: 82, enabled: true },
+          ],
+        },
+      },
+    })))
+
+    await new Promise(r => setTimeout(r, 0))
+    expect(schedulesMock.batchUpdate).toHaveBeenCalledWith({
+      deletes: { alarm: [9], power: [8], temperature: [7, 6] },
+      creates: {
+        power: [{
+          side: 'left',
+          dayOfWeek: 'monday',
+          onTime: '21:30',
+          offTime: '09:00',
+          onTemperature: 74,
+          enabled: true,
+        }],
+        temperature: [
+          { side: 'left', dayOfWeek: 'monday', time: '01:00', temperature: 77, enabled: true },
+          { side: 'left', dayOfWeek: 'monday', time: '05:00', temperature: 85, enabled: true },
+        ],
+        alarm: [{
+          side: 'left',
+          dayOfWeek: 'monday',
+          time: '06:30',
+          vibrationIntensity: 100,
+          vibrationPattern: 'double',
+          duration: 180,
+          alarmTemperature: 82,
+          enabled: true,
+        }],
+      },
+    })
+    await new Promise(r => setTimeout(r, 0))
+    expect(fake.publish.mock.calls.some(([t]) => String(t).endsWith('/state/schedules'))).toBe(true)
+
+    await shutdownMqttBridge()
+  })
+
+  it('does not delete power or temperature schedules for alarm-only set-schedules payloads', async () => {
+    dbMock.state.alarmScheduleRows = [
+      { id: 9, side: 'left', dayOfWeek: 'monday' },
+    ]
+    dbMock.state.powerScheduleRows = [
+      { id: 8, side: 'left', dayOfWeek: 'monday' },
+    ]
+    dbMock.state.temperatureScheduleRows = [
+      { id: 7, side: 'left', dayOfWeek: 'monday' },
+    ]
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    fake.emit('message', `sleepypod/${deviceId()}/cmd/set-schedules`, Buffer.from(JSON.stringify({
+      left: {
+        monday: { alarms: [] },
+      },
+    })))
+
+    await new Promise(r => setTimeout(r, 0))
+    expect(schedulesMock.batchUpdate).toHaveBeenCalledWith({
+      deletes: { alarm: [9] },
+      creates: { alarm: [], power: [], temperature: [] },
+    })
 
     await shutdownMqttBridge()
   })
@@ -886,6 +1342,7 @@ describe('mqttBridge — message dispatch', () => {
     await new Promise(r => setTimeout(r, 0))
 
     expect(deviceMock.setTemperature).toHaveBeenCalled()
+    expect(hapticMock.triggerHapticConfirm).not.toHaveBeenCalled()
 
     await shutdownMqttBridge()
   })
@@ -907,6 +1364,81 @@ describe('mqttBridge — frame subscription', () => {
       expect.objectContaining({ retain: true }),
       expect.any(Function),
     )
+
+    await shutdownMqttBridge()
+  })
+
+  it('publishes per-side climate and target-level state from deviceStatus frames', async () => {
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+    fake.publish.mockClear()
+
+    piezoMock.state.listener?.({
+      type: 'deviceStatus',
+      ts: 123_456,
+      leftSide: {
+        currentTemperature: 74,
+        targetTemperature: 75,
+        targetLevel: -27,
+        isAlarmVibrating: false,
+      },
+      rightSide: {
+        currentTemperature: 80,
+        targetTemperature: null,
+        targetLevel: 0,
+        isAlarmVibrating: true,
+      },
+      waterLevel: 'ok',
+    })
+
+    const published = new Map(fake.publish.mock.calls.map(([t, payload, opts]) => [
+      t,
+      { payload: JSON.parse(String(payload)), opts },
+    ]))
+
+    expect(published.get(`sleepypod/${deviceId()}/state/left/climate`)).toEqual({
+      payload: {
+        ts: 123_456,
+        currentTemperature: 74,
+        targetTemperature: 75,
+        isPowered: true,
+        isAlarmVibrating: false,
+        mode: 'heat',
+        waterLevel: 'ok',
+      },
+      opts: expect.objectContaining({ retain: true }),
+    })
+    expect(published.get(`sleepypod/${deviceId()}/state/left/target-level`)).toEqual({
+      payload: {
+        ts: 123_456,
+        level: -3,
+        targetTemperature: 75,
+        isPowered: true,
+      },
+      opts: expect.objectContaining({ retain: true }),
+    })
+    expect(published.get(`sleepypod/${deviceId()}/state/right/climate`)).toEqual({
+      payload: {
+        ts: 123_456,
+        currentTemperature: 80,
+        targetTemperature: null,
+        isPowered: false,
+        isAlarmVibrating: true,
+        mode: 'off',
+        waterLevel: 'ok',
+      },
+      opts: expect.objectContaining({ retain: true }),
+    })
+    expect(published.get(`sleepypod/${deviceId()}/state/right/target-level`)).toEqual({
+      payload: {
+        ts: 123_456,
+        level: 0,
+        targetTemperature: null,
+        isPowered: false,
+      },
+      opts: expect.objectContaining({ retain: true }),
+    })
 
     await shutdownMqttBridge()
   })
@@ -934,6 +1466,45 @@ describe('mqttBridge — frame subscription', () => {
     piezoMock.state.listener?.({ type: 'deviceStatus' })
 
     expect(fake.publish).not.toHaveBeenCalled()
+
+    await shutdownMqttBridge()
+  })
+})
+
+describe('mqttBridge — alarm state publication', () => {
+  it('publishes ringing/snoozed occurrence metadata for Home Assistant', async () => {
+    alarmStateMock.getAlarmStatus.mockReturnValue({
+      state: 'snoozed',
+      active: true,
+      occurrenceId: 'schedule-42-1785255000000',
+      scheduleId: 42,
+      scheduledFor: 1_785_255_000,
+      snoozeUntil: 1_785_255_300,
+      ringingUntil: null,
+      vibrationIntensity: 100,
+      vibrationPattern: 'rise',
+      duration: 180,
+    })
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    publishAlarmState('right')
+
+    const call = [...fake.publish.mock.calls]
+      .reverse()
+      .find(([topicName]) => String(topicName).endsWith('/state/right/alarm'))
+    expect(JSON.parse(String(call?.[1]))).toMatchObject({
+      state: 'snoozed',
+      occurrence_id: 'schedule-42-1785255000000',
+      schedule_id: 42,
+      scheduled_for: 1_785_255_000,
+      snoozed_until: 1_785_255_300,
+      ringing_until: null,
+      vibration_intensity: 100,
+      vibration_pattern: 'rise',
+      duration: 180,
+    })
 
     await shutdownMqttBridge()
   })
@@ -1096,6 +1667,48 @@ describe('mqttBridge — publishState content', () => {
       hrv: 50,
       breathingRate: 14,
     }
+    dbMock.state.alarmScheduleRows = [
+      {
+        id: 3,
+        side: 'right',
+        dayOfWeek: 'saturday',
+        time: '07:15',
+        vibrationIntensity: 100,
+        vibrationPattern: 'rise',
+        duration: 30,
+        alarmTemperature: 82,
+        enabled: true,
+      },
+    ]
+    dbMock.state.powerScheduleRows = [
+      {
+        id: 2,
+        side: 'right',
+        dayOfWeek: 'saturday',
+        onTime: '21:30',
+        offTime: '09:00',
+        onTemperature: 88,
+        enabled: true,
+      },
+    ]
+    dbMock.state.temperatureScheduleRows = [
+      {
+        id: 4,
+        side: 'right',
+        dayOfWeek: 'saturday',
+        time: '01:00',
+        temperature: 80,
+        enabled: true,
+      },
+      {
+        id: 5,
+        side: 'right',
+        dayOfWeek: 'saturday',
+        time: '05:00',
+        temperature: 82,
+        enabled: true,
+      },
+    ]
 
     const fake = await startBridgeWithFake()
     fake.connected = true
@@ -1109,7 +1722,25 @@ describe('mqttBridge — publishState content', () => {
     expect(topics.some(t => t.endsWith('/state/device-status'))).toBe(true)
     expect(topics.some(t => t.endsWith('/state/water-level'))).toBe(true)
     expect(topics.some(t => t.endsWith('/state/left/climate'))).toBe(true)
+    expect(topics.some(t => t.endsWith('/state/left/target-level'))).toBe(true)
+    expect(topics.some(t => t.endsWith('/state/schedules'))).toBe(true)
     expect(topics.some(t => t.endsWith('/state/biometrics/left'))).toBe(true)
+    const scheduleCall = fake.publish.mock.calls.find(([t]) => String(t).endsWith('/state/schedules'))
+    const schedulePayload = JSON.parse(String(scheduleCall?.[1]))
+    expect(schedulePayload.state).toBe('ready')
+    expect(schedulePayload.right.saturday.power).toEqual({
+      enabled: true,
+      off: '09:00',
+      on: '21:30',
+      onTemperature: 88,
+    })
+    expect(schedulePayload.right.saturday.temperatures).toEqual({
+      '01:00': 80,
+      '05:00': 82,
+    })
+    expect(schedulePayload.right.saturday.alarms).toEqual([
+      expect.objectContaining({ time: '07:15', duration: 30, enabled: true }),
+    ])
 
     await shutdownMqttBridge()
   })
@@ -1463,5 +2094,630 @@ describe('mqttBridge — testConnection', () => {
     expect(opts.password).toBe('p')
     expect(opts.rejectUnauthorized).toBe(false)
     expect(opts.reconnectPeriod).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Mutation-coverage suites
+//
+// The blocks below pin the *contents* of the bridge's published payloads, not
+// just their topics. They exist to kill the string/array/number-literal and
+// conditional mutants Stryker reported surviving in mqttBridge.ts — every
+// asserted constant is written out independently of the source so emptying or
+// flipping it in mqttBridge.ts fails a test here.
+// ---------------------------------------------------------------------------
+
+describe('mqttBridge — resolveConfig mutation coverage', () => {
+  it('warns with the device_settings fallback message when the row read throws', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    dbMock.state.throwOnSelect = true
+
+    await resolveConfig()
+
+    expect(warn).toHaveBeenCalledWith(
+      '[mqtt] failed to read device_settings — falling back to env:',
+      expect.anything(),
+    )
+    warn.mockRestore()
+  })
+
+  it('reports DB-true haDiscovery with source "db" (pins the ?? boolean coalesce)', async () => {
+    // The "db sources" suite above uses mqttHaDiscovery=false, which is
+    // indistinguishable under the `?? → &&` mutant. A true value separates
+    // them: `true ?? null` → true (db) vs `true && null` → null (default).
+    dbMock.state.row = { mqttHaDiscovery: true }
+
+    const { config, sources } = await resolveConfig()
+
+    expect(sources.haDiscovery).toBe('db')
+    expect(config.haDiscovery).toBe(true)
+  })
+})
+
+describe('mqttBridge — safePublish error logging', () => {
+  async function startWithPublish(publishImpl: FakeClient['publish']): Promise<FakeClient> {
+    const fake = createFakeClient()
+    fake.publish = publishImpl
+    mqttMock.state.nextClient = fake
+    bridgeState.client = null
+    bridgeState.runState = 'stopped'
+    bridgeState.resolved = null
+    bridgeState.messagesPublished = 0
+    dbMock.state.row = { mqttEnabled: true, mqttUrl: 'mqtt://x' }
+    await startMqttBridge()
+    fake.connected = true
+    fake.emit('connect')
+    return fake
+  }
+
+  it('warns "publish … failed" with the broker error when the publish callback errors', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startWithPublish(vi.fn((_t: string, _p: any, _o: any, cb?: (err?: Error | null) => void) => {
+      cb?.(new Error('broker said no'))
+    }) as any)
+
+    const matched = (warn.mock.calls as unknown[][]).some(args =>
+      String(args[0] ?? '').includes('[mqtt] publish ')
+      && String(args[0] ?? '').includes(' failed:')
+      && args[1] === 'broker said no',
+    )
+    expect(matched).toBe(true)
+    warn.mockRestore()
+    await shutdownMqttBridge()
+  })
+
+  it('warns "publish … threw" when publish throws synchronously', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startWithPublish(vi.fn(() => {
+      throw new Error('publish kaboom')
+    }) as any)
+
+    const matched = (warn.mock.calls as unknown[][]).some(args =>
+      String(args[0] ?? '').includes('[mqtt] publish ')
+      && String(args[0] ?? '').includes(' threw:')
+      && args[1] === 'publish kaboom',
+    )
+    expect(matched).toBe(true)
+    warn.mockRestore()
+    await shutdownMqttBridge()
+  })
+})
+
+describe('mqttBridge — HA discovery payload contents (mutation coverage)', () => {
+  const ID = 'pod-test'
+  const AVAIL = `sleepypod/${ID}/availability`
+  const DEVICE = { identifiers: [ID], name: `Sleepypod ${ID}`, manufacturer: 'Sleepypod', model: 'Pod' }
+
+  function sensorCfg(o: { name: string, unique_id: string, state_topic: string, value_template: string, unit?: string, device_class?: string }) {
+    const cfg: Record<string, unknown> = {
+      name: o.name,
+      unique_id: o.unique_id,
+      availability_topic: AVAIL,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: o.state_topic,
+      value_template: o.value_template,
+      state_class: 'measurement',
+      device: DEVICE,
+    }
+    if (o.unit) cfg.unit_of_measurement = o.unit
+    if (o.device_class) cfg.device_class = o.device_class
+    return cfg
+  }
+
+  function binaryCfg(o: { name: string, unique_id: string, state_topic: string }) {
+    return {
+      name: o.name,
+      unique_id: o.unique_id,
+      availability_topic: AVAIL,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: o.state_topic,
+      payload_on: 'on',
+      payload_off: 'off',
+      device_class: 'problem',
+      device: DEVICE,
+    }
+  }
+
+  function climateCfg(side: 'left' | 'right') {
+    const Side = side === 'left' ? 'Left' : 'Right'
+    const climateTopic = `sleepypod/${ID}/state/${side}/climate`
+    return {
+      name: `${Side} side`,
+      unique_id: `${ID}_${side}_climate`,
+      availability_topic: AVAIL,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      current_temperature_topic: climateTopic,
+      current_temperature_template: '{{ value_json.currentTemperature }}',
+      temperature_state_topic: climateTopic,
+      temperature_state_template: '{{ value_json.targetTemperature }}',
+      mode_state_topic: climateTopic,
+      mode_state_template: '{{ value_json.mode }}',
+      temperature_command_topic: `sleepypod/${ID}/cmd/set-temperature`,
+      temperature_command_template: `{ "side": "${side}", "temperature": {{ value | int }} }`,
+      mode_command_topic: `sleepypod/${ID}/cmd/set-power`,
+      mode_command_template: `{ "side": "${side}", "powered": {{ "true" if value == "heat" else "false" }} }`,
+      modes: ['off', 'heat'],
+      min_temp: 55,
+      max_temp: 110,
+      temp_step: 1,
+      temperature_unit: 'F',
+      device: DEVICE,
+    }
+  }
+
+  function targetLevelNumberCfg(side: 'left' | 'right') {
+    const Side = side === 'left' ? 'Left' : 'Right'
+    return {
+      name: `${Side} target level`,
+      unique_id: `${ID}_${side}_target_level`,
+      availability_topic: AVAIL,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: `sleepypod/${ID}/state/${side}/target-level`,
+      value_template: '{{ value_json.level }}',
+      json_attributes_topic: `sleepypod/${ID}/state/${side}/target-level`,
+      command_topic: `sleepypod/${ID}/cmd/set-target-level`,
+      command_template: `{ "side": "${side}", "level": {{ value | float }} }`,
+      min: -10,
+      max: 10,
+      step: 1,
+      mode: 'slider',
+      icon: 'mdi:thermometer-lines',
+      device: DEVICE,
+    }
+  }
+
+  it('publishes the full HA discovery config set with exact payloads', async () => {
+    process.env.MQTT_DEVICE_ID = ID
+    const fake = await startBridgeWithFake({ config: { haDiscovery: true, topicPrefix: 'sleepypod' } })
+    fake.connected = true
+    fake.emit('connect')
+    await new Promise(r => setTimeout(r, 0))
+
+    const got: Record<string, unknown> = {}
+    for (const [t, payload] of fake.publish.mock.calls as [string, unknown][]) {
+      const text = Buffer.isBuffer(payload) ? payload.toString('utf-8') : typeof payload === 'string' ? payload : ''
+      if (typeof t === 'string' && t.startsWith('homeassistant/') && text) got[t] = JSON.parse(text)
+    }
+
+    const expected: Record<string, unknown> = {
+      [`homeassistant/climate/${ID}/left/config`]: climateCfg('left'),
+      [`homeassistant/climate/${ID}/right/config`]: climateCfg('right'),
+      [`homeassistant/number/${ID}/left_target_level/config`]: targetLevelNumberCfg('left'),
+      [`homeassistant/number/${ID}/right_target_level/config`]: targetLevelNumberCfg('right'),
+      [`homeassistant/sensor/${ID}/water_level/config`]: sensorCfg({
+        name: 'Water level',
+        unique_id: `${ID}_water_level`,
+        state_topic: `sleepypod/${ID}/state/water-level`,
+        value_template: '{{ value_json.level }}',
+      }),
+      [`homeassistant/sensor/${ID}/schedules/config`]: {
+        name: 'Schedules',
+        unique_id: `${ID}_schedules`,
+        availability_topic: AVAIL,
+        payload_available: 'online',
+        payload_not_available: 'offline',
+        state_topic: `sleepypod/${ID}/state/schedules`,
+        value_template: '{{ value_json.state }}',
+        json_attributes_topic: `sleepypod/${ID}/state/schedules`,
+        icon: 'mdi:calendar-clock',
+        device: DEVICE,
+      },
+      [`homeassistant/sensor/${ID}/ambient_temperature/config`]: sensorCfg({
+        name: 'Ambient temperature',
+        unique_id: `${ID}_ambient_temperature`,
+        state_topic: `sleepypod/${ID}/state/environment/ambient`,
+        value_template: '{{ value_json.temperature }}',
+        unit: '°C',
+        device_class: 'temperature',
+      }),
+      [`homeassistant/sensor/${ID}/ambient_humidity/config`]: sensorCfg({
+        name: 'Ambient humidity',
+        unique_id: `${ID}_ambient_humidity`,
+        state_topic: `sleepypod/${ID}/state/environment/ambient`,
+        value_template: '{{ value_json.humidity }}',
+        unit: '%',
+        device_class: 'humidity',
+      }),
+    }
+
+    for (const side of ['left', 'right'] as const) {
+      const Side = side === 'left' ? 'Left' : 'Right'
+      expected[`homeassistant/sensor/${ID}/${side}_alarm_state/config`] = {
+        name: `${Side} alarm state`,
+        unique_id: `${ID}_${side}_alarm_state`,
+        availability_topic: AVAIL,
+        payload_available: 'online',
+        payload_not_available: 'offline',
+        state_topic: `sleepypod/${ID}/state/${side}/alarm`,
+        value_template: '{{ value_json.state }}',
+        json_attributes_topic: `sleepypod/${ID}/state/${side}/alarm`,
+        device_class: 'enum',
+        options: ['idle', 'ringing', 'snoozed'],
+        icon: 'mdi:alarm',
+        device: DEVICE,
+      }
+      expected[`homeassistant/button/${ID}/${side}_alarm_snooze/config`] = {
+        name: `${Side} alarm snooze`,
+        unique_id: `${ID}_${side}_alarm_snooze`,
+        availability_topic: AVAIL,
+        payload_available: 'online',
+        payload_not_available: 'offline',
+        command_topic: `sleepypod/${ID}/cmd/snooze-alarm`,
+        payload_press: `{"side":"${side}","duration":300}`,
+        icon: 'mdi:alarm-snooze',
+        device: DEVICE,
+      }
+      expected[`homeassistant/button/${ID}/${side}_alarm_stop/config`] = {
+        name: `${Side} alarm stop`,
+        unique_id: `${ID}_${side}_alarm_stop`,
+        availability_topic: AVAIL,
+        payload_available: 'online',
+        payload_not_available: 'offline',
+        command_topic: `sleepypod/${ID}/cmd/stop-alarm`,
+        payload_press: `{"side":"${side}"}`,
+        icon: 'mdi:alarm-off',
+        device: DEVICE,
+      }
+      expected[`homeassistant/sensor/${ID}/pump_${side}_rpm/config`] = sensorCfg({
+        name: `${Side} pump RPM`,
+        unique_id: `${ID}_pump_${side}_rpm`,
+        state_topic: `sleepypod/${ID}/pump/${side}/rpm`,
+        value_template: '{{ value_json.rpm }}',
+        unit: 'rpm',
+      })
+      expected[`homeassistant/sensor/${ID}/pump_${side}_loop_temp/config`] = sensorCfg({
+        name: `${Side} pump loop temp`,
+        unique_id: `${ID}_pump_${side}_loop_temp`,
+        state_topic: `sleepypod/${ID}/pump/${side}/loop_temp_c`,
+        value_template: '{{ value_json.temperature }}',
+        unit: '°C',
+        device_class: 'temperature',
+      })
+      expected[`homeassistant/binary_sensor/${ID}/pump_${side}_stall/config`] = binaryCfg({
+        name: `${Side} pump stall`,
+        unique_id: `${ID}_pump_${side}_stall`,
+        state_topic: `sleepypod/${ID}/pump/${side}/stall`,
+      })
+      expected[`homeassistant/binary_sensor/${ID}/pump_${side}_clog/config`] = binaryCfg({
+        name: `${Side} pump clog detected`,
+        unique_id: `${ID}_pump_${side}_clog`,
+        state_topic: `sleepypod/${ID}/pump/${side}/clog_detected`,
+      })
+      expected[`homeassistant/sensor/${ID}/${side}_heart_rate/config`] = sensorCfg({
+        name: `${Side} heart rate`,
+        unique_id: `${ID}_${side}_heart_rate`,
+        state_topic: `sleepypod/${ID}/state/biometrics/${side}`,
+        value_template: '{{ value_json.heartRate }}',
+        unit: 'bpm',
+      })
+      expected[`homeassistant/sensor/${ID}/${side}_breathing_rate/config`] = sensorCfg({
+        name: `${Side} breathing rate`,
+        unique_id: `${ID}_${side}_breathing_rate`,
+        state_topic: `sleepypod/${ID}/state/biometrics/${side}`,
+        value_template: '{{ value_json.breathingRate }}',
+        unit: 'br/min',
+      })
+      expected[`homeassistant/sensor/${ID}/${side}_hrv/config`] = sensorCfg({
+        name: `${Side} HRV`,
+        unique_id: `${ID}_${side}_hrv`,
+        state_topic: `sleepypod/${ID}/state/biometrics/${side}`,
+        value_template: '{{ value_json.hrv }}',
+        unit: 'ms',
+      })
+    }
+
+    expect(got).toEqual(expected)
+    await shutdownMqttBridge()
+  })
+})
+
+describe('mqttBridge — publishState payload contents (mutation coverage)', () => {
+  const ID = 'pod-test'
+
+  function setupData() {
+    dacMock.getDacMonitorIfRunning.mockReturnValue({
+      getLastStatus: () => ({
+        leftSide: { temp: 80 },
+        rightSide: { temp: 82 },
+        waterLevel: 'ok',
+        isPriming: false,
+        podVersion: '1.2.3',
+      }),
+    })
+    dbMock.state.deviceStateRows = [
+      { side: 'left', currentTemperature: 70, targetTemperature: 72, isPowered: true, isAlarmVibrating: false, waterLevel: 'ok', lastUpdated: new Date('2026-01-01T00:00:00Z') },
+      { side: 'right', currentTemperature: 68, targetTemperature: 66, isPowered: false, isAlarmVibrating: true, waterLevel: 'low', lastUpdated: new Date('2026-01-02T00:00:00Z') },
+    ]
+    dbMock.state.biometricsRow = { side: 'left', timestamp: new Date('2026-04-04T00:00:00Z'), heartRate: 60, hrv: 50, breathingRate: 14 }
+    dbMock.state.bedTempRow = { timestamp: new Date('2026-03-03T00:00:00Z'), ambientTemp: 2000, humidity: 5000, leftPumpRpm: 1800, rightPumpRpm: 1900, leftFlowrateCd: 2050, rightFlowrateCd: 2150 }
+  }
+
+  async function capture(): Promise<{ fake: FakeClient, map: Record<string, string> }> {
+    process.env.MQTT_DEVICE_ID = ID
+    setupData()
+    const fake = await startBridgeWithFake({ config: { haDiscovery: false, topicPrefix: 'sleepypod' } })
+    fake.connected = true
+    fake.emit('connect')
+    await new Promise(r => setTimeout(r, 0))
+    await new Promise(r => setTimeout(r, 0))
+    const map: Record<string, string> = {}
+    for (const [t, payload] of fake.publish.mock.calls as [string, string][]) {
+      if (typeof t === 'string') map[t] = payload
+    }
+    return { fake, map }
+  }
+
+  it('device-status mirrors the DAC monitor status fields', async () => {
+    const { map } = await capture()
+    const payload = JSON.parse(map[`sleepypod/${ID}/state/device-status`])
+    expect(payload).toMatchObject({
+      leftSide: { temp: 80 },
+      rightSide: { temp: 82 },
+      waterLevel: 'ok',
+      isPriming: false,
+      podVersion: '1.2.3',
+    })
+    expect(typeof payload.ts).toBe('number')
+    await shutdownMqttBridge()
+  })
+
+  it('water-level carries the DAC waterLevel', async () => {
+    const { map } = await capture()
+    const payload = JSON.parse(map[`sleepypod/${ID}/state/water-level`])
+    expect(payload.level).toBe('ok')
+    await shutdownMqttBridge()
+  })
+
+  it('per-side climate payload maps isPowered → mode heat/off', async () => {
+    const { map } = await capture()
+    expect(JSON.parse(map[`sleepypod/${ID}/state/left/climate`])).toEqual({
+      ts: new Date('2026-01-01T00:00:00Z').getTime(),
+      currentTemperature: 70,
+      targetTemperature: 72,
+      isPowered: true,
+      isAlarmVibrating: false,
+      mode: 'heat',
+      waterLevel: 'ok',
+    })
+    expect(JSON.parse(map[`sleepypod/${ID}/state/right/climate`])).toEqual({
+      ts: new Date('2026-01-02T00:00:00Z').getTime(),
+      currentTemperature: 68,
+      targetTemperature: 66,
+      isPowered: false,
+      isAlarmVibrating: true,
+      mode: 'off',
+      waterLevel: 'low',
+    })
+    await shutdownMqttBridge()
+  })
+
+  it('per-side target-level payload maps target temperature to normalized -10..10 level', async () => {
+    const { map } = await capture()
+    expect(JSON.parse(map[`sleepypod/${ID}/state/left/target-level`])).toEqual({
+      ts: new Date('2026-01-01T00:00:00Z').getTime(),
+      level: -4,
+      targetTemperature: 72,
+      isPowered: true,
+    })
+    expect(JSON.parse(map[`sleepypod/${ID}/state/right/target-level`])).toEqual({
+      ts: new Date('2026-01-02T00:00:00Z').getTime(),
+      level: 0,
+      targetTemperature: 66,
+      isPowered: false,
+    })
+    await shutdownMqttBridge()
+  })
+
+  it('biometrics payload carries heartRate / hrv / breathingRate', async () => {
+    const { map } = await capture()
+    expect(JSON.parse(map[`sleepypod/${ID}/state/biometrics/left`])).toEqual({
+      ts: new Date('2026-04-04T00:00:00Z').getTime(),
+      heartRate: 60,
+      hrv: 50,
+      breathingRate: 14,
+    })
+    await shutdownMqttBridge()
+  })
+
+  it('pump rpm payloads carry per-side rpm; loop_temp_c is scaled by /100', async () => {
+    const { map } = await capture()
+    expect(JSON.parse(map[`sleepypod/${ID}/pump/left/rpm`])).toEqual({
+      ts: new Date('2026-03-03T00:00:00Z').getTime(),
+      rpm: 1800,
+    })
+    expect(JSON.parse(map[`sleepypod/${ID}/pump/right/rpm`])).toEqual({
+      ts: new Date('2026-03-03T00:00:00Z').getTime(),
+      rpm: 1900,
+    })
+    expect(JSON.parse(map[`sleepypod/${ID}/pump/left/loop_temp_c`]).temperature).toBeCloseTo(20.5, 2)
+    expect(JSON.parse(map[`sleepypod/${ID}/pump/right/loop_temp_c`]).temperature).toBeCloseTo(21.5, 2)
+    await shutdownMqttBridge()
+  })
+
+  it('pump stall + clog publish "off" when no stall notice is active', async () => {
+    const { resetPumpStallNotifications } = await import('@/src/hardware/pumpStallNotification')
+    resetPumpStallNotifications()
+    const { map } = await capture()
+    expect(map[`sleepypod/${ID}/pump/left/stall`]).toBe('off')
+    expect(map[`sleepypod/${ID}/pump/right/stall`]).toBe('off')
+    expect(map[`sleepypod/${ID}/pump/left/clog_detected`]).toBe('off')
+    expect(map[`sleepypod/${ID}/pump/right/clog_detected`]).toBe('off')
+    resetPumpStallNotifications()
+    await shutdownMqttBridge()
+  })
+})
+
+describe('mqttBridge — connect-option + lifecycle mutation coverage', () => {
+  it('builds a clientId prefixed with the device id and an LWT offline retained will', async () => {
+    process.env.MQTT_DEVICE_ID = 'pod-test'
+    await startBridgeWithFake({ config: { topicPrefix: 'sleepypod' } })
+
+    const [, opts] = mqttMock.connect.mock.calls.at(-1) as unknown as [string, any]
+    expect(String(opts.clientId)).toContain('sleepypod-pod-test-')
+    expect(opts.will?.payload).toEqual(Buffer.from('offline'))
+    expect(opts.will?.retain).toBe(true)
+
+    await shutdownMqttBridge()
+  })
+
+  it('no-ops when already connected even with a valid enabled config', async () => {
+    bridgeState.client = null
+    bridgeState.runState = 'connected'
+    bridgeState.resolved = null
+    dbMock.state.row = { mqttEnabled: true, mqttUrl: 'mqtt://x' }
+    mqttMock.state.nextClient = createFakeClient()
+
+    await startMqttBridge()
+
+    expect(mqttMock.connect).not.toHaveBeenCalled()
+
+    bridgeState.runState = 'stopped'
+    bridgeState.client = null
+  })
+
+  it('warns with the no-URL message when enabled but URL is missing', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    bridgeState.runState = 'stopped'
+    bridgeState.client = null
+    dbMock.state.row = { mqttEnabled: true, mqttUrl: null }
+
+    await startMqttBridge()
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('enabled but no URL configured'))
+    warn.mockRestore()
+    bridgeState.runState = 'stopped'
+    bridgeState.lastError = null
+  })
+
+  it('warns with the client-error message and records lastError', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    fake.emit('error', new Error('socket gone'))
+
+    expect(warn).toHaveBeenCalledWith('[mqtt] client error:', 'socket gone')
+    expect(bridgeState.lastError).toBe('socket gone')
+    warn.mockRestore()
+    await shutdownMqttBridge()
+  })
+
+  it('logs the subscribe-failure message when subscribe errors', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const fake = createFakeClient()
+    fake.subscribe = vi.fn((_t: string, _o: any, cb?: (err: Error | null) => void) => {
+      cb?.(new Error('sub failed'))
+      return fake
+    }) as any
+    mqttMock.state.nextClient = fake
+    bridgeState.client = null
+    bridgeState.runState = 'stopped'
+    bridgeState.resolved = null
+    dbMock.state.row = { mqttEnabled: true, mqttUrl: 'mqtt://x' }
+
+    await startMqttBridge()
+    fake.connected = true
+    fake.emit('connect')
+
+    expect(warn).toHaveBeenCalledWith('[mqtt] subscribe cmd/* failed:', 'sub failed')
+    warn.mockRestore()
+    await shutdownMqttBridge()
+  })
+
+  it('ends the client with force=false on shutdown', async () => {
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    await shutdownMqttBridge()
+
+    const endCall = fake.end.mock.calls.at(-1) as unknown[] | undefined
+    expect(endCall?.[0]).toBe(false)
+  })
+})
+
+describe('mqttBridge — command-dispatch + error-log mutation coverage', () => {
+  it('warns with the unknown-verb message for an unrecognised command', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    fake.emit('message', `sleepypod/${deviceId()}/cmd/bogus`, Buffer.from('{}'))
+    await new Promise(r => setTimeout(r, 0))
+
+    expect(warn).toHaveBeenCalledWith('[mqtt] unknown command verb: bogus')
+    warn.mockRestore()
+    await shutdownMqttBridge()
+  })
+
+  it('warns with the command-failed message when a handler rejects', async () => {
+    deviceMock.setTemperature.mockRejectedValueOnce(new Error('zod nope'))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    fake.emit('message', `sleepypod/${deviceId()}/cmd/set-temperature`, Buffer.from('{}'))
+    await new Promise(r => setTimeout(r, 0))
+    await new Promise(r => setTimeout(r, 0))
+
+    expect(warn).toHaveBeenCalledWith('[mqtt] command set-temperature failed:', 'zod nope')
+    warn.mockRestore()
+    await shutdownMqttBridge()
+  })
+
+  it('warns with the pump-rpm-failure message when the flow query throws', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    dbMock.state.throwOnBedTemp = true
+
+    const fake = await startBridgeWithFake({ config: { haDiscovery: false } })
+    fake.connected = true
+    fake.emit('connect')
+    await new Promise(r => setTimeout(r, 0))
+    await new Promise(r => setTimeout(r, 0))
+
+    const matched = (warn.mock.calls as unknown[][]).some(args =>
+      String(args[0] ?? '').includes('[mqtt] pump rpm publish failed')
+      && String(args[1] ?? '').includes('bed_temp boom'),
+    )
+    expect(matched).toBe(true)
+    warn.mockRestore()
+    await shutdownMqttBridge()
+  })
+})
+
+describe('mqttBridge — testConnection TLS option matrix (mutation coverage)', () => {
+  it('omits rejectUnauthorized when tlsEnabled but MQTT_TLS_INSECURE is unset', async () => {
+    const fake = createFakeClient()
+    mqttMock.state.nextClient = fake
+
+    const promise = testConnection({ url: 'mqtts://x', tlsEnabled: true })
+    await new Promise(r => setTimeout(r, 0))
+    fake.emit('connect')
+    await promise
+
+    const [, opts] = mqttMock.connect.mock.calls.at(-1) as unknown as [string, any]
+    expect(opts.rejectUnauthorized).toBeUndefined()
+    expect(String(opts.clientId)).toContain('sleepypod-test-')
+  })
+
+  it('omits rejectUnauthorized when MQTT_TLS_INSECURE is set but tlsEnabled is false', async () => {
+    process.env.MQTT_TLS_INSECURE = 'true'
+    const fake = createFakeClient()
+    mqttMock.state.nextClient = fake
+
+    const promise = testConnection({ url: 'mqtt://x', tlsEnabled: false })
+    await new Promise(r => setTimeout(r, 0))
+    fake.emit('connect')
+    await promise
+
+    const [, opts] = mqttMock.connect.mock.calls.at(-1) as unknown as [string, any]
+    expect(opts.rejectUnauthorized).toBeUndefined()
   })
 })

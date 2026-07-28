@@ -5,14 +5,26 @@ import { db } from '@/src/db'
 import { deviceSettings, sideSettings, tapGestures } from '@/src/db/schema'
 import { eq, and } from 'drizzle-orm'
 import {
+  coverButtonSchema,
+  gestureButtonSchema,
   isoDatetimeSchema,
   sideSchema,
   tapTypeSchema,
   temperatureUnitSchema,
   timeStringSchema,
+  vibrationIntensitySchema,
+  vibrationPatternSchema,
 } from '@/src/server/validation-schemas'
 
 const timestampSchema = z.coerce.date()
+const feedbackVibrationDurationSchema = z.number().int().min(1).max(10)
+const temperatureStepModeSchema = z.enum(['degree', 'level'])
+const feedbackVibrationInputShape = {
+  feedbackVibrationEnabled: z.boolean().optional(),
+  feedbackVibrationIntensity: vibrationIntensitySchema.optional(),
+  feedbackVibrationPattern: vibrationPatternSchema.optional(),
+  feedbackVibrationDuration: feedbackVibrationDurationSchema.optional(),
+}
 
 const deviceSettingsSchema = z.object({
   id: z.number(),
@@ -55,13 +67,40 @@ const sideSettingsSchema = z.object({
 const tapGestureSchema = z.object({
   id: z.number(),
   side: sideSchema,
+  button: gestureButtonSchema,
   tapType: tapTypeSchema,
-  actionType: z.enum(['temperature', 'alarm']),
+  actionType: z.enum(['temperature', 'alarm', 'power']),
   temperatureChange: z.enum(['increment', 'decrement']).nullable().optional(),
   temperatureAmount: z.number().nullable().optional(),
+  temperatureStepMode: temperatureStepModeSchema.nullable().optional(),
+  powerBehavior: z.enum(['toggle', 'on', 'off']).nullable().optional(),
   alarmBehavior: z.enum(['snooze', 'dismiss']).nullable().optional(),
   alarmSnoozeDuration: z.number().nullable().optional(),
   alarmInactiveBehavior: z.enum(['power', 'none']).nullable().optional(),
+  feedbackVibrationEnabled: z.boolean().default(false),
+  feedbackVibrationIntensity: z.number().nullable().optional(),
+  feedbackVibrationPattern: z.enum(['double', 'rise']).nullable().optional(),
+  feedbackVibrationDuration: z.number().nullable().optional(),
+  createdAt: timestampSchema,
+  updatedAt: timestampSchema,
+})
+
+const coverButtonActionSchema = z.object({
+  id: z.number(),
+  side: sideSchema,
+  button: coverButtonSchema,
+  actionType: z.enum(['temperature', 'alarm', 'power']),
+  temperatureChange: z.enum(['increment', 'decrement']).nullable().optional(),
+  temperatureAmount: z.number().nullable().optional(),
+  temperatureStepMode: temperatureStepModeSchema.nullable().optional(),
+  powerBehavior: z.enum(['toggle', 'on', 'off']).nullable().optional(),
+  alarmBehavior: z.enum(['snooze', 'dismiss']).nullable().optional(),
+  alarmSnoozeDuration: z.number().nullable().optional(),
+  alarmInactiveBehavior: z.enum(['power', 'none']).nullable().optional(),
+  feedbackVibrationEnabled: z.boolean().default(false),
+  feedbackVibrationIntensity: z.number().nullable().optional(),
+  feedbackVibrationPattern: z.enum(['double', 'rise']).nullable().optional(),
+  feedbackVibrationDuration: z.number().nullable().optional(),
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
 })
@@ -75,6 +114,10 @@ const getAllSettingsResponse = z.object({
   gestures: z.object({
     left: z.array(tapGestureSchema),
     right: z.array(tapGestureSchema),
+  }),
+  coverButtons: z.object({
+    left: z.array(coverButtonActionSchema),
+    right: z.array(coverButtonActionSchema),
   }),
 })
 import { getJobManager } from '@/src/scheduler'
@@ -92,6 +135,27 @@ const PRIME_KEYS = ['primePodDaily', 'primePodTime'] as const
 const LED_KEYS = [
   'ledNightModeEnabled', 'ledNightStartTime', 'ledNightEndTime',
 ] as const
+
+type CoverButtonValue = z.infer<typeof coverButtonSchema>
+
+function isCoverButtonValue(button: string): button is CoverButtonValue {
+  return button === 'top' || button === 'middle' || button === 'bottom'
+}
+
+function isSupportedCoverButtonGesture(button: string, tapType: string): boolean {
+  return (button === 'top' || button === 'bottom') && tapType === 'doubleTap'
+}
+
+function assertSupportedGesture(button: string, tapType: string): void {
+  if (button === 'surface' || isSupportedCoverButtonGesture(button, tapType)) {
+    return
+  }
+
+  throw new TRPCError({
+    code: 'BAD_REQUEST',
+    message: 'Cover button gestures are only supported for double-tap on the plus/minus buttons',
+  })
+}
 
 /**
  * Apply scheduler mutations triggered by a device-settings update. Re-reads
@@ -157,6 +221,10 @@ export const settingsRouter = router({
         const [device] = await db.select().from(deviceSettings).limit(1)
         const sides = await db.select().from(sideSettings)
         const gestures = await db.select().from(tapGestures)
+        const coverButtons = gestures.filter(
+          (g): g is typeof g & { button: CoverButtonValue, tapType: 'doubleTap' } =>
+            isCoverButtonValue(g.button) && isSupportedCoverButtonGesture(g.button, g.tapType)
+        )
 
         return {
           device: device ?? {
@@ -190,6 +258,10 @@ export const settingsRouter = router({
           gestures: {
             left: gestures.filter(g => g.side === 'left'),
             right: gestures.filter(g => g.side === 'right'),
+          },
+          coverButtons: {
+            left: coverButtons.filter(g => g.side === 'left'),
+            right: coverButtons.filter(g => g.side === 'right'),
           },
         }
       }
@@ -626,6 +698,7 @@ export const settingsRouter = router({
    *
    * Uses discriminated union validation to ensure:
    * - actionType='temperature' requires temperatureChange + temperatureAmount
+   * - actionType='power' requires/normalizes powerBehavior
    * - actionType='alarm' requires alarmBehavior (+ optional snooze/inactive fields)
    */
   setGesture: publicProcedure
@@ -634,27 +707,63 @@ export const settingsRouter = router({
         z
           .object({
             side: sideSchema,
+            button: gestureButtonSchema.optional().default('surface'),
             tapType: tapTypeSchema,
             actionType: z.literal('temperature'),
             temperatureChange: z.enum(['increment', 'decrement']),
             temperatureAmount: z.number().int().min(0).max(10),
+            temperatureStepMode: temperatureStepModeSchema.optional().default('level'),
+            ...feedbackVibrationInputShape,
           })
           .strict(),
         z
           .object({
             side: sideSchema,
+            button: gestureButtonSchema.optional().default('surface'),
+            tapType: tapTypeSchema,
+            actionType: z.literal('power'),
+            powerBehavior: z.enum(['toggle', 'on', 'off']).default('toggle'),
+            ...feedbackVibrationInputShape,
+          })
+          .strict(),
+        z
+          .object({
+            side: sideSchema,
+            button: gestureButtonSchema.optional().default('surface'),
             tapType: tapTypeSchema,
             actionType: z.literal('alarm'),
             alarmBehavior: z.enum(['snooze', 'dismiss']),
             alarmSnoozeDuration: z.number().int().min(60).max(600).optional(),
             alarmInactiveBehavior: z.enum(['power', 'none']).optional(),
+            ...feedbackVibrationInputShape,
           })
           .strict(),
       ])
     )
+    .output(tapGestureSchema)
     .mutation(async ({ input }) => {
+      assertSupportedGesture(input.button, input.tapType)
+
       try {
         const result = db.transaction((tx) => {
+          const values = {
+            side: input.side,
+            button: input.button,
+            tapType: input.tapType,
+            actionType: input.actionType,
+            temperatureChange: input.actionType === 'temperature' ? input.temperatureChange : null,
+            temperatureAmount: input.actionType === 'temperature' ? input.temperatureAmount : null,
+            temperatureStepMode: input.actionType === 'temperature' ? input.temperatureStepMode : null,
+            powerBehavior: input.actionType === 'power' ? input.powerBehavior : null,
+            alarmBehavior: input.actionType === 'alarm' ? input.alarmBehavior : null,
+            alarmSnoozeDuration: input.actionType === 'alarm' ? input.alarmSnoozeDuration ?? null : null,
+            alarmInactiveBehavior: input.actionType === 'alarm' ? input.alarmInactiveBehavior ?? null : null,
+            feedbackVibrationEnabled: input.feedbackVibrationEnabled ?? false,
+            feedbackVibrationIntensity: input.feedbackVibrationEnabled ? input.feedbackVibrationIntensity ?? 30 : null,
+            feedbackVibrationPattern: input.feedbackVibrationEnabled ? input.feedbackVibrationPattern ?? 'double' : null,
+            feedbackVibrationDuration: input.feedbackVibrationEnabled ? input.feedbackVibrationDuration ?? 1 : null,
+          }
+
           // Check if gesture already exists
           const existing = tx
             .select()
@@ -662,6 +771,7 @@ export const settingsRouter = router({
             .where(
               and(
                 eq(tapGestures.side, input.side),
+                eq(tapGestures.button, input.button),
                 eq(tapGestures.tapType, input.tapType)
               )
             )
@@ -673,7 +783,7 @@ export const settingsRouter = router({
             const [updated] = tx
               .update(tapGestures)
               .set({
-                ...input,
+                ...values,
                 updatedAt: new Date(),
               })
               .where(eq(tapGestures.id, existing[0].id))
@@ -693,9 +803,7 @@ export const settingsRouter = router({
             // Create new
             const [created] = tx
               .insert(tapGestures)
-              .values({
-                ...input,
-              })
+              .values(values)
               .returning()
               .all()
 
@@ -724,6 +832,133 @@ export const settingsRouter = router({
     }),
 
   /**
+   * Deprecated compatibility endpoint: physical Pod 5 cover-button actions are
+   * now double-tap gestures assigned to the plus/minus buttons.
+   */
+  setCoverButtonAction: publicProcedure
+    .input(
+      z.discriminatedUnion('actionType', [
+        z
+          .object({
+            side: sideSchema,
+            button: coverButtonSchema,
+            actionType: z.literal('temperature'),
+            temperatureChange: z.enum(['increment', 'decrement']),
+            temperatureAmount: z.number().int().min(0).max(10),
+            temperatureStepMode: temperatureStepModeSchema.optional().default('level'),
+            ...feedbackVibrationInputShape,
+          })
+          .strict(),
+        z
+          .object({
+            side: sideSchema,
+            button: coverButtonSchema,
+            actionType: z.literal('power'),
+            powerBehavior: z.enum(['toggle', 'on', 'off']).default('toggle'),
+            ...feedbackVibrationInputShape,
+          })
+          .strict(),
+        z
+          .object({
+            side: sideSchema,
+            button: coverButtonSchema,
+            actionType: z.literal('alarm'),
+            alarmBehavior: z.enum(['snooze', 'dismiss']),
+            alarmSnoozeDuration: z.number().int().min(60).max(600).optional(),
+            alarmInactiveBehavior: z.enum(['power', 'none']).optional(),
+            ...feedbackVibrationInputShape,
+          })
+          .strict(),
+      ])
+    )
+    .output(coverButtonActionSchema)
+    .mutation(async ({ input }) => {
+      assertSupportedGesture(input.button, 'doubleTap')
+
+      try {
+        const result = db.transaction((tx) => {
+          const existing = tx
+            .select()
+            .from(tapGestures)
+            .where(
+              and(
+                eq(tapGestures.side, input.side),
+                eq(tapGestures.button, input.button),
+                eq(tapGestures.tapType, 'doubleTap')
+              )
+            )
+            .limit(1)
+            .all()
+
+          const values = {
+            side: input.side,
+            button: input.button,
+            tapType: 'doubleTap' as const,
+            actionType: input.actionType,
+            temperatureChange: input.actionType === 'temperature' ? input.temperatureChange : null,
+            temperatureAmount: input.actionType === 'temperature' ? input.temperatureAmount : null,
+            temperatureStepMode: input.actionType === 'temperature' ? input.temperatureStepMode : null,
+            powerBehavior: input.actionType === 'power' ? input.powerBehavior : null,
+            alarmBehavior: input.actionType === 'alarm' ? input.alarmBehavior : null,
+            alarmSnoozeDuration: input.actionType === 'alarm' ? input.alarmSnoozeDuration ?? null : null,
+            alarmInactiveBehavior: input.actionType === 'alarm' ? input.alarmInactiveBehavior ?? null : null,
+            feedbackVibrationEnabled: input.feedbackVibrationEnabled ?? false,
+            feedbackVibrationIntensity: input.feedbackVibrationEnabled ? input.feedbackVibrationIntensity ?? 30 : null,
+            feedbackVibrationPattern: input.feedbackVibrationEnabled ? input.feedbackVibrationPattern ?? 'double' : null,
+            feedbackVibrationDuration: input.feedbackVibrationEnabled ? input.feedbackVibrationDuration ?? 1 : null,
+          }
+
+          if (existing.length > 0) {
+            const [updated] = tx
+              .update(tapGestures)
+              .set({
+                ...values,
+                updatedAt: new Date(),
+              })
+              .where(eq(tapGestures.id, existing[0].id))
+              .returning()
+              .all()
+
+            if (!updated) {
+              throw new TRPCError({
+                code: 'INTERNAL_SERVER_ERROR',
+                message: 'Failed to update cover button action - no record returned',
+              })
+            }
+
+            return updated
+          }
+
+          const [created] = tx
+            .insert(tapGestures)
+            .values(values)
+            .returning()
+            .all()
+
+          if (!created) {
+            throw new TRPCError({
+              code: 'INTERNAL_SERVER_ERROR',
+              message: 'Failed to create cover button action - no record returned',
+            })
+          }
+
+          return created
+        })
+
+        return { ...result, button: input.button }
+      }
+      catch (error) {
+        if (error instanceof TRPCError) throw error
+
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: `Failed to set cover button action: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          cause: error,
+        })
+      }
+    }),
+
+  /**
    * Delete tap gesture
    */
   deleteGesture: publicProcedure
@@ -732,6 +967,7 @@ export const settingsRouter = router({
       z
         .object({
           side: sideSchema,
+          button: gestureButtonSchema.optional().default('surface'),
           tapType: tapTypeSchema,
         })
         .strict()
@@ -745,6 +981,7 @@ export const settingsRouter = router({
             .where(
               and(
                 eq(tapGestures.side, input.side),
+                eq(tapGestures.button, input.button),
                 eq(tapGestures.tapType, input.tapType)
               )
             )
@@ -754,7 +991,7 @@ export const settingsRouter = router({
           if (!deleted) {
             throw new TRPCError({
               code: 'NOT_FOUND',
-              message: `Gesture for ${input.side} ${input.tapType} not found`,
+              message: `Gesture for ${input.side} ${input.button} ${input.tapType} not found`,
             })
           }
         })

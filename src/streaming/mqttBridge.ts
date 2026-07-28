@@ -17,13 +17,20 @@
  *   <prefix>/<device-id>/availability                — LWT (online | offline)
  *   <prefix>/<device-id>/state/device-status         — full deviceStatus mirror
  *   <prefix>/<device-id>/state/<side>/climate        — per-side temperature/mode
+ *   <prefix>/<device-id>/state/<side>/target-level   — per-side normalized -10..10 target level
+ *   <prefix>/<device-id>/state/<side>/alarm          — idle | ringing | snoozed + occurrence metadata
+ *   <prefix>/<device-id>/state/schedules             — retained alarm schedule mirror
  *   <prefix>/<device-id>/state/water-level           — low | ok | unknown
  *   <prefix>/<device-id>/state/biometrics/<side>     — latest HR/HRV/BR summary
  *   <prefix>/<device-id>/state/environment/ambient   — ambient temp (°C) + humidity (%)
  *   <prefix>/<device-id>/cmd/set-temperature         — JSON {side, temperature, duration?}
+ *   <prefix>/<device-id>/cmd/set-target-level        — JSON {side, level, duration?}
  *   <prefix>/<device-id>/cmd/set-power               — JSON {side, powered, temperature?}
  *   <prefix>/<device-id>/cmd/set-alarm               — JSON {side, vibrationIntensity, vibrationPattern, duration}
  *   <prefix>/<device-id>/cmd/clear-alarm             — JSON {side}
+ *   <prefix>/<device-id>/cmd/snooze-alarm            — JSON {side, duration}
+ *   <prefix>/<device-id>/cmd/stop-alarm              — JSON {side}
+ *   <prefix>/<device-id>/cmd/set-schedules           — JSON {left?: {day: {alarms: []}}, right?: ...}
  *   <prefix>/<device-id>/cmd/start-priming           — JSON {} (or empty payload)
  *
  * Commands route through the existing tRPC procedures via createCaller, so the
@@ -38,10 +45,13 @@ import os from 'node:os'
 import mqtt, { type IClientOptions, type IClientPublishOptions, type MqttClient } from 'mqtt'
 import { eq, desc } from 'drizzle-orm'
 import { db, biometricsDb } from '@/src/db'
-import { deviceSettings, deviceState } from '@/src/db/schema'
+import { alarmSchedules, deviceSettings, deviceState, powerSchedules, temperatureSchedules } from '@/src/db/schema'
 import { bedTemp, flowReadings, vitals } from '@/src/db/biometrics-schema'
 import { getPumpStallNotice } from '@/src/hardware/pumpStallNotification'
 import { centiDegreesToC, centiPercentToPercent } from '@/src/lib/tempUtils'
+import { fahrenheitToLevel, levelToFahrenheit, type Side } from '@/src/hardware/types'
+import { triggerHapticConfirm } from '@/src/hardware/sensorHaptics'
+import { getAlarmStatus } from '@/src/hardware/snoozeManager'
 import { onServerFrame } from './piezoStream'
 import { getDacMonitorIfRunning } from '@/src/hardware/dacMonitor.instance'
 
@@ -54,6 +64,28 @@ const STATE_PUBLISH_INTERVAL_MS = 30_000
 const RECONNECT_PERIOD_MS = 5_000
 const CONNECT_TIMEOUT_MS = 10_000
 const TEST_CONNECT_TIMEOUT_MS = 5_000
+const USER_TARGET_LEVEL_MIN = -10
+const USER_TARGET_LEVEL_MAX = 10
+const SIDES = ['left', 'right'] as const
+const SCHEDULE_DAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as const
+type ScheduleSide = typeof SIDES[number]
+type AlarmScheduleRow = typeof alarmSchedules.$inferSelect
+type PowerScheduleRow = typeof powerSchedules.$inferSelect
+type TemperatureScheduleRow = typeof temperatureSchedules.$inferSelect
+interface ScheduleRows {
+  alarm: AlarmScheduleRow[]
+  power: PowerScheduleRow[]
+  temperature: TemperatureScheduleRow[]
+}
+type ScheduleCommandKind = keyof ScheduleRows
+interface ScheduleCommandCreates {
+  creates: {
+    alarm: Array<typeof alarmSchedules.$inferInsert>
+    power: Array<typeof powerSchedules.$inferInsert>
+    temperature: Array<typeof temperatureSchedules.$inferInsert>
+  }
+  touched: Record<ScheduleCommandKind, boolean>
+}
 
 export type ConfigSource = 'db' | 'env' | 'default'
 
@@ -234,6 +266,338 @@ function safePublish(t: string, payload: string | Buffer, opts: IClientPublishOp
   }
 }
 
+function clampUserTargetLevel(level: number): number {
+  return Math.max(USER_TARGET_LEVEL_MIN, Math.min(USER_TARGET_LEVEL_MAX, level))
+}
+
+function targetTemperatureToUserLevel(targetTemperature: number | null | undefined, isPowered: boolean): number {
+  if (!isPowered || targetTemperature == null) return 0
+  return clampUserTargetLevel(Math.round(fahrenheitToLevel(targetTemperature) / 10))
+}
+
+function userLevelToTargetTemperature(level: number): number {
+  return levelToFahrenheit(clampUserTargetLevel(level) * 10)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function intInRange(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.max(min, Math.min(max, Math.round(parsed)))
+}
+
+function scheduleTemperatureF(value: unknown, fallback: number): number {
+  const parsed = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  if (parsed >= USER_TARGET_LEVEL_MIN && parsed <= USER_TARGET_LEVEL_MAX) {
+    return userLevelToTargetTemperature(parsed)
+  }
+  return intInRange(parsed, fallback, MIN_SCHEDULE_TEMPERATURE_F, MAX_SCHEDULE_TEMPERATURE_F)
+}
+
+function timeString(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const match = value.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/)
+  if (!match) return null
+  const hour = Number(match[1])
+  const minute = Number(match[2])
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+}
+
+function timeToMinutes(time: string): number {
+  const [hour, minute] = time.split(':').map(Number)
+  return hour * 60 + minute
+}
+
+function minutesToTime(minutes: number): string {
+  const normalized = ((minutes % 1440) + 1440) % 1440
+  const hour = Math.floor(normalized / 60)
+  const minute = normalized % 60
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+}
+
+function defaultAsleepTime(powerOn: string): string {
+  return minutesToTime(timeToMinutes(powerOn) + 210)
+}
+
+function defaultDawnTime(powerOff: string): string {
+  return minutesToTime(timeToMinutes(powerOff) - 240)
+}
+
+function mqttAlarmFromRow(row: AlarmScheduleRow) {
+  return {
+    alarmTemperature: row.alarmTemperature,
+    duration: row.duration,
+    enabled: row.enabled,
+    time: row.time,
+    vibrationIntensity: row.vibrationIntensity,
+    vibrationPattern: row.vibrationPattern,
+  }
+}
+
+function mqttPowerFromRow(row: PowerScheduleRow | undefined) {
+  return row
+    ? {
+        enabled: row.enabled,
+        off: row.offTime,
+        on: row.onTime,
+        onTemperature: row.onTemperature,
+      }
+    : {
+        enabled: false,
+        off: '09:00',
+        on: '21:30',
+        onTemperature: DEFAULT_SCHEDULE_TEMPERATURE_F,
+      }
+}
+
+function mqttTemperaturesFromRows(rows: TemperatureScheduleRow[]) {
+  return Object.fromEntries(
+    [...rows]
+      .sort((a, b) => a.time.localeCompare(b.time) || a.id - b.id)
+      .map(row => [row.time, row.temperature]),
+  )
+}
+
+function buildSchedulesPayload(rows: ScheduleRows, ts = Date.now()) {
+  const payload: Record<string, unknown> = { state: 'ready', ts }
+  for (const side of SIDES) {
+    payload[side] = Object.fromEntries(SCHEDULE_DAYS.map(day => [
+      day,
+      {
+        power: mqttPowerFromRow(rows.power.find(row => row.side === side && row.dayOfWeek === day)),
+        temperatures: mqttTemperaturesFromRows(rows.temperature.filter(row => row.side === side && row.dayOfWeek === day)),
+        alarms: rows.alarm
+          .filter(row => row.side === side && row.dayOfWeek === day)
+          .sort((a, b) => a.time.localeCompare(b.time) || a.id - b.id)
+          .map(mqttAlarmFromRow),
+      },
+    ]))
+  }
+  return payload
+}
+
+const MIN_SCHEDULE_TEMPERATURE_F = 55
+const MAX_SCHEDULE_TEMPERATURE_F = 110
+const DEFAULT_SCHEDULE_TEMPERATURE_F = 82
+const DEFAULT_POWER_ON_TIME = '21:30'
+const DEFAULT_POWER_OFF_TIME = '09:00'
+
+function normalizeScheduleCommandAlarm(value: unknown, context: string) {
+  if (!isRecord(value)) {
+    console.warn(`[mqtt] skipping invalid ${context} alarm: not an object`)
+    return null
+  }
+  const time = timeString(value.time)
+  if (!time) {
+    console.warn(`[mqtt] skipping invalid ${context} alarm: invalid time`)
+    return null
+  }
+  return {
+    time,
+    vibrationIntensity: intInRange(value.vibrationIntensity, 100, 1, 100),
+    vibrationPattern: value.vibrationPattern === 'double' ? 'double' as const : 'rise' as const,
+    duration: intInRange(value.duration, 30, 0, 180),
+    alarmTemperature: intInRange(value.alarmTemperature, 82, 55, 110),
+    enabled: value.enabled !== false,
+  }
+}
+
+function firstPresent(record: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    if (record[key] !== undefined && record[key] !== null && record[key] !== '') return record[key]
+  }
+  return undefined
+}
+
+function hasAny(record: Record<string, unknown>, keys: string[]): boolean {
+  return keys.some(key => record[key] !== undefined && record[key] !== null)
+}
+
+function normalizeScheduleCommandPower(value: unknown, dayPayload: Record<string, unknown>, context: string) {
+  const power = isRecord(value) ? value : {}
+  const on = timeString(firstPresent(power, ['on', 'onTime', 'start', 'startTime']))
+    ?? timeString(firstPresent(dayPayload, ['on', 'onTime', 'powerOn', 'bedtime', 'bedtimeTime']))
+    ?? DEFAULT_POWER_ON_TIME
+  const off = timeString(firstPresent(power, ['off', 'offTime', 'end', 'endTime']))
+    ?? timeString(firstPresent(dayPayload, ['off', 'offTime', 'powerOff', 'wake', 'wakeTime']))
+    ?? DEFAULT_POWER_OFF_TIME
+  if (on === off) {
+    console.warn(`[mqtt] skipping invalid ${context} power schedule: on/off times are equal`)
+    return null
+  }
+
+  const temperatureValue = firstPresent(power, ['onTemperature', 'onTemperatureF', 'temperature', 'temperatureF', 'level'])
+    ?? firstPresent(dayPayload, ['onTemperature', 'onTemperatureF', 'bedtimeTemperature', 'bedtimeTemperatureF', 'bedtimeLevel'])
+
+  return {
+    enabled: value === undefined && dayPayload.enabled === false ? false : power.enabled !== false,
+    offTime: off,
+    onTemperature: scheduleTemperatureF(temperatureValue, DEFAULT_SCHEDULE_TEMPERATURE_F),
+    onTime: on,
+  }
+}
+
+function temperatureFromScheduleValue(value: unknown, fallback: number): { enabled: boolean, temperature: number } | null {
+  if (isRecord(value)) {
+    const temperatureValue = firstPresent(value, ['temperature', 'temperatureF', 'level', 'value'])
+    return {
+      enabled: value.enabled !== false,
+      temperature: scheduleTemperatureF(temperatureValue, fallback),
+    }
+  }
+  if (value === undefined || value === null || value === '') return null
+  return {
+    enabled: true,
+    temperature: scheduleTemperatureF(value, fallback),
+  }
+}
+
+function addTemperatureCreate(
+  creates: ScheduleCommandCreates['creates']['temperature'],
+  side: ScheduleSide,
+  day: (typeof SCHEDULE_DAYS)[number],
+  time: string | null,
+  value: unknown,
+  fallback: number,
+) {
+  if (!time) return
+  const normalized = temperatureFromScheduleValue(value, fallback)
+  if (!normalized) return
+  const existingIndex = creates.findIndex(row => row.side === side && row.dayOfWeek === day && row.time === time)
+  const row = {
+    dayOfWeek: day,
+    enabled: normalized.enabled,
+    side,
+    temperature: normalized.temperature,
+    time,
+  }
+  if (existingIndex >= 0) creates[existingIndex] = row
+  else creates.push(row)
+}
+
+function scheduleCommandTemperatureCreates(
+  dayPayload: Record<string, unknown>,
+  power: ReturnType<typeof normalizeScheduleCommandPower>,
+  side: ScheduleSide,
+  day: (typeof SCHEDULE_DAYS)[number],
+) {
+  const creates: ScheduleCommandCreates['creates']['temperature'] = []
+  const powerOn = power?.onTime ?? DEFAULT_POWER_ON_TIME
+  const powerOff = power?.offTime ?? DEFAULT_POWER_OFF_TIME
+  const asleepTime = timeString(firstPresent(dayPayload, ['asleepTime', 'initialSleepTime'])) ?? defaultAsleepTime(powerOn)
+  const dawnTime = timeString(firstPresent(dayPayload, ['dawnTime', 'finalSleepTime'])) ?? defaultDawnTime(powerOff)
+
+  const temperatures = dayPayload.temperatures
+  if (isRecord(temperatures)) {
+    for (const [time, value] of Object.entries(temperatures)) {
+      addTemperatureCreate(creates, side, day, timeString(time), value, DEFAULT_SCHEDULE_TEMPERATURE_F)
+    }
+  }
+
+  const temperatureList = Array.isArray(dayPayload.temperatureSchedules)
+    ? dayPayload.temperatureSchedules
+    : Array.isArray(dayPayload.temperature)
+      ? dayPayload.temperature
+      : []
+  for (const [index, value] of temperatureList.entries()) {
+    if (!isRecord(value)) {
+      console.warn(`[mqtt] skipping invalid ${side}.${day}.temperature[${index}]: not an object`)
+      continue
+    }
+    addTemperatureCreate(
+      creates,
+      side,
+      day,
+      timeString(firstPresent(value, ['time', 'at'])),
+      value,
+      DEFAULT_SCHEDULE_TEMPERATURE_F,
+    )
+  }
+
+  addTemperatureCreate(
+    creates,
+    side,
+    day,
+    asleepTime,
+    firstPresent(dayPayload, ['asleepTemperature', 'asleepTemperatureF', 'asleepLevel']),
+    DEFAULT_SCHEDULE_TEMPERATURE_F,
+  )
+  addTemperatureCreate(
+    creates,
+    side,
+    day,
+    dawnTime,
+    firstPresent(dayPayload, ['dawnTemperature', 'dawnTemperatureF', 'dawnLevel']),
+    DEFAULT_SCHEDULE_TEMPERATURE_F,
+  )
+
+  return creates
+}
+
+function scheduleCommandCreates(payload: CommandPayload, side: ScheduleSide): ScheduleCommandCreates {
+  const sidePayload = payload[side]
+  const result: ScheduleCommandCreates = {
+    creates: { alarm: [], power: [], temperature: [] },
+    touched: { alarm: false, power: false, temperature: false },
+  }
+  if (!isRecord(sidePayload)) return result
+
+  for (const day of SCHEDULE_DAYS) {
+    const dayPayload = sidePayload[day]
+    if (!isRecord(dayPayload)) continue
+
+    const powerTouched = isRecord(dayPayload.power) || hasAny(dayPayload, [
+      'on',
+      'onTime',
+      'off',
+      'offTime',
+      'powerOn',
+      'powerOff',
+      'bedtime',
+      'bedtimeTime',
+      'bedtimeLevel',
+      'bedtimeTemperature',
+      'bedtimeTemperatureF',
+      'onTemperature',
+      'onTemperatureF',
+    ])
+    const normalizedPower = powerTouched
+      ? normalizeScheduleCommandPower(dayPayload.power, dayPayload, `${side}.${day}`)
+      : null
+    if (normalizedPower) {
+      result.touched.power = true
+      result.creates.power.push({ side, dayOfWeek: day, ...normalizedPower })
+    }
+
+    const temperatureTouched = isRecord(dayPayload.temperatures)
+      || Array.isArray(dayPayload.temperatureSchedules)
+      || Array.isArray(dayPayload.temperature)
+      || hasAny(dayPayload, ['asleepTemperature', 'asleepTemperatureF', 'asleepLevel', 'dawnTemperature', 'dawnTemperatureF', 'dawnLevel'])
+    if (temperatureTouched) {
+      result.touched.temperature = true
+      result.creates.temperature.push(...scheduleCommandTemperatureCreates(dayPayload, normalizedPower, side, day))
+    }
+
+    const alarmValues = Array.isArray(dayPayload.alarms)
+      ? dayPayload.alarms
+      : isRecord(dayPayload.alarm)
+        ? [dayPayload.alarm]
+        : []
+    if (Array.isArray(dayPayload.alarms) || isRecord(dayPayload.alarm)) result.touched.alarm = true
+    for (const [index, alarm] of alarmValues.entries()) {
+      const normalized = normalizeScheduleCommandAlarm(alarm, `${side}.${day}[${index}]`)
+      if (normalized) result.creates.alarm.push({ side, dayOfWeek: day, ...normalized })
+    }
+  }
+
+  return result
+}
+
 // ---------------------------------------------------------------------------
 // HA discovery
 // ---------------------------------------------------------------------------
@@ -303,6 +667,69 @@ function publishHaDiscovery(): void {
     return cfg
   }
 
+  const schedulesTopic = topic('state', 'schedules')
+  const schedulesSensor = {
+    name: 'Schedules',
+    unique_id: `${id}_schedules`,
+    availability_topic: availability,
+    payload_available: 'online',
+    payload_not_available: 'offline',
+    state_topic: schedulesTopic,
+    value_template: '{{ value_json.state }}',
+    json_attributes_topic: schedulesTopic,
+    icon: 'mdi:calendar-clock',
+    device: dev,
+  }
+
+  const targetLevelNumber = (side: 'left' | 'right') => ({
+    name: `${side === 'left' ? 'Left' : 'Right'} target level`,
+    unique_id: `${id}_${side}_target_level`,
+    availability_topic: availability,
+    payload_available: 'online',
+    payload_not_available: 'offline',
+    state_topic: topic('state', side, 'target-level'),
+    value_template: '{{ value_json.level }}',
+    json_attributes_topic: topic('state', side, 'target-level'),
+    command_topic: topic('cmd', 'set-target-level'),
+    command_template: `{ "side": "${side}", "level": {{ value | float }} }`,
+    min: USER_TARGET_LEVEL_MIN,
+    max: USER_TARGET_LEVEL_MAX,
+    step: 1,
+    mode: 'slider',
+    icon: 'mdi:thermometer-lines',
+    device: dev,
+  })
+
+  const alarmStateSensor = (side: ScheduleSide) => ({
+    name: `${side === 'left' ? 'Left' : 'Right'} alarm state`,
+    unique_id: `${id}_${side}_alarm_state`,
+    availability_topic: availability,
+    payload_available: 'online',
+    payload_not_available: 'offline',
+    state_topic: topic('state', side, 'alarm'),
+    value_template: '{{ value_json.state }}',
+    json_attributes_topic: topic('state', side, 'alarm'),
+    device_class: 'enum',
+    options: ['idle', 'ringing', 'snoozed'],
+    icon: 'mdi:alarm',
+    device: dev,
+  })
+
+  const alarmButton = (side: ScheduleSide, action: 'snooze' | 'stop') => ({
+    name: `${side === 'left' ? 'Left' : 'Right'} alarm ${action}`,
+    unique_id: `${id}_${side}_alarm_${action}`,
+    availability_topic: availability,
+    payload_available: 'online',
+    payload_not_available: 'offline',
+    command_topic: topic('cmd', `${action}-alarm`),
+    payload_press: JSON.stringify({
+      side,
+      ...(action === 'snooze' && { duration: 5 * 60 }),
+    }),
+    icon: action === 'snooze' ? 'mdi:alarm-snooze' : 'mdi:alarm-off',
+    device: dev,
+  })
+
   safePublish(
     `${haPrefix}/climate/${id}/left/config`,
     JSON.stringify(climate('left')),
@@ -318,6 +745,34 @@ function publishHaDiscovery(): void {
     JSON.stringify(sensor('water_level', 'Water level', topic('state', 'water-level'), '{{ value_json.level }}')),
     RETAINED_QOS_0,
   )
+  safePublish(
+    `${haPrefix}/sensor/${id}/schedules/config`,
+    JSON.stringify(schedulesSensor),
+    RETAINED_QOS_0,
+  )
+
+  for (const side of SIDES) {
+    safePublish(
+      `${haPrefix}/number/${id}/${side}_target_level/config`,
+      JSON.stringify(targetLevelNumber(side)),
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      `${haPrefix}/sensor/${id}/${side}_alarm_state/config`,
+      JSON.stringify(alarmStateSensor(side)),
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      `${haPrefix}/button/${id}/${side}_alarm_snooze/config`,
+      JSON.stringify(alarmButton(side, 'snooze')),
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      `${haPrefix}/button/${id}/${side}_alarm_stop/config`,
+      JSON.stringify(alarmButton(side, 'stop')),
+      RETAINED_QOS_0,
+    )
+  }
 
   // Ambient temperature + humidity from bed_temp. Two HA sensor entities
   // sharing one state topic so a single retained payload feeds both.
@@ -351,7 +806,7 @@ function publishHaDiscovery(): void {
   // Pump topics — one set per side. RPM + loop temp as measurement sensors;
   // stall / clog as binary sensors with the `problem` device_class so HA
   // renders them as red alert tiles.
-  for (const side of ['left', 'right'] as const) {
+  for (const side of SIDES) {
     const rpmTopic = topic('pump', side, 'rpm')
     const loopTopic = topic('pump', side, 'loop_temp_c')
     const stallTopic = topic('pump', side, 'stall')
@@ -416,7 +871,7 @@ function publishHaDiscovery(): void {
     )
   }
 
-  for (const side of ['left', 'right'] as const) {
+  for (const side of SIDES) {
     safePublish(
       `${haPrefix}/sensor/${id}/${side}_heart_rate/config`,
       JSON.stringify(sensor(`${side}_heart_rate`, `${side === 'left' ? 'Left' : 'Right'} heart rate`,
@@ -438,9 +893,121 @@ function publishHaDiscovery(): void {
   }
 }
 
+function clearRemovedGestureMqttExposure(): void {
+  const id = deviceId()
+  const haPrefix = process.env.MQTT_HA_DISCOVERY_PREFIX || 'homeassistant'
+  const empty = Buffer.alloc(0)
+
+  safePublish(`${haPrefix}/sensor/${id}/gesture_settings/config`, empty, RETAINED_QOS_0)
+  safePublish(topic('state', 'button-gestures'), empty, RETAINED_QOS_0)
+}
+
 // ---------------------------------------------------------------------------
 // State publication
 // ---------------------------------------------------------------------------
+
+async function publishSchedulesState(): Promise<void> {
+  try {
+    const [alarmRows, powerRows, temperatureRows] = await Promise.all([
+      db.select().from(alarmSchedules).all(),
+      db.select().from(powerSchedules).all(),
+      db.select().from(temperatureSchedules).all(),
+    ])
+    safePublish(
+      topic('state', 'schedules'),
+      JSON.stringify(buildSchedulesPayload({ alarm: alarmRows, power: powerRows, temperature: temperatureRows })),
+      RETAINED_QOS_0,
+    )
+  }
+  catch (err) {
+    console.warn('[mqtt] schedule publish failed:', err instanceof Error ? err.message : err)
+  }
+}
+
+export function publishAlarmState(side: ScheduleSide): void {
+  const status = getAlarmStatus(side)
+  safePublish(topic('state', side, 'alarm'), JSON.stringify({
+    ts: Date.now(),
+    state: status.state,
+    occurrence_id: status.occurrenceId,
+    schedule_id: status.scheduleId,
+    scheduled_for: status.scheduledFor,
+    snoozed_until: status.snoozeUntil,
+    ringing_until: status.ringingUntil,
+    vibration_intensity: status.vibrationIntensity,
+    vibration_pattern: status.vibrationPattern,
+    duration: status.duration,
+  }), RETAINED_QOS_0)
+}
+
+interface SideMqttState {
+  ts: number
+  currentTemperature: number | null
+  targetTemperature: number | null
+  isPowered: boolean
+  isAlarmVibrating: boolean
+  waterLevel: 'low' | 'ok' | 'unknown' | null | undefined
+}
+
+function publishSideMqttState(side: ScheduleSide, statePayload: SideMqttState): void {
+  const mode = statePayload.isPowered ? 'heat' : 'off'
+  safePublish(topic('state', side, 'climate'), JSON.stringify({
+    ts: statePayload.ts,
+    currentTemperature: statePayload.currentTemperature,
+    targetTemperature: statePayload.targetTemperature,
+    isPowered: statePayload.isPowered,
+    isAlarmVibrating: statePayload.isAlarmVibrating,
+    mode,
+    waterLevel: statePayload.waterLevel ?? 'unknown',
+  }), RETAINED_QOS_0)
+  safePublish(topic('state', side, 'target-level'), JSON.stringify({
+    ts: statePayload.ts,
+    level: targetTemperatureToUserLevel(statePayload.targetTemperature, statePayload.isPowered),
+    targetTemperature: statePayload.targetTemperature,
+    isPowered: statePayload.isPowered,
+  }), RETAINED_QOS_0)
+}
+
+function numberOrNull(value: unknown): number | null {
+  if (value == null) return null
+  const parsed = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function publishSideMqttStateFromFrame(frame: Record<string, unknown>, side: ScheduleSide): void {
+  const sideStatus = frame[side === 'left' ? 'leftSide' : 'rightSide']
+  if (!isRecord(sideStatus)) return
+
+  const hasClimateSignal = 'currentTemperature' in sideStatus
+    || 'targetTemperature' in sideStatus
+    || 'targetLevel' in sideStatus
+    || 'isAlarmVibrating' in sideStatus
+  if (!hasClimateSignal) return
+
+  const targetLevel = numberOrNull(sideStatus.targetLevel)
+  const frameTargetTemperature = numberOrNull(sideStatus.targetTemperature)
+  const targetTemperature = frameTargetTemperature ?? (targetLevel != null && targetLevel !== 0
+    ? levelToFahrenheit(targetLevel)
+    : null)
+  const explicitPowered = typeof sideStatus.isPowered === 'boolean'
+    ? sideStatus.isPowered
+    : typeof sideStatus.isOn === 'boolean'
+      ? sideStatus.isOn
+      : undefined
+  const isPowered = explicitPowered ?? targetTemperature != null
+  const waterLevel = frame.waterLevel === 'low' || frame.waterLevel === 'ok'
+    ? frame.waterLevel
+    : 'unknown'
+
+  publishSideMqttState(side, {
+    ts: typeof frame.ts === 'number' ? frame.ts : Date.now(),
+    currentTemperature: numberOrNull(sideStatus.currentTemperature),
+    targetTemperature,
+    isPowered,
+    isAlarmVibrating: sideStatus.isAlarmVibrating === true,
+    waterLevel,
+  })
+}
 
 async function publishState(): Promise<void> {
   if (!state.client?.connected) return
@@ -467,23 +1034,25 @@ async function publishState(): Promise<void> {
   try {
     const sides = await db.select().from(deviceState)
     for (const row of sides) {
-      const mode = row.isPowered ? 'heat' : 'off'
-      safePublish(topic('state', row.side, 'climate'), JSON.stringify({
+      publishSideMqttState(row.side, {
         ts: row.lastUpdated.getTime(),
         currentTemperature: row.currentTemperature,
         targetTemperature: row.targetTemperature,
         isPowered: row.isPowered,
         isAlarmVibrating: row.isAlarmVibrating,
-        mode,
         waterLevel: row.waterLevel,
-      }), RETAINED_QOS_0)
+      })
     }
   }
   catch (err) {
     console.warn('[mqtt] device_state publish failed:', err instanceof Error ? err.message : err)
   }
 
-  for (const side of ['left', 'right'] as const) {
+  for (const side of SIDES) publishAlarmState(side)
+
+  await publishSchedulesState()
+
+  for (const side of SIDES) {
     try {
       const [latest] = await biometricsDb
         .select()
@@ -559,7 +1128,7 @@ async function publishState(): Promise<void> {
 
   // Stall + clog state per side. Clog stays 'off' until the nightly job
   // lands — that work is out of scope for this PR.
-  for (const side of ['left', 'right'] as const) {
+  for (const side of SIDES) {
     safePublish(
       topic('pump', side, 'stall'),
       getPumpStallNotice(side) ? 'on' : 'off',
@@ -594,10 +1163,13 @@ async function getCaller(): Promise<AppCaller> {
 interface CommandPayload {
   side?: unknown
   temperature?: unknown
+  level?: unknown
   duration?: unknown
   powered?: unknown
   vibrationIntensity?: unknown
   vibrationPattern?: unknown
+  left?: unknown
+  right?: unknown
 }
 
 function parsePayload(buf: Buffer): CommandPayload {
@@ -612,6 +1184,23 @@ function parsePayload(buf: Buffer): CommandPayload {
   }
 }
 
+function sideFromPayload(payload: CommandPayload): Side | null {
+  return payload.side === 'left' || payload.side === 'right' ? payload.side : null
+}
+
+async function triggerAcceptedTemperatureHaptic(payload: CommandPayload): Promise<void> {
+  const side = sideFromPayload(payload)
+  if (!side) return
+
+  try {
+    await triggerHapticConfirm(side)
+    console.log(`[mqtt] accepted temperature haptic sent for ${side}`)
+  }
+  catch (err) {
+    console.error('[mqtt] accepted temperature haptic failed:', err instanceof Error ? err.message : err)
+  }
+}
+
 async function handleCommand(verb: string, payload: CommandPayload): Promise<void> {
   // Each branch hands the payload straight to the tRPC procedure — its Zod
   // schema rejects malformed input. No client-side validation duplicated here.
@@ -619,6 +1208,15 @@ async function handleCommand(verb: string, payload: CommandPayload): Promise<voi
   switch (verb) {
     case 'set-temperature':
       await caller.device.setTemperature(payload as never)
+      await triggerAcceptedTemperatureHaptic(payload)
+      return
+    case 'set-target-level':
+      await caller.device.setTemperature({
+        side: payload.side,
+        duration: payload.duration,
+        temperature: userLevelToTargetTemperature(Number(payload.level)),
+      } as never)
+      await triggerAcceptedTemperatureHaptic(payload)
       return
     case 'set-power':
       await caller.device.setPower(payload as never)
@@ -629,11 +1227,52 @@ async function handleCommand(verb: string, payload: CommandPayload): Promise<voi
     case 'clear-alarm':
       await caller.device.clearAlarm(payload as never)
       return
+    case 'snooze-alarm':
+      await caller.device.snoozeAlarm(payload as never)
+      return
+    case 'stop-alarm':
+      await caller.device.clearAlarm(payload as never)
+      return
+    case 'set-schedules':
+      await replaceSchedules(payload, caller)
+      await publishSchedulesState()
+      return
     case 'start-priming':
       await caller.device.startPriming({})
       return
     default:
       console.warn(`[mqtt] unknown command verb: ${verb}`)
+  }
+}
+
+async function replaceSchedules(payload: CommandPayload, caller: AppCaller): Promise<void> {
+  for (const side of SIDES) {
+    if (!isRecord(payload[side])) continue
+    const { creates, touched } = scheduleCommandCreates(payload, side)
+    if (!touched.alarm && !touched.power && !touched.temperature) continue
+
+    const deletes: {
+      alarm?: number[]
+      power?: number[]
+      temperature?: number[]
+    } = {}
+    if (touched.alarm) {
+      const existingRows = await db.select().from(alarmSchedules).where(eq(alarmSchedules.side, side)).all()
+      deletes.alarm = existingRows.map(row => row.id)
+    }
+    if (touched.power) {
+      const existingRows = await db.select().from(powerSchedules).where(eq(powerSchedules.side, side)).all()
+      deletes.power = existingRows.map(row => row.id)
+    }
+    if (touched.temperature) {
+      const existingRows = await db.select().from(temperatureSchedules).where(eq(temperatureSchedules.side, side)).all()
+      deletes.temperature = existingRows.map(row => row.id)
+    }
+
+    await caller.schedules.batchUpdate({
+      deletes,
+      creates,
+    } as never)
   }
 }
 
@@ -749,6 +1388,7 @@ export async function startMqttBridge(): Promise<void> {
     console.log(`[mqtt] connected to ${config.url} (deviceId=${id}, prefix=${config.topicPrefix})`)
     safePublish(availabilityTopic, 'online', RETAINED_QOS_0)
     publishHaDiscovery()
+    clearRemovedGestureMqttExposure()
     client.subscribe(topic('cmd', '+'), { qos: 0 }, (err: Error | null) => {
       if (err) console.warn('[mqtt] subscribe cmd/* failed:', err.message)
     })
@@ -789,6 +1429,10 @@ export async function startMqttBridge(): Promise<void> {
     if (frame.type !== 'deviceStatus') return
     if (!state.client?.connected) return
     safePublish(topic('state', 'device-status'), JSON.stringify(frame), RETAINED_QOS_0)
+    if (isRecord(frame)) {
+      publishSideMqttStateFromFrame(frame, 'left')
+      publishSideMqttStateFromFrame(frame, 'right')
+    }
   })
 }
 

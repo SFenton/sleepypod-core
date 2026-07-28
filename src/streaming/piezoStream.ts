@@ -37,6 +37,8 @@ import { WebSocketServer, WebSocket } from 'ws'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { Decoder } from 'cbor-x'
+import { recordCapFrame, resetCapFrameWindows } from './capFramePersistence'
+import { capSideChannels } from './normalizeFrame'
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -45,6 +47,7 @@ const WS_PORT = Number(process.env.PIEZO_WS_PORT ?? 3001)
 const RAW_DATA_DIR = process.env.RAW_DATA_DIR ?? '/persistent'
 const FILE_POLL_INTERVAL_MS = 10 // match Python's 10 ms poll for new data
 const SEEK_MAX_DURATION_S = 30 // max seconds of data to replay on seek
+const MAX_LIVE_READ_BYTES_PER_TICK = 1024 * 1024
 // Keep frame-index entries within the seek window plus a small margin so the
 // index stays bounded on long-running streams (24h at 50fps was ~70MB).
 const FRAME_INDEX_RETENTION_S = SEEK_MAX_DURATION_S + 10
@@ -287,7 +290,7 @@ function findLatestRaw(dir: string): string | null {
 const ALL_SENSOR_TYPES = [
   'piezo-dual', 'capSense', 'capSense2',
   'bedTemp', 'bedTemp2', 'frzTemp', 'frzTherm', 'frzHealth', 'log',
-  'deviceStatus', 'gesture',
+  'deviceStatus', 'gesture', 'buttonEvent',
 ] as const
 
 /** Valid sensor type string. Used for subscription filtering. */
@@ -636,6 +639,13 @@ export function startPiezoStreamServer(): WebSocketServer {
   let currentPath: string | null = null
   let fileBuffer = Buffer.alloc(0)
   let readOffset = 0 // offset into the actual file (not the buffer)
+  const rawFilesAtStartup = new Set<string>()
+  try {
+    for (const entry of fs.readdirSync(RAW_DATA_DIR)) {
+      if (entry.endsWith('.RAW')) rawFilesAtStartup.add(path.join(RAW_DATA_DIR, entry))
+    }
+  }
+  catch { /* RAW dir may not exist yet */ }
 
   wss.on('connection', (ws) => {
     console.log('[sensorStream] Client connected')
@@ -660,9 +670,12 @@ export function startPiezoStreamServer(): WebSocketServer {
     })
   })
 
-  // Periodic file-tailing loop: read new data from the RAW file and broadcast
+  // Periodic file-tailing loop: read new data from the RAW file and broadcast.
+  // Runs even with no clients connected — the cap-frame downsampler must keep
+  // persisting through unattended nights so the next morning can be replayed.
+  // Broadcasting is already per-client guarded, so an idle loop does no fan-out.
   streamingInterval = setInterval(() => {
-    if (!wss || wss.clients.size === 0) return
+    if (!wss) return
 
     // Find the latest RAW file
     const latest = findLatestRaw(RAW_DATA_DIR)
@@ -670,16 +683,27 @@ export function startPiezoStreamServer(): WebSocketServer {
 
     // Switch files if a newer one appeared
     if (latest !== currentPath) {
-      console.log(`[sensorStream] Switched to RAW file: ${path.basename(latest)}`)
+      const startOffset = (() => {
+        if (!rawFilesAtStartup.has(latest)) return 0
+        try {
+          return fs.statSync(latest).size
+        }
+        catch {
+          return 0
+        }
+      })()
+      console.log(`[sensorStream] Switched to RAW file: ${path.basename(latest)} (tailing from ${startOffset} bytes)`)
       currentPath = latest
       fileBuffer = Buffer.alloc(0)
-      readOffset = 0
+      readOffset = startOffset
       // Reset the sidecar frame index for the new file
       frameIndex.length = 0
       indexedFilePath = latest
       // Drop the cached capSense snapshot — old file's last frame doesn't
       // describe the current sensor state.
       latestCapSenseSnapshot = null
+      // Drop any in-flight downsample windows; the new file restarts the stream.
+      resetCapFrameWindows()
     }
 
     // Read any new bytes appended since last read
@@ -694,7 +718,16 @@ export function startPiezoStreamServer(): WebSocketServer {
         return // no new data
       }
 
-      const newBytes = Buffer.alloc(fileSize - readOffset)
+      let bytesToRead = fileSize - readOffset
+      if (bytesToRead > MAX_LIVE_READ_BYTES_PER_TICK) {
+        const skipped = bytesToRead - MAX_LIVE_READ_BYTES_PER_TICK
+        readOffset += skipped
+        fileBuffer = Buffer.alloc(0)
+        bytesToRead = MAX_LIVE_READ_BYTES_PER_TICK
+        console.warn('[sensorStream] Skipped %d stale RAW bytes to keep live tail bounded', skipped)
+      }
+
+      const newBytes = Buffer.alloc(bytesToRead)
       fs.readSync(fd, newBytes, 0, newBytes.length, readOffset)
       fs.closeSync(fd)
       fd = null
@@ -747,8 +780,8 @@ export function startPiezoStreamServer(): WebSocketServer {
               }
             }
 
-            // Notify server-side listeners (only frzHealth currently has consumers)
-            if (frameType === 'frzHealth' && serverFrameListeners.size > 0) {
+            // Notify server-side listeners for every decoded frame.
+            if (serverFrameListeners.size > 0) {
               for (const cb of serverFrameListeners) {
                 try {
                   cb(frame as Record<string, unknown>)
@@ -758,21 +791,24 @@ export function startPiezoStreamServer(): WebSocketServer {
             }
 
             // Update the live capSense snapshot for in-process readers (virtual
-            // occupancy sensor). Cheap O(1) copy of the small per-frame shape.
+            // occupancy sensor) and downsample into biometrics.db for replay.
+            // Firmware sends per-side channels as {values:[...]} on Pod 4/5 and
+            // {out,cen,in} on Pod 3 — unwrap to a flat array so both paths see
+            // real readings regardless of pod variant.
             if (frameType === 'capSense' || frameType === 'capSense2') {
-              const left = (frame as { left: unknown }).left
-              const right = (frame as { right: unknown }).right
               const ts = (frame as { ts: unknown }).ts
-              if (typeof ts === 'number'
-                && (typeof left === 'number' || Array.isArray(left))
-                && (typeof right === 'number' || Array.isArray(right))) {
+              const left = capSideChannels((frame as { left: unknown }).left)
+              const right = capSideChannels((frame as { right: unknown }).right)
+              if (typeof ts === 'number' && left && right) {
                 latestCapSenseSnapshot = {
                   type: frameType,
                   ts,
                   receivedAtMs: Date.now(),
-                  left: left as number | number[],
-                  right: right as number | number[],
+                  left,
+                  right,
                 }
+                recordCapFrame('left', left, ts)
+                recordCapFrame('right', right, ts)
               }
             }
           }
@@ -898,6 +934,12 @@ export async function shutdownPiezoStreamServer(): Promise<void> {
   const server = wss
   if (server) {
     wss = null
+    // `server.close()` only fires its callback once every client has
+    // disconnected; a still-open socket would hang shutdown forever. Drop
+    // them eagerly so close always completes.
+    for (const client of server.clients) {
+      client.terminate()
+    }
     return new Promise<void>((resolve) => {
       server.close(() => {
         // Drop per-client state explicitly — relying on per-socket close

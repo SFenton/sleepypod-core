@@ -65,6 +65,13 @@ export const deviceSettings = sqliteTable('device_settings', {
     .default(false),
   pumpStallRecoveryRpm: integer('pump_stall_recovery_rpm').notNull().default(1500),
   pumpStallRecoverySamples: integer('pump_stall_recovery_samples').notNull().default(3),
+  // Autopilot global kill-switch. When false, the AutomationEngine evaluates
+  // nothing and commands no hardware — per-rule enabled/dryRun state is
+  // preserved, so flipping this back on resumes every rule as it was. Persisted
+  // so the kill-switch survives reboot.
+  autopilotEnabled: integer('autopilot_enabled', { mode: 'boolean' })
+    .notNull()
+    .default(true),
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`),
@@ -93,21 +100,34 @@ export const sideSettings = sqliteTable('side_settings', {
 export const tapGestures = sqliteTable('tap_gestures', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   side: text('side', { enum: ['left', 'right'] }).notNull(),
+  button: text('button', { enum: ['surface', 'top', 'middle', 'bottom'] })
+    .notNull()
+    .default('surface'),
   tapType: text('tap_type', {
-    enum: ['doubleTap', 'tripleTap', 'quadTap'],
+    enum: ['singleTap', 'doubleTap', 'tripleTap', 'quadTap'],
   }).notNull(),
-  actionType: text('action_type', { enum: ['temperature', 'alarm'] }).notNull(),
+  actionType: text('action_type', { enum: ['temperature', 'alarm', 'power'] }).notNull(),
   // For temperature actions
   temperatureChange: text('temperature_change', {
     enum: ['increment', 'decrement'],
   }),
   temperatureAmount: integer('temperature_amount'), // 0-10
+  temperatureStepMode: text('temperature_step_mode', { enum: ['degree', 'level'] }),
   // For alarm actions
   alarmBehavior: text('alarm_behavior', { enum: ['snooze', 'dismiss'] }),
   alarmSnoozeDuration: integer('alarm_snooze_duration'), // 60-600 seconds
   alarmInactiveBehavior: text('alarm_inactive_behavior', {
     enum: ['power', 'none'],
   }),
+  // For power actions
+  powerBehavior: text('power_behavior', { enum: ['toggle', 'on', 'off'] }),
+  // Optional short haptic feedback after the action executes
+  feedbackVibrationEnabled: integer('feedback_vibration_enabled', { mode: 'boolean' })
+    .notNull()
+    .default(false),
+  feedbackVibrationIntensity: integer('feedback_vibration_intensity'), // 1-100
+  feedbackVibrationPattern: text('feedback_vibration_pattern', { enum: ['double', 'rise'] }),
+  feedbackVibrationDuration: integer('feedback_vibration_duration'), // 1-10 seconds
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`),
@@ -115,7 +135,43 @@ export const tapGestures = sqliteTable('tap_gestures', {
     .notNull()
     .default(sql`(unixepoch())`),
 }, t => [
-  uniqueIndex('uq_tap_side_type').on(t.side, t.tapType),
+  uniqueIndex('uq_tap_side_button_type').on(t.side, t.button, t.tapType),
+])
+
+export const coverButtonActions = sqliteTable('cover_button_actions', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  side: text('side', { enum: ['left', 'right'] }).notNull(),
+  button: text('button', { enum: ['top', 'middle', 'bottom'] }).notNull(),
+  actionType: text('action_type', { enum: ['temperature', 'alarm', 'power'] }).notNull(),
+  // For temperature actions
+  temperatureChange: text('temperature_change', {
+    enum: ['increment', 'decrement'],
+  }),
+  temperatureAmount: integer('temperature_amount'), // 0-10
+  temperatureStepMode: text('temperature_step_mode', { enum: ['degree', 'level'] }),
+  // For power actions
+  powerBehavior: text('power_behavior', { enum: ['toggle', 'on', 'off'] }),
+  // For alarm actions
+  alarmBehavior: text('alarm_behavior', { enum: ['snooze', 'dismiss'] }),
+  alarmSnoozeDuration: integer('alarm_snooze_duration'), // 60-600 seconds
+  alarmInactiveBehavior: text('alarm_inactive_behavior', {
+    enum: ['power', 'none'],
+  }),
+  // Optional short haptic feedback after the action executes
+  feedbackVibrationEnabled: integer('feedback_vibration_enabled', { mode: 'boolean' })
+    .notNull()
+    .default(false),
+  feedbackVibrationIntensity: integer('feedback_vibration_intensity'), // 1-100
+  feedbackVibrationPattern: text('feedback_vibration_pattern', { enum: ['double', 'rise'] }),
+  feedbackVibrationDuration: integer('feedback_vibration_duration'), // 1-10 seconds
+  createdAt: integer('created_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, t => [
+  uniqueIndex('uq_cover_button_side_button').on(t.side, t.button),
 ])
 
 // ============================================================================
@@ -221,6 +277,17 @@ export const deviceState = sqliteTable('device_state', {
   isAlarmVibrating: integer('is_alarm_vibrating', { mode: 'boolean' })
     .notNull()
     .default(false),
+  alarmState: text('alarm_state', { enum: ['idle', 'ringing', 'snoozed'] })
+    .notNull()
+    .default('idle'),
+  alarmOccurrenceId: text('alarm_occurrence_id'),
+  alarmScheduleId: integer('alarm_schedule_id'),
+  alarmScheduledFor: integer('alarm_scheduled_for', { mode: 'timestamp' }),
+  alarmSnoozedUntil: integer('alarm_snoozed_until', { mode: 'timestamp' }),
+  alarmRingingUntil: integer('alarm_ringing_until', { mode: 'timestamp' }),
+  alarmVibrationIntensity: integer('alarm_vibration_intensity'),
+  alarmVibrationPattern: text('alarm_vibration_pattern', { enum: ['double', 'rise'] }),
+  alarmDuration: integer('alarm_duration'),
   waterLevel: text('water_level', { enum: ['low', 'ok', 'unknown'] }).default(
     'unknown'
   ),
@@ -269,6 +336,51 @@ export const runOnceSessions = sqliteTable('run_once_sessions', {
     .default(sql`(unixepoch())`),
 }, t => [
   index('idx_run_once_side_status').on(t.side, t.status),
+])
+
+// ============================================================================
+// Autopilot — reactive automations (WHEN / IF / THEN rules engine)
+// ============================================================================
+
+export const automations = sqliteTable('automations', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull(),
+  enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
+  // null side = system/both; left/right scopes the rule to one side
+  side: text('side', { enum: ['left', 'right'] }),
+  priority: integer('priority').notNull().default(0),
+  // When true the rule never touches hardware — it logs would-fire events and
+  // emits notify actions only. The safe default for a freshly-built rule.
+  dryRun: integer('dry_run', { mode: 'boolean' }).notNull().default(true),
+  cooldownMin: integer('cooldown_min'),
+  // Rule "AST" as JSON, validated by the zod schemas in validation-schemas.ts.
+  trigger: text('trigger', { mode: 'json' }).notNull(),
+  conditions: text('conditions', { mode: 'json' }).notNull(), // AND/OR/NOT tree
+  actions: text('actions', { mode: 'json' }).notNull(), // expression-param actions
+  createdAt: integer('created_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, t => [
+  index('idx_automations_enabled').on(t.enabled),
+])
+
+export const automationRuns = sqliteTable('automation_runs', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  automationId: integer('automation_id')
+    .notNull()
+    .references(() => automations.id, { onDelete: 'cascade' }),
+  firedAt: integer('fired_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  outcome: text('outcome', {
+    enum: ['fired', 'skipped', 'clamped', 'dry_run', 'error'],
+  }).notNull(),
+  detail: text('detail', { mode: 'json' }), // evaluated values + action result
+}, t => [
+  index('idx_automation_runs_automation_fired').on(t.automationId, t.firedAt),
 ])
 
 // Indexes are now defined inline within each table definition above using index()

@@ -9,7 +9,7 @@ import { withHardwareClient } from '@/src/server/helpers'
 import { getPrimeCompletedAt, dismissPrimeNotification } from '@/src/hardware/primeNotification'
 import { getAllPumpStallNotices } from '@/src/hardware/pumpStallNotification'
 import { shouldBlock as pumpStallShouldBlock } from '@/src/hardware/pumpStallGuard'
-import { snoozeAlarm, cancelSnooze, getSnoozeStatus } from '@/src/hardware/snoozeManager'
+import { getSnoozeStatus, snoozeAlarm, startAlarm, stopAlarm } from '@/src/hardware/snoozeManager'
 import { broadcastMutationStatus } from '@/src/streaming/broadcastMutationStatus'
 import { HardwareCommand, fahrenheitToLevel } from '@/src/hardware/types'
 import { getSharedHardwareClient } from '@/src/hardware/sharedClient'
@@ -99,16 +99,16 @@ export const deviceRouter = router({
     .input(z.object({ unit: z.enum(['F', 'C']).default('F') }).strict())
     .output(z.object({
       leftSide: z.object({
-        currentTemperature: z.number(),
-        targetTemperature: z.number(),
+        currentTemperature: z.number().nullable(),
+        targetTemperature: z.number().nullable(),
         currentLevel: z.number(),
         targetLevel: z.number(),
         heatingDuration: z.number(),
         isAlarmVibrating: z.boolean().optional(),
       }),
       rightSide: z.object({
-        currentTemperature: z.number(),
-        targetTemperature: z.number(),
+        currentTemperature: z.number().nullable(),
+        targetTemperature: z.number().nullable(),
         currentLevel: z.number(),
         targetLevel: z.number(),
         heatingDuration: z.number(),
@@ -215,7 +215,8 @@ export const deviceRouter = router({
         const leftSnooze = getSnoozeStatus('left')
         const rightSnooze = getSnoozeStatus('right')
 
-        const convertTemp = (f: number) => input.unit === 'C' ? Math.round(toC(f) * 10) / 10 : f
+        const convertTemp = (f: number | null) =>
+          f == null ? null : (input.unit === 'C' ? Math.round(toC(f) * 10) / 10 : f)
 
         // Best-effort enrichment — nulls on failure
         let wifiStrength: number = -1
@@ -475,7 +476,7 @@ export const deviceRouter = router({
 
         broadcastMutationStatus(input.side, input.powered
           ? { targetTemperature: input.temperature ?? 75, targetLevel: fahrenheitToLevel(input.temperature ?? 75) }
-          : { targetLevel: 0 },
+          : { targetTemperature: null, targetLevel: 0 },
         )
         return { success: true }
       }, 'Failed to set power')
@@ -526,30 +527,14 @@ export const deviceRouter = router({
     )
     .output(z.object({ success: z.boolean() }))
     .mutation(async ({ input }) => {
-      markSideMutated(input.side)
       return withHardwareClient(async (client) => {
-        cancelSnooze(input.side)
-        await client.setAlarm(input.side, {
+        await startAlarm(input.side, {
           vibrationIntensity: input.vibrationIntensity,
           vibrationPattern: input.vibrationPattern,
           duration: input.duration,
+        }, {
+          client,
         })
-
-        // Best-effort DB sync — next getStatus() call will re-sync if this fails
-        try {
-          await db
-            .update(deviceState)
-            .set({
-              isAlarmVibrating: true,
-              lastUpdated: new Date(),
-            })
-            .where(eq(deviceState.side, input.side))
-        }
-        catch (dbError) {
-          console.error('Failed to sync alarm state to DB:', dbError)
-        }
-
-        broadcastMutationStatus(input.side, { isAlarmVibrating: true })
         return { success: true }
       }, 'Failed to set alarm')
     }),
@@ -576,26 +561,8 @@ export const deviceRouter = router({
     )
     .output(z.object({ success: z.boolean() }))
     .mutation(async ({ input }) => {
-      markSideMutated(input.side)
       return withHardwareClient(async (client) => {
-        await client.clearAlarm(input.side)
-        cancelSnooze(input.side)
-
-        // Best-effort DB sync — next getStatus() call will re-sync if this fails
-        try {
-          await db
-            .update(deviceState)
-            .set({
-              isAlarmVibrating: false,
-              lastUpdated: new Date(),
-            })
-            .where(eq(deviceState.side, input.side))
-        }
-        catch (dbError) {
-          console.error('Failed to sync alarm clear state to DB:', dbError)
-        }
-
-        broadcastMutationStatus(input.side, { isAlarmVibrating: false })
+        await stopAlarm(input.side, { client })
         return { success: true }
       }, 'Failed to clear alarm')
     }),
@@ -617,26 +584,21 @@ export const deviceRouter = router({
     .output(z.object({ success: z.boolean(), snoozeUntil: z.number() }))
     .mutation(async ({ input }) => {
       return withHardwareClient(async (client) => {
-        await client.clearAlarm(input.side)
-
-        const snoozeUntil = snoozeAlarm(input.side, input.duration, {
-          vibrationIntensity: input.vibrationIntensity,
-          vibrationPattern: input.vibrationPattern,
-          duration: input.alarmDuration,
+        const status = await snoozeAlarm(input.side, input.duration, {
+          client,
+          fallbackConfig: {
+            vibrationIntensity: input.vibrationIntensity,
+            vibrationPattern: input.vibrationPattern,
+            duration: input.alarmDuration,
+          },
         })
-
-        try {
-          await db
-            .update(deviceState)
-            .set({ isAlarmVibrating: false, lastUpdated: new Date() })
-            .where(eq(deviceState.side, input.side))
+        if (!status?.snoozeUntil) {
+          throw new TRPCError({
+            code: 'PRECONDITION_FAILED',
+            message: `No active alarm to snooze on the ${input.side} side`,
+          })
         }
-        catch (dbError) {
-          console.error('Failed to sync snooze state to DB:', dbError)
-        }
-
-        broadcastMutationStatus(input.side, { isAlarmVibrating: false })
-        return { success: true, snoozeUntil: Math.floor(snoozeUntil.getTime() / 1000) }
+        return { success: true, snoozeUntil: status.snoozeUntil }
       }, 'Failed to snooze alarm')
     }),
 

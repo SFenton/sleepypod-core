@@ -28,6 +28,7 @@ interface IptablesRule {
 
 /** Known iptables paths from the pod capabilities manifest, used as fallbacks */
 const KNOWN_IPTABLES_PATHS = [...new Set(Object.values(POD_CAPS).map(c => c.iptablesPath))]
+const IPTABLES_SAVE_HELPER = '/usr/local/bin/sp-iptables-save'
 
 /**
  * Resolve the absolute path to the iptables binary.
@@ -63,21 +64,21 @@ function buildRequiredRules(iptables: string) {
       name: 'mDNS outbound (UDP 5353)',
       chain: 'OUTPUT' as const,
       check: 'udp dpt:5353',
-      repair: `${iptables} -I OUTPUT 2 -p udp --dport 5353 -j ACCEPT`,
+      repair: `${iptables} -I OUTPUT -p udp --dport 5353 -j ACCEPT`,
       critical: true,
     },
     {
       name: 'mDNS inbound (UDP 5353)',
       chain: 'INPUT' as const,
       check: 'udp dpt:5353',
-      repair: `${iptables} -I INPUT 2 -p udp --dport 5353 -j ACCEPT`,
+      repair: `${iptables} -I INPUT -p udp --dport 5353 -j ACCEPT`,
       critical: true,
     },
     {
       name: 'mDNS outbound source (UDP 5353)',
       chain: 'OUTPUT' as const,
       check: 'udp spt:5353',
-      repair: `${iptables} -I OUTPUT 2 -p udp --sport 5353 -j ACCEPT`,
+      repair: `${iptables} -I OUTPUT -p udp --sport 5353 -j ACCEPT`,
       critical: true,
     },
     {
@@ -91,10 +92,24 @@ function buildRequiredRules(iptables: string) {
       name: 'NTP outbound (UDP 123)',
       chain: 'OUTPUT' as const,
       check: 'udp dpt:123',
-      repair: `${iptables} -I OUTPUT 2 -p udp --dport 123 -j ACCEPT`,
+      repair: `${iptables} -I OUTPUT -p udp --dport 123 -j ACCEPT`,
       critical: true,
     },
   ]
+}
+
+function persistRules(iptables: string): void {
+  try {
+    execSync(`test -x ${IPTABLES_SAVE_HELPER}`, { timeout: 2000 })
+    execSync(`sudo -n ${IPTABLES_SAVE_HELPER}`, { encoding: 'utf-8', timeout: 5000 })
+    return
+  }
+  catch {
+    // Helper is installed by scripts/install on pods. Dev/CI and older installs fall through.
+  }
+
+  const iptablesSave = iptables.replace(/iptables$/, 'iptables-save')
+  execSync(`${iptablesSave} > /etc/iptables/rules.v4`, { encoding: 'utf-8', timeout: 5000 })
 }
 
 /**
@@ -175,10 +190,8 @@ export function checkAndRepairIptables(iptablesPath?: string): IptablesStatus {
   }
 
   if (repaired.length > 0) {
-    // Persist the repaired rules — derive iptables-save path from iptables path
-    const iptablesSave = iptables.replace(/iptables$/, 'iptables-save')
     try {
-      execSync(`${iptablesSave} > /etc/iptables/rules.v4`, { encoding: 'utf-8', timeout: 5000 })
+      persistRules(iptables)
       console.log(`[iptables] Saved ${repaired.length} repaired rules to rules.v4`)
     }
     catch {

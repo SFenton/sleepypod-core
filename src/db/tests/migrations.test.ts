@@ -17,9 +17,49 @@ describe('migrations smoke test', () => {
 
       // Smoke-check that the unique index added in this PR actually exists
       const idx = raw.prepare(
-        'SELECT name FROM sqlite_master WHERE type = \'index\' AND name = \'uq_tap_side_type\'',
+        'SELECT name FROM sqlite_master WHERE type = \'index\' AND name = \'uq_tap_side_button_type\'',
       ).get() as { name?: string } | undefined
-      expect(idx?.name).toBe('uq_tap_side_type')
+      expect(idx?.name).toBe('uq_tap_side_button_type')
+
+      const buttonIdx = raw.prepare(
+        'SELECT name FROM sqlite_master WHERE type = \'index\' AND name = \'uq_cover_button_side_button\'',
+      ).get() as { name?: string } | undefined
+      expect(buttonIdx?.name).toBe('uq_cover_button_side_button')
+
+      const coverRows = raw.prepare(
+        'SELECT side, button, action_type, temperature_change, temperature_amount, power_behavior FROM cover_button_actions ORDER BY side, button',
+      ).all()
+      expect(coverRows).toEqual([
+        { side: 'left', button: 'bottom', action_type: 'temperature', temperature_change: 'decrement', temperature_amount: 1, power_behavior: null },
+        { side: 'left', button: 'middle', action_type: 'power', temperature_change: null, temperature_amount: null, power_behavior: 'toggle' },
+        { side: 'left', button: 'top', action_type: 'temperature', temperature_change: 'increment', temperature_amount: 1, power_behavior: null },
+        { side: 'right', button: 'bottom', action_type: 'temperature', temperature_change: 'decrement', temperature_amount: 1, power_behavior: null },
+        { side: 'right', button: 'middle', action_type: 'power', temperature_change: null, temperature_amount: null, power_behavior: 'toggle' },
+        { side: 'right', button: 'top', action_type: 'temperature', temperature_change: 'increment', temperature_amount: 1, power_behavior: null },
+      ])
+
+      const buttonGestureRows = raw.prepare(
+        'SELECT side, button, tap_type, action_type, temperature_change, temperature_amount, power_behavior FROM tap_gestures WHERE button != \'surface\' ORDER BY side, button, tap_type',
+      ).all()
+      expect(buttonGestureRows).toEqual([
+        { side: 'left', button: 'bottom', tap_type: 'doubleTap', action_type: 'temperature', temperature_change: 'decrement', temperature_amount: 1, power_behavior: null },
+        { side: 'left', button: 'top', tap_type: 'doubleTap', action_type: 'temperature', temperature_change: 'increment', temperature_amount: 1, power_behavior: null },
+        { side: 'right', button: 'bottom', tap_type: 'doubleTap', action_type: 'temperature', temperature_change: 'decrement', temperature_amount: 1, power_behavior: null },
+        { side: 'right', button: 'top', tap_type: 'doubleTap', action_type: 'temperature', temperature_change: 'increment', temperature_amount: 1, power_behavior: null },
+      ])
+
+      const deviceStateColumns = raw.prepare('PRAGMA table_info(device_state)').all() as Array<{ name: string }>
+      expect(deviceStateColumns.map(column => column.name)).toEqual(expect.arrayContaining([
+        'alarm_state',
+        'alarm_occurrence_id',
+        'alarm_schedule_id',
+        'alarm_scheduled_for',
+        'alarm_snoozed_until',
+        'alarm_ringing_until',
+        'alarm_vibration_intensity',
+        'alarm_vibration_pattern',
+        'alarm_duration',
+      ]))
     }
     finally {
       raw.close()
@@ -47,47 +87,22 @@ describe('migrations smoke test', () => {
     }
   })
 
-  it('main DB unique index dedups existing duplicates', () => {
+  it('main DB unique index scopes gestures by side, button, and tap count', () => {
     const raw = new Database(':memory:')
     try {
-      // Apply ALL migrations (including 0006 which creates uq_tap_side_type).
-      // Then drop the index, insert duplicate rows, and replay the dedup SQL
-      // — this simulates upgrade-from-old-schema where duplicates predated
-      // the unique index and the migration must clean them up.
       const db = drizzle(raw, { schema })
       migrate(db, {
         migrationsFolder: path.resolve(process.cwd(), 'src/db/migrations'),
       })
 
-      // Drop the freshly-created unique index so we can insert duplicates,
-      // then re-run the DELETE-then-create statements the migration uses.
-      raw.exec('DROP INDEX uq_tap_side_type')
       const insertStmt = raw.prepare(
-        'INSERT INTO tap_gestures (side, tap_type, action_type) VALUES (?, ?, ?)',
+        'INSERT INTO tap_gestures (side, button, tap_type, action_type) VALUES (?, ?, ?, ?)',
       )
-      insertStmt.run('left', 'doubleTap', 'temperature')
-      insertStmt.run('left', 'doubleTap', 'alarm') // duplicate
-      insertStmt.run('right', 'tripleTap', 'temperature')
+      insertStmt.run('left', 'middle', 'doubleTap', 'power')
+      insertStmt.run('right', 'middle', 'doubleTap', 'alarm')
+      insertStmt.run('left', 'top', 'tripleTap', 'temperature')
 
-      expect(raw.prepare('SELECT COUNT(*) AS n FROM tap_gestures').get())
-        .toEqual({ n: 3 })
-
-      // Apply the dedup + unique index statements from 0006
-      raw.exec(`
-        DELETE FROM tap_gestures
-        WHERE id NOT IN (
-          SELECT MAX(id) FROM tap_gestures GROUP BY side, tap_type
-        );
-        CREATE UNIQUE INDEX uq_tap_side_type ON tap_gestures (side, tap_type);
-      `)
-
-      const remaining = raw.prepare(
-        'SELECT side, tap_type, action_type FROM tap_gestures ORDER BY side, tap_type',
-      ).all() as Array<{ side: string, tap_type: string, action_type: string }>
-      expect(remaining).toHaveLength(2)
-      // MAX(id) wins: the 'alarm' duplicate is the one that stays
-      expect(remaining[0]).toEqual({ side: 'left', tap_type: 'doubleTap', action_type: 'alarm' })
-      expect(remaining[1]).toEqual({ side: 'right', tap_type: 'tripleTap', action_type: 'temperature' })
+      expect(() => insertStmt.run('left', 'middle', 'doubleTap', 'alarm')).toThrow()
     }
     finally {
       raw.close()

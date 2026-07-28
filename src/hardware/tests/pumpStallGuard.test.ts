@@ -75,6 +75,7 @@ function resetSchema(): void {
       pump_stall_auto_recovery_enabled INTEGER NOT NULL DEFAULT 0,
       pump_stall_recovery_rpm INTEGER NOT NULL DEFAULT 1500,
       pump_stall_recovery_samples INTEGER NOT NULL DEFAULT 3,
+      autopilot_enabled INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL DEFAULT (unixepoch()),
       updated_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
@@ -84,6 +85,15 @@ function resetSchema(): void {
       target_temperature REAL,
       is_powered INTEGER NOT NULL DEFAULT 0,
       is_alarm_vibrating INTEGER NOT NULL DEFAULT 0,
+      alarm_state TEXT NOT NULL DEFAULT 'idle',
+      alarm_occurrence_id TEXT,
+      alarm_schedule_id INTEGER,
+      alarm_scheduled_for INTEGER,
+      alarm_snoozed_until INTEGER,
+      alarm_ringing_until INTEGER,
+      alarm_vibration_intensity INTEGER,
+      alarm_vibration_pattern TEXT,
+      alarm_duration INTEGER,
       water_level TEXT DEFAULT 'unknown',
       powered_on_at INTEGER,
       last_updated INTEGER NOT NULL DEFAULT (unixepoch())

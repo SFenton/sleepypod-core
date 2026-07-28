@@ -92,6 +92,62 @@
       "when": 1780280050942,
       "tag": "0012_backfill_pump_stall_optin",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1780859527495,
+      "tag": "0013_autopilot_automations",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1780862594290,
+      "tag": "0014_optimal_marvex",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1781919814911,
+      "tag": "0015_blue_victor_mancha",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "6",
+      "when": 1781922109911,
+      "tag": "0016_cheerful_reptil",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1781930065731,
+      "tag": "0017_dark_crusher_hogan",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1781935065731,
+      "tag": "0018_focus_cover_button_double_taps",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1782084800000,
+      "tag": "0019_temperature_step_mode",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1785256112741,
+      "tag": "0020_alarm_lifecycle",
+      "breakpoints": true
     }
   ]
 }

@@ -2,6 +2,20 @@
 
 **Status:** SUPERSEDED 2026-05-11 — see "Correction" below.
 
+## Follow-up (2026-06-20)
+
+`HardwareCommand.ALARM_SOLO` now maps to cmd 17. Live probing on `eight-pod`
+confirmed cmd 17 reaches `sparkAlarmS`, but it immediately clears both alarm
+channels and does not emit an `[alarm io] ... start` motor write or the
+center-button `haptic mode--dur 2->750` path. It is therefore still not a usable
+replacement for per-side `ALARM_LEFT` / `ALARM_RIGHT`, nor for the local
+center-button confirm buzz.
+
+Separate follow-up probing found the actual center-confirm path: raw Sensor
+USART opcode `0x40` with payload `side, 25, 7, 2`, CRC-framed like the other
+Sensor commands. SleepyPod uses that hidden command for cover-button feedback
+only; scheduled/user alarms still use `ALARM_LEFT` / `ALARM_RIGHT`.
+
 ## Correction (2026-05-11)
 
 The original decision in this ADR is wrong. Re-verified live on
@@ -59,10 +73,8 @@ suggesting a third "solo" path:
 setHighCurrentVibration
 ```
 
-These strings exist in the binary but the corresponding spark function
-is not registered with the DAC. Either it's planned/dead code, or the
-registration was removed in a firmware update we don't have. Either
-way, cmd 2 doesn't drive the motors on the current J55 firmware.
+These strings exist in the binary. The current solo opcode is cmd 17, which
+reaches `sparkAlarmS` but does not drive the motors on the current J55 firmware.
 
 ## Consequences of the correction
 

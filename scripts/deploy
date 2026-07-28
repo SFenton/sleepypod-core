@@ -76,7 +76,12 @@ $SSH_CMD "mkdir -p '$REMOTE_DIR' && \
 
 # Tar source + build, pipe over SSH, extract on pod
 # Includes .next (pre-built) but excludes node_modules (installed on pod for native modules)
-COPYFILE_DISABLE=1 tar cf - --no-mac-metadata \
+TAR_EXTRA_ARGS=()
+if tar --help 2>/dev/null | grep -q -- '--no-mac-metadata'; then
+  TAR_EXTRA_ARGS+=(--no-mac-metadata)
+fi
+
+COPYFILE_DISABLE=1 tar cf - "${TAR_EXTRA_ARGS[@]}" \
   --exclude='node_modules' \
   --exclude='*.db' \
   --exclude='*.db-shm' \

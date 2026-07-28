@@ -19,12 +19,9 @@ export enum HardwareCommand {
   PRIME = '13',
   DEVICE_STATUS = '14',
   ALARM_CLEAR = '16',
-  // Solo alarm — `sparkAlarmS` in frankenfirmware. Drives both LP5009 motor
-  // controllers on the cover directly via setHighCurrentVibration, bypassing
-  // the per-side `Pillow.cpp::triggerVibrationAlarm` label gate. Should be
-  // the path that buzzes on a cover-only Pod 5. Identified from free-sleep
-  // (throwaway31265/free-sleep) deviceApi.ts where `ALARM_SOLO: "17"` was
-  // commented out.
+  // Solo alarm — `sparkAlarmS` in frankenfirmware. Live Pod 5 probing shows
+  // cmd 17 reaches sparkAlarmS, but it immediately clears both alarm channels
+  // and does not enter the center-button haptic confirm path.
   ALARM_SOLO = '17',
 }
 
@@ -90,8 +87,8 @@ export interface DeviceStatus {
  * Individual side status
  */
 export interface SideStatus {
-  currentTemperature: number // In Fahrenheit
-  targetTemperature: number // In Fahrenheit
+  currentTemperature: number | null // °F, or null when the level is 0 (off/neutral)
+  targetTemperature: number | null // °F, or null when the level is 0 (off/neutral)
   currentLevel: number // -100 to 100
   targetLevel: number // -100 to 100
   heatingDuration: number // In seconds

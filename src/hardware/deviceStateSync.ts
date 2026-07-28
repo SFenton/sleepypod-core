@@ -114,12 +114,11 @@ export class DeviceStateSync {
     const sideStatus = side === 'left' ? status.leftSide : status.rightSide
     const now = new Date()
 
-    // Stale display fix: if firmware reports targetLevel=0 AND heatingDuration=0,
-    // the pod has returned to neutral after its duration expired. Force isPowered
-    // to false regardless of currentLevel (which may still be non-zero while the
-    // water temperature equalizes back to ambient).
-    const durationExpired = sideStatus.targetLevel === 0 && sideStatus.heatingDuration === 0
-    const isNowPowered = durationExpired ? false : sideStatus.currentLevel !== 0
+    // Level 0 / null target is the firmware's neutral-off command. currentLevel
+    // can remain non-zero while the water equalizes, but that residual level
+    // must not re-mark the side as powered and cause MQTT/HA state flapping.
+    const targetNeutral = sideStatus.targetLevel === 0 || sideStatus.targetTemperature == null
+    const isNowPowered = !targetNeutral
 
     const skipPoweredFields = isSideRecentlyMutated(side)
 
@@ -145,9 +144,9 @@ export class DeviceStateSync {
         poweredOnAt = null
       }
 
-      // When duration has expired, clear the target temperature so the UI
-      // doesn't show a stale "warming to X°F" when the pod is actually neutral.
-      const targetTemp = durationExpired ? null : sideStatus.targetTemperature
+      // When the target is neutral, clear the setpoint so the UI doesn't show
+      // stale "warming to X°F" state while the pod is actually off/neutral.
+      const targetTemp = targetNeutral ? null : sideStatus.targetTemperature
 
       // If a mutation just landed, the firmware status is likely stale —
       // preserve the mutation's powered-state fields and only refresh

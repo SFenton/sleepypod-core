@@ -62,6 +62,17 @@ while [ $# -gt 0 ]; do
 done
 export NODE_MODULES_DIR
 
+group_exists() {
+  local group_name="$1"
+
+  if command -v getent >/dev/null 2>&1; then
+    getent group "$group_name" >/dev/null 2>&1
+    return
+  fi
+
+  awk -F: -v group_name="$group_name" '$1 == group_name { found = 1 } END { exit found ? 0 : 1 }' /etc/group 2>/dev/null
+}
+
 # Resolve DATA_DIR (SQLite home) before anything that touches it. Precedence:
 #   1. --data-dir / DATA_DIR env override
 #   2. /etc/sleepypod/data-dir written by a prior install run
@@ -585,7 +596,7 @@ for bin in node npm npx pnpm; do
 done
 
 INSTALL_DIR="/home/dac/sleepypod-core"
-GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-sleepypod/core}"
+GITHUB_REPO="${SLEEPYPOD_GITHUB_REPO:-SFenton/sleepypod-core}"
 SCRIPT_DEFAULT_BRANCH="__BRANCH__"  # substituted at release time by .github/workflows/{release,dev-release}.yml
 # Guard for users curling the raw source from main: the substitution only
 # happens inside the release tarball, so the file at raw.githubusercontent
@@ -697,7 +708,7 @@ mkdir -p /persistent/deviceinfo
 # Mode 2770 (no world bits) mirrors the socket's own 0770 — every real
 # consumer is either root or in the `dac` group, so world r-x adds nothing
 # but surface area.
-if getent group dac &>/dev/null; then
+if group_exists dac; then
   chown root:dac /persistent/deviceinfo
   chmod 2770 /persistent/deviceinfo
 fi
@@ -713,6 +724,7 @@ fi
 # run as UID 0. Membership:
 #   - sleepypod:  write access to $DATA_DIR (SQLite files)
 #   - dac:        read/write access to dac.sock (hardware control)
+#   - dialout:    write access to Sensor UART (/dev/ttyS2) for haptic confirms
 # Runtime capabilities (CAP_NET_ADMIN, CAP_NET_RAW) are granted via the
 # service unit — they're only needed for iptables check/repair.
 if ! id sleepypod &>/dev/null; then
@@ -723,6 +735,9 @@ fi
 # Add sleepypod to dac group (if dac exists) so it can reach dac.sock
 if id dac &>/dev/null; then
   usermod -aG dac sleepypod
+fi
+if group_exists dialout; then
+  usermod -aG dialout sleepypod
 fi
 
 # Allow the sleepypod service user to run sp-update as root without a
@@ -743,7 +758,8 @@ fi
 # vendor image.
 SUDOERS_FILE="/etc/sudoers.d/sleepypod-update"
 SUDOERS_CONTENT='Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-sleepypod ALL=(root) NOPASSWD: /usr/local/bin/sp-update'
+sleepypod ALL=(root) NOPASSWD: /usr/local/bin/sp-update
+sleepypod ALL=(root) NOPASSWD: /usr/local/bin/sp-iptables-save'
 SUDOERS_TMP=$(mktemp)
 printf '%s\n' "$SUDOERS_CONTENT" > "$SUDOERS_TMP"
 chmod 0440 "$SUDOERS_TMP"
@@ -853,8 +869,8 @@ fi
 # ============================================================================
 # Install Node.js via binary download (works on any Linux, no apt required)
 # ============================================================================
-NODE_WANTED=22
-NODE_FULL="22.17.0"
+NODE_WANTED=24
+NODE_FULL="24.16.0"
 NODE_DIR="/usr/local/lib/nodejs"
 
 # Detect architecture
@@ -1175,6 +1191,15 @@ if [ ! -f "$INSTALL_DIR/node_modules/better-sqlite3/build/Release/better_sqlite3
   cd "$INSTALL_DIR"
 fi
 
+ensure_standalone_node_modules() {
+  if [ ! -f "$INSTALL_DIR/.next/standalone/server.js" ]; then
+    return 0
+  fi
+
+  rm -rf "$INSTALL_DIR/.next/standalone/node_modules"
+  ln -s ../../node_modules "$INSTALL_DIR/.next/standalone/node_modules"
+}
+
 # Build application (skip if .next already exists — pre-built by deploy script or CI)
 # Effective branch: --branch flag, download branch, or script default
 EFFECTIVE_BRANCH="${INSTALL_BRANCH:-${DOWNLOAD_BRANCH:-$SCRIPT_DEFAULT_BRANCH}}"
@@ -1188,6 +1213,7 @@ else
   CI=true pnpm install --frozen-lockfile
   SP_BRANCH="$EFFECTIVE_BRANCH" pnpm build
 fi
+ensure_standalone_node_modules
 
 # Create or preserve environment file
 if [ -f "$INSTALL_DIR/.env" ]; then
@@ -1265,14 +1291,60 @@ echo "Creating systemd service..."
 # namespace setup (ProtectSystem=strict makes /etc read-only by default;
 # the runtime's checkAndRepairIptables() writes /etc/iptables/rules.v4).
 mkdir -p /etc/iptables
+if id sleepypod &>/dev/null; then
+  touch /etc/iptables/rules.v4 /etc/iptables/rules.v6
+  chown root:sleepypod /etc/iptables /etc/iptables/rules.v4 /etc/iptables/rules.v6
+  chmod 2775 /etc/iptables
+  chmod 0664 /etc/iptables/rules.v4 /etc/iptables/rules.v6
+fi
 
-# Only emit SupplementaryGroups=dac when the dac group exists — otherwise
+cat > /usr/local/bin/sp-iptables-save << 'SP_IPTABLES_SAVE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+IPTABLES_SAVE="${IPTABLES_SAVE:-}"
+if [ -z "$IPTABLES_SAVE" ]; then
+  if command -v iptables-save >/dev/null 2>&1; then
+    IPTABLES_SAVE="$(command -v iptables-save)"
+  elif [ -x /usr/sbin/iptables-save ]; then
+    IPTABLES_SAVE="/usr/sbin/iptables-save"
+  elif [ -x /sbin/iptables-save ]; then
+    IPTABLES_SAVE="/sbin/iptables-save"
+  else
+    echo "iptables-save not found" >&2
+    exit 127
+  fi
+fi
+
+mkdir -p /etc/iptables
+tmp="$(mktemp /etc/iptables/rules.v4.XXXXXX)"
+trap 'rm -f "$tmp"' EXIT
+"$IPTABLES_SAVE" > "$tmp"
+if group_exists sleepypod; then
+  chown root:sleepypod "$tmp"
+  chmod 0664 "$tmp"
+else
+  chown root:root "$tmp"
+  chmod 0644 "$tmp"
+fi
+mv "$tmp" /etc/iptables/rules.v4
+trap - EXIT
+SP_IPTABLES_SAVE
+chown root:root /usr/local/bin/sp-iptables-save
+chmod 0755 /usr/local/bin/sp-iptables-save
+
+# Only emit SupplementaryGroups entries when the groups exist — otherwise
 # systemd refuses to start the unit with "Failed to determine supplementary
 # group: No such file or directory".
-SUPP_GROUPS_LINE=""
-if getent group dac &>/dev/null; then
-  SUPP_GROUPS_LINE="SupplementaryGroups=dac"
+SUPP_GROUPS=""
+if group_exists dac; then
+  SUPP_GROUPS="dac"
 fi
+if group_exists dialout; then
+  SUPP_GROUPS="${SUPP_GROUPS:+$SUPP_GROUPS }dialout"
+fi
+SUPP_GROUPS_LINE=""
+[ -n "$SUPP_GROUPS" ] && SUPP_GROUPS_LINE="SupplementaryGroups=$SUPP_GROUPS"
 
 cat > /etc/systemd/system/sleepypod.service << EOF
 [Unit]
@@ -1282,8 +1354,8 @@ After=network.target
 [Service]
 Type=simple
 # Drop privileges: the Node.js app no longer runs as UID 0. It needs
-# group membership for dac.sock (dac) + data dir (sleepypod), and
-# CAP_NET_ADMIN/CAP_NET_RAW for runtime iptables check+repair. Anything
+# group membership for dac.sock (dac), Sensor UART (dialout), and data dir
+# (sleepypod), plus CAP_NET_ADMIN/CAP_NET_RAW for runtime iptables check+repair. Anything
 # else that needs root runs via ExecStartPre with the \`+\` prefix.
 User=sleepypod
 Group=sleepypod
@@ -1706,6 +1778,10 @@ if [ "${SKIP_SSH:-}" != true ] && [ -t 0 ] && [[ "${SETUP_SSH:-}" =~ ^[Yy]$ ]]; 
   sed -i "s/#\?PermitRootLogin .*/PermitRootLogin prohibit-password/" /etc/ssh/sshd_config
   sed -i "s/#\?PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
   sed -i "s/#\?PermitEmptyPasswords .*/PermitEmptyPasswords no/" /etc/ssh/sshd_config
+  if grep -qE '^[[:space:]]*AllowUsers[[:space:]]+' /etc/ssh/sshd_config \
+      && ! grep -E '^[[:space:]]*AllowUsers[[:space:]]+' /etc/ssh/sshd_config | grep -qw root; then
+    sed -i -E 's|^([[:space:]]*AllowUsers[[:space:]]+)|\1root |' /etc/ssh/sshd_config
+  fi
 
   echo ""
   echo "Enter your SSH public key:"
@@ -1714,10 +1790,13 @@ if [ "${SKIP_SSH:-}" != true ] && [ -t 0 ] && [[ "${SETUP_SSH:-}" =~ ^[Yy]$ ]]; 
   if [ -n "$SSH_KEY" ]; then
     # Validate key format
     if echo "$SSH_KEY" | grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp[0-9]+) [A-Za-z0-9+/=]+'; then
-      mkdir -p /root/.ssh
-      echo "$SSH_KEY" >> /root/.ssh/authorized_keys
-      chmod 700 /root/.ssh
-      chmod 600 /root/.ssh/authorized_keys
+      ROOT_HOME="$(awk -F: '$1 == "root" { print $6 }' /etc/passwd 2>/dev/null || true)"
+      [ -n "$ROOT_HOME" ] || ROOT_HOME="/root"
+      mkdir -p "$ROOT_HOME/.ssh"
+      echo "$SSH_KEY" >> "$ROOT_HOME/.ssh/authorized_keys"
+      chown -R root:root "$ROOT_HOME/.ssh"
+      chmod 700 "$ROOT_HOME/.ssh"
+      chmod 600 "$ROOT_HOME/.ssh/authorized_keys"
       echo "SSH key added"
     else
       echo "Warning: Invalid SSH key format, skipping"
