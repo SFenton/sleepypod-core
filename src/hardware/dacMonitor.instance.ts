@@ -10,8 +10,8 @@
  *   1. `startDacServer()`     — kicks off the DacTransport connection on dac.sock
  *   2. `getDacMonitor()`      — creates the monitor, gesture handler, state sync;
  *                               wires status / gesture events; starts polling
- *   3. `shutdownDacMonitor()` — stops the monitor, cancels snoozes, clears the
- *                               shared client, disconnects the transport
+ *   3. `shutdownDacMonitor()` — stops the monitor, clears the shared client,
+ *                               and disconnects the transport
  *
  * Backed by `globalThis` so Turbopack module duplication can't produce two
  * monitors competing for the same socket.
@@ -23,9 +23,9 @@ import { CoverButtonActionHandler, type CoverButton, type CoverButtonEvent } fro
 import { defaultCoverButtonActionDeps } from './coverButtonActionHandler.deps'
 import { GestureActionHandler } from './gestureActionHandler'
 import { defaultGestureActionDeps } from './gestureActionHandler.deps'
-import { DeviceStateSync, getAlarmState } from './deviceStateSync'
+import { DeviceStateSync } from './deviceStateSync'
 import { trackPrimingState, resetPrimingState, getPrimeCompletedAt } from './primeNotification'
-import { cancelSnooze, getSnoozeStatus } from './snoozeManager'
+import { getAlarmStatus, getSnoozeStatus } from './snoozeManager'
 import { clearSharedHardwareClient, getSharedHardwareClient } from './sharedClient'
 import type { Side } from './types'
 
@@ -265,12 +265,13 @@ export const getDacMonitor = async (): Promise<DacMonitor> => {
         // Dynamic import to avoid circular dependency (piezoStream is started separately)
         import('../streaming/piezoStream').then(({ broadcastFrame }) => {
           const primeCompletedAt = getPrimeCompletedAt()
-          const alarmState = getAlarmState()
+          const leftAlarm = getAlarmStatus('left')
+          const rightAlarm = getAlarmStatus('right')
           broadcastFrame({
             type: 'deviceStatus',
             ts: Date.now(),
-            leftSide: { ...status.leftSide, isAlarmVibrating: alarmState.left },
-            rightSide: { ...status.rightSide, isAlarmVibrating: alarmState.right },
+            leftSide: { ...status.leftSide, isAlarmVibrating: leftAlarm.state === 'ringing' },
+            rightSide: { ...status.rightSide, isAlarmVibrating: rightAlarm.state === 'ringing' },
             waterLevel: status.waterLevel,
             isPriming: status.isPriming,
             ...(primeCompletedAt && { primeCompletedNotification: { timestamp: primeCompletedAt } }),
@@ -333,8 +334,6 @@ export const shutdownDacMonitor = async (): Promise<void> => {
   const gestureHandler = g[KEYS.gesture] as GestureActionHandler | undefined
   const coverButtonHandler = g[KEYS.coverButton] as CoverButtonActionHandler | undefined
 
-  cancelSnooze('left')
-  cancelSnooze('right')
   resetPrimingState()
 
   const unsubFlow = g[KEYS.unsubFlow] as (() => void) | undefined

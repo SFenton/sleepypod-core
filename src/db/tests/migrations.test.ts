@@ -47,6 +47,19 @@ describe('migrations smoke test', () => {
         { side: 'right', button: 'bottom', tap_type: 'doubleTap', action_type: 'temperature', temperature_change: 'decrement', temperature_amount: 1, power_behavior: null },
         { side: 'right', button: 'top', tap_type: 'doubleTap', action_type: 'temperature', temperature_change: 'increment', temperature_amount: 1, power_behavior: null },
       ])
+
+      const deviceStateColumns = raw.prepare('PRAGMA table_info(device_state)').all() as Array<{ name: string }>
+      expect(deviceStateColumns.map(column => column.name)).toEqual(expect.arrayContaining([
+        'alarm_state',
+        'alarm_occurrence_id',
+        'alarm_schedule_id',
+        'alarm_scheduled_for',
+        'alarm_snoozed_until',
+        'alarm_ringing_until',
+        'alarm_vibration_intensity',
+        'alarm_vibration_pattern',
+        'alarm_duration',
+      ]))
     }
     finally {
       raw.close()

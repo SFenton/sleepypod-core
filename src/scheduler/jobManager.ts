@@ -19,6 +19,7 @@ import { cancelAutoOffTimer } from '@/src/services/autoOffWatcher'
 import { markSideMutated } from '@/src/hardware/deviceStateSync'
 import { withSideLock } from '@/src/hardware/sideLock'
 import { timeToDate, nowInTimezone } from './timeUtils'
+import { startAlarm } from '@/src/hardware/snoozeManager'
 
 const HEARTBEAT_INTERVAL_MS_DEFAULT = 60_000
 const HEARTBEAT_STALE_MS_DEFAULT = 90_000
@@ -439,17 +440,20 @@ export class JobManager {
       else {
         console.log(`Alarm job alarm-${sched.id} — ${sched.side} not powered; skipping temperature, firing vibration only`)
       }
-      await client.setAlarm(sched.side, {
+      await startAlarm(sched.side, {
         vibrationIntensity: sched.vibrationIntensity,
         vibrationPattern: sched.vibrationPattern,
         duration: sched.duration,
-      })
-      broadcastMutationStatus(sched.side, {
-        ...(powered && {
-          targetTemperature: sched.alarmTemperature,
-          targetLevel: fahrenheitToLevel(sched.alarmTemperature),
-        }),
-        isAlarmVibrating: true,
+      }, {
+        client,
+        scheduleId: sched.id,
+        scheduledFor: new Date(),
+        broadcastOverlay: powered
+          ? {
+              targetTemperature: sched.alarmTemperature,
+              targetLevel: fahrenheitToLevel(sched.alarmTemperature),
+            }
+          : undefined,
       })
     })
   }

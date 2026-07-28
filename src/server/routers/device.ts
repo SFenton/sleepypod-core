@@ -9,7 +9,7 @@ import { withHardwareClient } from '@/src/server/helpers'
 import { getPrimeCompletedAt, dismissPrimeNotification } from '@/src/hardware/primeNotification'
 import { getAllPumpStallNotices } from '@/src/hardware/pumpStallNotification'
 import { shouldBlock as pumpStallShouldBlock } from '@/src/hardware/pumpStallGuard'
-import { snoozeAlarm, cancelSnooze, getSnoozeStatus } from '@/src/hardware/snoozeManager'
+import { getSnoozeStatus, snoozeAlarm, startAlarm, stopAlarm } from '@/src/hardware/snoozeManager'
 import { broadcastMutationStatus } from '@/src/streaming/broadcastMutationStatus'
 import { HardwareCommand, fahrenheitToLevel } from '@/src/hardware/types'
 import { getSharedHardwareClient } from '@/src/hardware/sharedClient'
@@ -527,30 +527,14 @@ export const deviceRouter = router({
     )
     .output(z.object({ success: z.boolean() }))
     .mutation(async ({ input }) => {
-      markSideMutated(input.side)
       return withHardwareClient(async (client) => {
-        cancelSnooze(input.side)
-        await client.setAlarm(input.side, {
+        await startAlarm(input.side, {
           vibrationIntensity: input.vibrationIntensity,
           vibrationPattern: input.vibrationPattern,
           duration: input.duration,
+        }, {
+          client,
         })
-
-        // Best-effort DB sync — next getStatus() call will re-sync if this fails
-        try {
-          await db
-            .update(deviceState)
-            .set({
-              isAlarmVibrating: true,
-              lastUpdated: new Date(),
-            })
-            .where(eq(deviceState.side, input.side))
-        }
-        catch (dbError) {
-          console.error('Failed to sync alarm state to DB:', dbError)
-        }
-
-        broadcastMutationStatus(input.side, { isAlarmVibrating: true })
         return { success: true }
       }, 'Failed to set alarm')
     }),
@@ -577,26 +561,8 @@ export const deviceRouter = router({
     )
     .output(z.object({ success: z.boolean() }))
     .mutation(async ({ input }) => {
-      markSideMutated(input.side)
       return withHardwareClient(async (client) => {
-        await client.clearAlarm(input.side)
-        cancelSnooze(input.side)
-
-        // Best-effort DB sync — next getStatus() call will re-sync if this fails
-        try {
-          await db
-            .update(deviceState)
-            .set({
-              isAlarmVibrating: false,
-              lastUpdated: new Date(),
-            })
-            .where(eq(deviceState.side, input.side))
-        }
-        catch (dbError) {
-          console.error('Failed to sync alarm clear state to DB:', dbError)
-        }
-
-        broadcastMutationStatus(input.side, { isAlarmVibrating: false })
+        await stopAlarm(input.side, { client })
         return { success: true }
       }, 'Failed to clear alarm')
     }),
@@ -618,26 +584,21 @@ export const deviceRouter = router({
     .output(z.object({ success: z.boolean(), snoozeUntil: z.number() }))
     .mutation(async ({ input }) => {
       return withHardwareClient(async (client) => {
-        await client.clearAlarm(input.side)
-
-        const snoozeUntil = snoozeAlarm(input.side, input.duration, {
-          vibrationIntensity: input.vibrationIntensity,
-          vibrationPattern: input.vibrationPattern,
-          duration: input.alarmDuration,
+        const status = await snoozeAlarm(input.side, input.duration, {
+          client,
+          fallbackConfig: {
+            vibrationIntensity: input.vibrationIntensity,
+            vibrationPattern: input.vibrationPattern,
+            duration: input.alarmDuration,
+          },
         })
-
-        try {
-          await db
-            .update(deviceState)
-            .set({ isAlarmVibrating: false, lastUpdated: new Date() })
-            .where(eq(deviceState.side, input.side))
+        if (!status?.snoozeUntil) {
+          throw new TRPCError({
+            code: 'PRECONDITION_FAILED',
+            message: `No active alarm to snooze on the ${input.side} side`,
+          })
         }
-        catch (dbError) {
-          console.error('Failed to sync snooze state to DB:', dbError)
-        }
-
-        broadcastMutationStatus(input.side, { isAlarmVibrating: false })
-        return { success: true, snoozeUntil: Math.floor(snoozeUntil.getTime() / 1000) }
+        return { success: true, snoozeUntil: status.snoozeUntil }
       }, 'Failed to snooze alarm')
     }),
 

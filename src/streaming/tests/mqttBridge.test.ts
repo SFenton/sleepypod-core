@@ -19,6 +19,8 @@ const dbMock = vi.hoisted(() => {
     deviceStateRows: any[]
     bedTempRow: any | null
     alarmScheduleRows: any[]
+    powerScheduleRows: any[]
+    temperatureScheduleRows: any[]
     throwOnBedTemp: false | true | string
     throwOnDeviceState: false | true | string
     throwOnBiometrics: false | true | string
@@ -29,6 +31,8 @@ const dbMock = vi.hoisted(() => {
     deviceStateRows: [],
     bedTempRow: null,
     alarmScheduleRows: [],
+    powerScheduleRows: [],
+    temperatureScheduleRows: [],
     throwOnBedTemp: false,
     throwOnDeviceState: false,
     throwOnBiometrics: false,
@@ -40,15 +44,31 @@ const dbMock = vi.hoisted(() => {
   //   4. .from(bedTemp).orderBy(...).limit(1)   — ambient environment fetch
   // The mock returns a thenable from .from() so case 2 (await of the from()
   // result) iterates state.deviceStateRows; cases 1/3/4 chain through.
+  function tableName(table: unknown): string {
+    if (typeof table !== 'object' || table === null) return ''
+    const symbol = Object.getOwnPropertySymbols(table).find(s => String(s) === 'Symbol(drizzle:Name)')
+    return symbol ? String((table as Record<symbol, unknown>)[symbol]) : ''
+  }
+
+  function rowsForTable(name: string): any[] {
+    if (name === 'alarm_schedules') return state.alarmScheduleRows
+    if (name === 'power_schedules') return state.powerScheduleRows
+    if (name === 'temperature_schedules') return state.temperatureScheduleRows
+    if (name === 'device_state') return state.deviceStateRows
+    return []
+  }
+
   const select = vi.fn(() => ({
-    from: vi.fn(() => {
+    from: vi.fn((table: unknown) => {
+      const name = tableName(table)
       const fromObj: any = {
         limit: vi.fn(async () => {
           if (state.throwOnSelect) throw new Error('boom')
-          return state.row !== undefined ? [state.row] : []
+          if (name === 'device_settings') return state.row !== undefined ? [state.row] : []
+          return rowsForTable(name)
         }),
         where: vi.fn(() => ({
-          all: vi.fn(async () => state.alarmScheduleRows),
+          all: vi.fn(async () => rowsForTable(name)),
           orderBy: vi.fn(() => ({
             limit: vi.fn(async () => {
               if (state.throwOnBiometrics !== false) {
@@ -70,7 +90,7 @@ const dbMock = vi.hoisted(() => {
             return state.bedTempRow ? [state.bedTempRow] : []
           }),
         })),
-        all: vi.fn(async () => state.alarmScheduleRows),
+        all: vi.fn(async () => rowsForTable(name)),
         // Make `.from(deviceState)` itself awaitable so
         // bridge state publishers can iterate rows after `await db.select().from(...)`.
         then: (resolve: (rows: any[]) => any, reject?: (err: unknown) => any) => {
@@ -81,7 +101,7 @@ const dbMock = vi.hoisted(() => {
             if (reject) return reject(err)
             throw err as Error
           }
-          return resolve(state.deviceStateRows)
+          return resolve(rowsForTable(name))
         },
       }
       return fromObj
@@ -177,7 +197,12 @@ const deviceMock = vi.hoisted(() => ({
   setPower: vi.fn(async () => undefined),
   setAlarm: vi.fn(async () => undefined),
   clearAlarm: vi.fn(async () => undefined),
+  snoozeAlarm: vi.fn(async () => undefined),
   startPriming: vi.fn(async () => undefined),
+}))
+
+const hapticMock = vi.hoisted(() => ({
+  triggerHapticConfirm: vi.fn(async () => undefined),
 }))
 
 const schedulesMock = vi.hoisted(() => ({
@@ -190,6 +215,25 @@ const schedulesMock = vi.hoisted(() => ({
 vi.mock('@/src/server/routers/app', () => ({
   appRouter: { createCaller: () => ({ device: deviceMock, schedules: schedulesMock }) },
 }))
+
+vi.mock('@/src/hardware/sensorHaptics', () => hapticMock)
+
+const alarmStateMock = vi.hoisted(() => ({
+  getAlarmStatus: vi.fn<() => any>(() => ({
+    state: 'idle',
+    active: false,
+    occurrenceId: null,
+    scheduleId: null,
+    scheduledFor: null,
+    snoozeUntil: null,
+    ringingUntil: null,
+    vibrationIntensity: null,
+    vibrationPattern: null,
+    duration: null,
+  })),
+}))
+
+vi.mock('@/src/hardware/snoozeManager', () => alarmStateMock)
 
 // Hoisted onServerFrame mock — lifecycle tests need to capture the frame
 // listener so they can assert frame-driven publishes.
@@ -217,7 +261,7 @@ vi.mock('@/src/hardware/dacMonitor.instance', () => ({
 }))
 
 const bridgeModule = await import('../mqttBridge')
-const { __test__, getBridgeStatus, startMqttBridge, shutdownMqttBridge, testConnection } = bridgeModule
+const { __test__, getBridgeStatus, publishAlarmState, startMqttBridge, shutdownMqttBridge, testConnection } = bridgeModule
 const { resolveConfig, slugify, deviceId, parsePayload, state: bridgeState } = __test__
 
 const MQTT_ENV_KEYS = [
@@ -244,6 +288,8 @@ beforeEach(() => {
   dbMock.state.deviceStateRows = []
   dbMock.state.bedTempRow = null
   dbMock.state.alarmScheduleRows = []
+  dbMock.state.powerScheduleRows = []
+  dbMock.state.temperatureScheduleRows = []
   dbMock.state.throwOnBedTemp = false
   dbMock.state.throwOnDeviceState = false
   dbMock.state.throwOnBiometrics = false
@@ -259,7 +305,21 @@ beforeEach(() => {
   deviceMock.setPower.mockClear()
   deviceMock.setAlarm.mockClear()
   deviceMock.clearAlarm.mockClear()
+  deviceMock.snoozeAlarm.mockClear()
   deviceMock.startPriming.mockClear()
+  alarmStateMock.getAlarmStatus.mockReset().mockReturnValue({
+    state: 'idle',
+    active: false,
+    occurrenceId: null,
+    scheduleId: null,
+    scheduledFor: null,
+    snoozeUntil: null,
+    ringingUntil: null,
+    vibrationIntensity: null,
+    vibrationPattern: null,
+    duration: null,
+  })
+  hapticMock.triggerHapticConfirm.mockClear()
   schedulesMock.batchUpdate.mockClear()
 })
 
@@ -925,6 +985,41 @@ describe('mqttBridge — HA discovery payload content', () => {
     }
   }
 
+  function alarmStateCfg(side: 'left' | 'right'): Record<string, unknown> {
+    const label = side === 'left' ? 'Left' : 'Right'
+    return {
+      name: `${label} alarm state`,
+      unique_id: `testpod_${side}_alarm_state`,
+      availability_topic: AVAILABILITY,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      state_topic: `sleepypod/testpod/state/${side}/alarm`,
+      value_template: '{{ value_json.state }}',
+      json_attributes_topic: `sleepypod/testpod/state/${side}/alarm`,
+      device_class: 'enum',
+      options: ['idle', 'ringing', 'snoozed'],
+      icon: 'mdi:alarm',
+      device: DEVICE,
+    }
+  }
+
+  function alarmButtonCfg(side: 'left' | 'right', action: 'snooze' | 'stop'): Record<string, unknown> {
+    const label = side === 'left' ? 'Left' : 'Right'
+    return {
+      name: `${label} alarm ${action}`,
+      unique_id: `testpod_${side}_alarm_${action}`,
+      availability_topic: AVAILABILITY,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      command_topic: `sleepypod/testpod/cmd/${action}-alarm`,
+      payload_press: action === 'snooze'
+        ? `{"side":"${side}","duration":300}`
+        : `{"side":"${side}"}`,
+      icon: action === 'snooze' ? 'mdi:alarm-snooze' : 'mdi:alarm-off',
+      device: DEVICE,
+    }
+  }
+
   function schedulesSensorCfg(): Record<string, unknown> {
     return {
       name: 'Schedules',
@@ -982,6 +1077,12 @@ describe('mqttBridge — HA discovery payload content', () => {
 
   it.each(['left', 'right'] as const)('publishes the full %s target-level number config', (side) => {
     expect(configs.get(`homeassistant/number/testpod/${side}_target_level/config`)).toEqual(targetLevelNumberCfg(side))
+  })
+
+  it.each(['left', 'right'] as const)('publishes the full %s alarm entities', (side) => {
+    expect(configs.get(`homeassistant/sensor/testpod/${side}_alarm_state/config`)).toEqual(alarmStateCfg(side))
+    expect(configs.get(`homeassistant/button/testpod/${side}_alarm_snooze/config`)).toEqual(alarmButtonCfg(side, 'snooze'))
+    expect(configs.get(`homeassistant/button/testpod/${side}_alarm_stop/config`)).toEqual(alarmButtonCfg(side, 'stop'))
   })
 
   it('publishes the full water_level sensor config', () => {
@@ -1055,6 +1156,7 @@ describe('mqttBridge — message dispatch', () => {
 
     await new Promise(r => setTimeout(r, 0))
     expect(deviceMock.setTemperature).toHaveBeenCalledWith({ side: 'left', temperature: 70 })
+    expect(hapticMock.triggerHapticConfirm).toHaveBeenCalledWith('left')
 
     await shutdownMqttBridge()
   })
@@ -1068,6 +1170,7 @@ describe('mqttBridge — message dispatch', () => {
 
     await new Promise(r => setTimeout(r, 0))
     expect(deviceMock.setTemperature).toHaveBeenCalledWith({ side: 'left', temperature: 77 })
+    expect(hapticMock.triggerHapticConfirm).toHaveBeenCalledWith('left')
 
     await shutdownMqttBridge()
   })
@@ -1088,13 +1191,37 @@ describe('mqttBridge — message dispatch', () => {
     expect(deviceMock.setAlarm).toHaveBeenCalled()
     expect(deviceMock.clearAlarm).toHaveBeenCalled()
     expect(deviceMock.startPriming).toHaveBeenCalledWith({})
+    expect(hapticMock.triggerHapticConfirm).not.toHaveBeenCalled()
 
     await shutdownMqttBridge()
   })
 
-  it('routes set-schedules payloads to schedules.batchUpdate with normalized alarm rows', async () => {
+  it('routes per-side snooze and stop alarm verbs', async () => {
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    const id = deviceId()
+    fake.emit('message', `sleepypod/${id}/cmd/snooze-alarm`, Buffer.from(JSON.stringify({ side: 'right', duration: 300 })))
+    fake.emit('message', `sleepypod/${id}/cmd/stop-alarm`, Buffer.from(JSON.stringify({ side: 'right' })))
+
+    await new Promise(r => setTimeout(r, 0))
+    expect(deviceMock.snoozeAlarm).toHaveBeenCalledWith({ side: 'right', duration: 300 })
+    expect(deviceMock.clearAlarm).toHaveBeenCalledWith({ side: 'right' })
+
+    await shutdownMqttBridge()
+  })
+
+  it('routes set-schedules payloads to schedules.batchUpdate with normalized power, temperature, and alarm rows', async () => {
     dbMock.state.alarmScheduleRows = [
-      { id: 9, side: 'left', dayOfWeek: 'monday' },
+      { id: 9, side: 'left', dayOfWeek: 'monday', time: '06:30', vibrationIntensity: 100, vibrationPattern: 'rise', duration: 180, alarmTemperature: 82, enabled: true },
+    ]
+    dbMock.state.powerScheduleRows = [
+      { id: 8, side: 'left', dayOfWeek: 'monday', onTime: '21:30', offTime: '09:00', onTemperature: 74, enabled: true },
+    ]
+    dbMock.state.temperatureScheduleRows = [
+      { id: 7, side: 'left', dayOfWeek: 'monday', time: '01:00', temperature: 77, enabled: true },
+      { id: 6, side: 'left', dayOfWeek: 'monday', time: '05:00', temperature: 85, enabled: true },
     ]
     const fake = await startBridgeWithFake()
     fake.connected = true
@@ -1103,6 +1230,11 @@ describe('mqttBridge — message dispatch', () => {
     fake.emit('message', `sleepypod/${deviceId()}/cmd/set-schedules`, Buffer.from(JSON.stringify({
       left: {
         monday: {
+          power: { on: '21:30', off: '09:00', enabled: true, onTemperature: -3 },
+          temperatures: {
+            '01:00': -2,
+            '05:00': 1,
+          },
           alarms: [
             { time: '06:30:00', vibrationIntensity: 120, vibrationPattern: 'double', duration: 300, alarmTemperature: 82, enabled: true },
           ],
@@ -1112,8 +1244,20 @@ describe('mqttBridge — message dispatch', () => {
 
     await new Promise(r => setTimeout(r, 0))
     expect(schedulesMock.batchUpdate).toHaveBeenCalledWith({
-      deletes: { alarm: [9] },
+      deletes: { alarm: [9], power: [8], temperature: [7, 6] },
       creates: {
+        power: [{
+          side: 'left',
+          dayOfWeek: 'monday',
+          onTime: '21:30',
+          offTime: '09:00',
+          onTemperature: 74,
+          enabled: true,
+        }],
+        temperature: [
+          { side: 'left', dayOfWeek: 'monday', time: '01:00', temperature: 77, enabled: true },
+          { side: 'left', dayOfWeek: 'monday', time: '05:00', temperature: 85, enabled: true },
+        ],
         alarm: [{
           side: 'left',
           dayOfWeek: 'monday',
@@ -1126,7 +1270,37 @@ describe('mqttBridge — message dispatch', () => {
         }],
       },
     })
+    await new Promise(r => setTimeout(r, 0))
     expect(fake.publish.mock.calls.some(([t]) => String(t).endsWith('/state/schedules'))).toBe(true)
+
+    await shutdownMqttBridge()
+  })
+
+  it('does not delete power or temperature schedules for alarm-only set-schedules payloads', async () => {
+    dbMock.state.alarmScheduleRows = [
+      { id: 9, side: 'left', dayOfWeek: 'monday' },
+    ]
+    dbMock.state.powerScheduleRows = [
+      { id: 8, side: 'left', dayOfWeek: 'monday' },
+    ]
+    dbMock.state.temperatureScheduleRows = [
+      { id: 7, side: 'left', dayOfWeek: 'monday' },
+    ]
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    fake.emit('message', `sleepypod/${deviceId()}/cmd/set-schedules`, Buffer.from(JSON.stringify({
+      left: {
+        monday: { alarms: [] },
+      },
+    })))
+
+    await new Promise(r => setTimeout(r, 0))
+    expect(schedulesMock.batchUpdate).toHaveBeenCalledWith({
+      deletes: { alarm: [9] },
+      creates: { alarm: [], power: [], temperature: [] },
+    })
 
     await shutdownMqttBridge()
   })
@@ -1168,6 +1342,7 @@ describe('mqttBridge — message dispatch', () => {
     await new Promise(r => setTimeout(r, 0))
 
     expect(deviceMock.setTemperature).toHaveBeenCalled()
+    expect(hapticMock.triggerHapticConfirm).not.toHaveBeenCalled()
 
     await shutdownMqttBridge()
   })
@@ -1291,6 +1466,45 @@ describe('mqttBridge — frame subscription', () => {
     piezoMock.state.listener?.({ type: 'deviceStatus' })
 
     expect(fake.publish).not.toHaveBeenCalled()
+
+    await shutdownMqttBridge()
+  })
+})
+
+describe('mqttBridge — alarm state publication', () => {
+  it('publishes ringing/snoozed occurrence metadata for Home Assistant', async () => {
+    alarmStateMock.getAlarmStatus.mockReturnValue({
+      state: 'snoozed',
+      active: true,
+      occurrenceId: 'schedule-42-1785255000000',
+      scheduleId: 42,
+      scheduledFor: 1_785_255_000,
+      snoozeUntil: 1_785_255_300,
+      ringingUntil: null,
+      vibrationIntensity: 100,
+      vibrationPattern: 'rise',
+      duration: 180,
+    })
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    publishAlarmState('right')
+
+    const call = [...fake.publish.mock.calls]
+      .reverse()
+      .find(([topicName]) => String(topicName).endsWith('/state/right/alarm'))
+    expect(JSON.parse(String(call?.[1]))).toMatchObject({
+      state: 'snoozed',
+      occurrence_id: 'schedule-42-1785255000000',
+      schedule_id: 42,
+      scheduled_for: 1_785_255_000,
+      snoozed_until: 1_785_255_300,
+      ringing_until: null,
+      vibration_intensity: 100,
+      vibration_pattern: 'rise',
+      duration: 180,
+    })
 
     await shutdownMqttBridge()
   })
@@ -1466,6 +1680,35 @@ describe('mqttBridge — publishState content', () => {
         enabled: true,
       },
     ]
+    dbMock.state.powerScheduleRows = [
+      {
+        id: 2,
+        side: 'right',
+        dayOfWeek: 'saturday',
+        onTime: '21:30',
+        offTime: '09:00',
+        onTemperature: 88,
+        enabled: true,
+      },
+    ]
+    dbMock.state.temperatureScheduleRows = [
+      {
+        id: 4,
+        side: 'right',
+        dayOfWeek: 'saturday',
+        time: '01:00',
+        temperature: 80,
+        enabled: true,
+      },
+      {
+        id: 5,
+        side: 'right',
+        dayOfWeek: 'saturday',
+        time: '05:00',
+        temperature: 82,
+        enabled: true,
+      },
+    ]
 
     const fake = await startBridgeWithFake()
     fake.connected = true
@@ -1485,7 +1728,16 @@ describe('mqttBridge — publishState content', () => {
     const scheduleCall = fake.publish.mock.calls.find(([t]) => String(t).endsWith('/state/schedules'))
     const schedulePayload = JSON.parse(String(scheduleCall?.[1]))
     expect(schedulePayload.state).toBe('ready')
-    expect(schedulePayload.right.saturday.power.off).toBe('23:59')
+    expect(schedulePayload.right.saturday.power).toEqual({
+      enabled: true,
+      off: '09:00',
+      on: '21:30',
+      onTemperature: 88,
+    })
+    expect(schedulePayload.right.saturday.temperatures).toEqual({
+      '01:00': 80,
+      '05:00': 82,
+    })
     expect(schedulePayload.right.saturday.alarms).toEqual([
       expect.objectContaining({ time: '07:15', duration: 30, enabled: true }),
     ])
@@ -2074,6 +2326,42 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
 
     for (const side of ['left', 'right'] as const) {
       const Side = side === 'left' ? 'Left' : 'Right'
+      expected[`homeassistant/sensor/${ID}/${side}_alarm_state/config`] = {
+        name: `${Side} alarm state`,
+        unique_id: `${ID}_${side}_alarm_state`,
+        availability_topic: AVAIL,
+        payload_available: 'online',
+        payload_not_available: 'offline',
+        state_topic: `sleepypod/${ID}/state/${side}/alarm`,
+        value_template: '{{ value_json.state }}',
+        json_attributes_topic: `sleepypod/${ID}/state/${side}/alarm`,
+        device_class: 'enum',
+        options: ['idle', 'ringing', 'snoozed'],
+        icon: 'mdi:alarm',
+        device: DEVICE,
+      }
+      expected[`homeassistant/button/${ID}/${side}_alarm_snooze/config`] = {
+        name: `${Side} alarm snooze`,
+        unique_id: `${ID}_${side}_alarm_snooze`,
+        availability_topic: AVAIL,
+        payload_available: 'online',
+        payload_not_available: 'offline',
+        command_topic: `sleepypod/${ID}/cmd/snooze-alarm`,
+        payload_press: `{"side":"${side}","duration":300}`,
+        icon: 'mdi:alarm-snooze',
+        device: DEVICE,
+      }
+      expected[`homeassistant/button/${ID}/${side}_alarm_stop/config`] = {
+        name: `${Side} alarm stop`,
+        unique_id: `${ID}_${side}_alarm_stop`,
+        availability_topic: AVAIL,
+        payload_available: 'online',
+        payload_not_available: 'offline',
+        command_topic: `sleepypod/${ID}/cmd/stop-alarm`,
+        payload_press: `{"side":"${side}"}`,
+        icon: 'mdi:alarm-off',
+        device: DEVICE,
+      }
       expected[`homeassistant/sensor/${ID}/pump_${side}_rpm/config`] = sensorCfg({
         name: `${Side} pump RPM`,
         unique_id: `${ID}_pump_${side}_rpm`,
