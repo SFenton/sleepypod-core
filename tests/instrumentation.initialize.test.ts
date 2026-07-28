@@ -21,6 +21,8 @@ const mocks = vi.hoisted(() => ({
   getDacMonitor: vi.fn(async () => ({ getStatus: () => 'running' })),
   shutdownDacMonitor: vi.fn(async () => undefined),
   startDacServer: vi.fn(async () => undefined),
+  initializeAlarmLifecycle: vi.fn(async () => undefined),
+  shutdownAlarmLifecycle: vi.fn(),
   startPiezoStreamServer: vi.fn(),
   shutdownPiezoStreamServer: vi.fn(async () => undefined),
   startBonjourAnnouncement: vi.fn(),
@@ -76,6 +78,10 @@ vi.mock('@/src/hardware/dacMonitor.instance', () => ({
   getDacMonitor: mocks.getDacMonitor,
   shutdownDacMonitor: mocks.shutdownDacMonitor,
   startDacServer: mocks.startDacServer,
+}))
+vi.mock('@/src/hardware/snoozeManager', () => ({
+  initializeAlarmLifecycle: mocks.initializeAlarmLifecycle,
+  shutdownAlarmLifecycle: mocks.shutdownAlarmLifecycle,
 }))
 vi.mock('@/src/streaming/piezoStream', () => ({
   startPiezoStreamServer: mocks.startPiezoStreamServer,
@@ -136,6 +142,7 @@ beforeEach(() => {
   mocks.shutdownDacMonitor.mockResolvedValue(undefined)
   mocks.getDacMonitor.mockResolvedValue({ getStatus: () => 'running' } as never)
   mocks.startDacServer.mockResolvedValue(undefined)
+  mocks.initializeAlarmLifecycle.mockResolvedValue(undefined)
   mocks.startMqttBridge.mockResolvedValue(undefined)
   mocks.startHomeKitIfEnabled.mockResolvedValue(undefined)
   mocks.runMigrations.mockResolvedValue(undefined)
@@ -152,6 +159,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   delete process.env.CI
   delete process.env.NEXT_RUNTIME
   vi.useRealTimers()
@@ -177,6 +185,7 @@ describe('initializeScheduler — happy path', () => {
 
     expect(mocks.getJobManager).toHaveBeenCalled()
     expect(mocks.startDacServer).toHaveBeenCalled()
+    expect(mocks.initializeAlarmLifecycle).toHaveBeenCalled()
     expect(mocks.getDacMonitor).toHaveBeenCalled()
     expect(mocks.rehydratePumpStallGuard).toHaveBeenCalled()
     expect(mocks.initializeKeepalives).toHaveBeenCalled()
@@ -267,6 +276,26 @@ describe('initializeScheduler — error swallowing', () => {
     await new Promise(resolve => setImmediate(resolve))
     expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/DacMonitor failed/), expect.anything())
     warnSpy.mockRestore()
+  })
+
+  it('retries alarm lifecycle initialization independently after startup failures', async () => {
+    vi.useFakeTimers()
+    mocks.initializeAlarmLifecycle
+      .mockRejectedValueOnce(new Error('db busy 1'))
+      .mockRejectedValueOnce(new Error('db busy 2'))
+      .mockRejectedValueOnce(new Error('db busy 3'))
+      .mockResolvedValue(undefined)
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const { initializeScheduler } = await fresh()
+    const initialization = initializeScheduler()
+    await vi.runAllTimersAsync()
+    await initialization
+
+    expect(mocks.initializeAlarmLifecycle).toHaveBeenCalledTimes(4)
+    error.mockRestore()
+    warn.mockRestore()
   })
 
   it('logs and swallows when piezo stream server throws', async () => {

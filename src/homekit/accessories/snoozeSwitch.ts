@@ -5,14 +5,13 @@
 
 import { Service, Characteristic } from 'hap-nodejs'
 import {
-  cancelSnooze,
   getSnoozeStatus,
   snoozeAlarm,
+  stopAlarm,
 } from '@/src/hardware/snoozeManager'
-import { getSharedHardwareClient } from '@/src/hardware/dacMonitor.instance'
 import type { Side } from '@/src/hardware/types'
 
-const SNOOZE_SECONDS = 9 * 60
+const SNOOZE_SECONDS = 5 * 60
 const POLL_MS = 5_000
 
 export interface SnoozeSwitchAccessory {
@@ -32,21 +31,16 @@ export function buildSnoozeSwitch(side: Side): SnoozeSwitchAccessory {
     .onSet(async (value) => {
       const on = Number(value) === 1
       if (on) {
-        // Pull alarm-vibration off the bed and re-fire after the window.
-        try {
-          await getSharedHardwareClient().clearAlarm(side)
-        }
-        catch (e) {
-          console.warn(`[homekit] clearAlarm(${side}) failed during snooze:`, e instanceof Error ? e.message : e)
-        }
-        snoozeAlarm(side, SNOOZE_SECONDS, {
-          vibrationIntensity: 50,
-          vibrationPattern: 'rise',
-          duration: 60,
+        await snoozeAlarm(side, SNOOZE_SECONDS, {
+          fallbackConfig: {
+            vibrationIntensity: 50,
+            vibrationPattern: 'rise',
+            duration: 60,
+          },
         })
       }
       else {
-        cancelSnooze(side)
+        await stopAlarm(side)
       }
     })
 

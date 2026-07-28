@@ -1,6 +1,15 @@
-import { afterEach, describe, expect, test, vi } from 'vitest'
-import { CoverButtonActionHandler, type CoverButtonActionDeps, type CoverButtonEvent } from '../coverButtonActionHandler'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type { HardwareClient } from '../client'
+
+const alarmMock = vi.hoisted(() => ({
+  getAlarmStatus: vi.fn(() => ({ active: false, state: 'idle' })),
+  snoozeAlarm: vi.fn(),
+  stopAlarm: vi.fn(),
+}))
+
+vi.mock('../snoozeManager', () => alarmMock)
+
+import { CoverButtonActionHandler, type CoverButtonActionDeps, type CoverButtonEvent } from '../coverButtonActionHandler'
 
 const SOCKET_PATH = '/tmp/test-cover-button.sock'
 
@@ -49,6 +58,18 @@ const makeDeps = (
 }
 
 describe('CoverButtonActionHandler', () => {
+  beforeEach(() => {
+    alarmMock.getAlarmStatus.mockReset().mockReturnValue({ active: false, state: 'idle' })
+    alarmMock.snoozeAlarm.mockReset().mockImplementation(async (side, _duration, options) => {
+      await options.client.clearAlarm(side)
+      return { active: true, state: 'snoozed' }
+    })
+    alarmMock.stopAlarm.mockReset().mockImplementation(async (side, options) => {
+      await options.client.clearAlarm(side)
+      return { active: false, state: 'idle' }
+    })
+  })
+
   afterEach(() => {
     vi.clearAllTimers()
     vi.useRealTimers()
@@ -79,6 +100,37 @@ describe('CoverButtonActionHandler', () => {
     expect(vi.mocked(client.setTemperature).mock.invocationCallOrder[0]).toBeLessThan(
       recordTemperatureChange.mock.invocationCallOrder[0],
     )
+  })
+
+  test('increments temperature by HA target level when level step mode is enabled', async () => {
+    const action = {
+      actionType: 'temperature',
+      temperatureChange: 'increment',
+      temperatureAmount: 1,
+      temperatureStepMode: 'level',
+    }
+    const state = { targetTemperature: 74, isPowered: true, isAlarmVibrating: false }
+    const { deps, client, recordTemperatureChange } = makeDeps(action, state)
+
+    await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'top', 2))
+
+    expect(client.setTemperature).toHaveBeenCalledWith('left', 77)
+    expect(recordTemperatureChange).toHaveBeenCalledWith('left', 77)
+  })
+
+  test('decrements temperature by HA target level when level step mode is enabled', async () => {
+    const action = {
+      actionType: 'temperature',
+      temperatureChange: 'decrement',
+      temperatureAmount: 1,
+      temperatureStepMode: 'level',
+    }
+    const state = { targetTemperature: 77, isPowered: true, isAlarmVibrating: false }
+    const { deps, client } = makeDeps(action, state)
+
+    await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'bottom', 2))
+
+    expect(client.setTemperature).toHaveBeenCalledWith('left', 74)
   })
 
   test('ignores unsupported button tap counts', async () => {
@@ -189,27 +241,37 @@ describe('CoverButtonActionHandler', () => {
     expect(client.setAlarm).not.toHaveBeenCalled()
   })
 
-  test('snoozes active alarms and cleanup cancels restart', async () => {
-    vi.useFakeTimers()
-    const restartClient = makeMockClient()
+  test('routes active alarm snooze through the shared lifecycle controller', async () => {
     const action = { actionType: 'alarm', alarmBehavior: 'snooze', alarmSnoozeDuration: 60 }
     const state = { isAlarmVibrating: true, isPowered: true }
-    const newHardwareClient = vi.fn()
-      .mockReturnValueOnce(makeMockClient())
-      .mockReturnValueOnce(restartClient)
-    const deps: CoverButtonActionDeps = {
-      findActionConfig: vi.fn().mockResolvedValue(action),
-      findDeviceState: vi.fn().mockResolvedValue(state),
-      newHardwareClient,
-      triggerFeedbackHaptic: vi.fn().mockResolvedValue(undefined),
-    }
+    const { deps, client } = makeDeps(action, state)
 
     const handler = new CoverButtonActionHandler(SOCKET_PATH, deps)
     await handler.handle(makeEvent('right', 'middle', 2))
     handler.cleanup()
-    await vi.advanceTimersByTimeAsync(60_000)
 
-    expect(restartClient.setAlarm).not.toHaveBeenCalled()
+    expect(alarmMock.snoozeAlarm).toHaveBeenCalledWith('right', 60, {
+      client,
+      fallbackConfig: {
+        vibrationIntensity: 50,
+        vibrationPattern: 'rise',
+        duration: 180,
+      },
+    })
+    expect(client.clearAlarm).toHaveBeenCalledWith('right')
+    expect(client.setAlarm).not.toHaveBeenCalled()
+  })
+
+  test('stops a snoozed occurrence instead of running the inactive power action', async () => {
+    alarmMock.getAlarmStatus.mockReturnValue({ active: true, state: 'snoozed' })
+    const action = { actionType: 'alarm', alarmBehavior: 'dismiss', alarmInactiveBehavior: 'power' }
+    const state = { isAlarmVibrating: false, isPowered: false, targetTemperature: 70 }
+    const { deps, client } = makeDeps(action, state)
+
+    await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('right', 'middle', 2))
+
+    expect(alarmMock.stopAlarm).toHaveBeenCalledWith('right', { client })
+    expect(client.setPower).not.toHaveBeenCalled()
   })
 
   test('errors in execution do not throw', async () => {

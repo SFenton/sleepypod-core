@@ -28,6 +28,7 @@ import { startAutoOffWatcher, stopAutoOffWatcher } from '@/src/services/autoOffW
 import { startDatabaseIntegrityChecks, stopDatabaseIntegrityChecks } from '@/src/db/integrity'
 import { startPerformanceMonitoring, stopPerformanceMonitoring, recordStartupPhase } from '@/src/lib/serverPerformance'
 import { shutdownHomeKit, startHomeKitIfEnabled } from '@/src/homekit'
+import { initializeAlarmLifecycle, shutdownAlarmLifecycle } from '@/src/hardware/snoozeManager'
 
 let isInitialized = false
 let isShuttingDown = false
@@ -35,6 +36,9 @@ let handlersRegistered = false
 let initializationPromise: Promise<void> | null = null
 let hardwareReady = false
 let hardwarePromise: Promise<void> | null = null
+let alarmLifecycleRetryTimer: ReturnType<typeof setTimeout> | null = null
+
+const ALARM_LIFECYCLE_RETRY_MS = 5_000
 
 /**
  * Centralized graceful shutdown coordinator.
@@ -43,6 +47,11 @@ let hardwarePromise: Promise<void> | null = null
 async function gracefulShutdown(signal: string): Promise<void> {
   if (isShuttingDown) return
   isShuttingDown = true
+
+  if (alarmLifecycleRetryTimer) {
+    clearTimeout(alarmLifecycleRetryTimer)
+    alarmLifecycleRetryTimer = null
+  }
 
   console.log(`Received ${signal}, starting graceful shutdown...`)
 
@@ -122,6 +131,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   // Step 5: Shutdown DAC monitor
   try {
+    shutdownAlarmLifecycle()
     await shutdownDacMonitor()
   }
   catch (error) {
@@ -209,6 +219,25 @@ async function withRetry<T>(
   throw lastError
 }
 
+async function initializeAlarmLifecycleWithRecovery(): Promise<void> {
+  try {
+    await withRetry(
+      () => initializeAlarmLifecycle(),
+      'Alarm lifecycle initialization',
+    )
+  }
+  catch (error) {
+    console.error('Failed to initialize alarm lifecycle:', error)
+    if (isShuttingDown || alarmLifecycleRetryTimer) return
+
+    alarmLifecycleRetryTimer = setTimeout(() => {
+      alarmLifecycleRetryTimer = null
+      void initializeAlarmLifecycleWithRecovery()
+    }, ALARM_LIFECYCLE_RETRY_MS)
+    alarmLifecycleRetryTimer.unref?.()
+  }
+}
+
 /**
  * Validate hardware daemon connectivity on startup.
  * Logs a warning if unavailable but does not crash.
@@ -270,6 +299,9 @@ async function prepareHardware(): Promise<void> {
     console.warn('[DAC] Socket server failed to start:', error instanceof Error ? error.message : error)
   }
 
+  if (isShuttingDown) return
+
+  await initializeAlarmLifecycleWithRecovery()
   if (isShuttingDown) return
 
   // Start DAC monitor (non-blocking — waits for frankenfirmware to connect)
@@ -341,7 +373,6 @@ async function initializeBackgroundServices(): Promise<void> {
     }
 
     isInitialized = true
-
     // Initialize temperature keepalive timers for sides with alwaysOn enabled
     initializeKeepalives()
 

@@ -18,6 +18,7 @@ import {
 
 const timestampSchema = z.coerce.date()
 const feedbackVibrationDurationSchema = z.number().int().min(1).max(10)
+const temperatureStepModeSchema = z.enum(['degree', 'level'])
 const feedbackVibrationInputShape = {
   feedbackVibrationEnabled: z.boolean().optional(),
   feedbackVibrationIntensity: vibrationIntensitySchema.optional(),
@@ -71,6 +72,7 @@ const tapGestureSchema = z.object({
   actionType: z.enum(['temperature', 'alarm', 'power']),
   temperatureChange: z.enum(['increment', 'decrement']).nullable().optional(),
   temperatureAmount: z.number().nullable().optional(),
+  temperatureStepMode: temperatureStepModeSchema.nullable().optional(),
   powerBehavior: z.enum(['toggle', 'on', 'off']).nullable().optional(),
   alarmBehavior: z.enum(['snooze', 'dismiss']).nullable().optional(),
   alarmSnoozeDuration: z.number().nullable().optional(),
@@ -90,6 +92,7 @@ const coverButtonActionSchema = z.object({
   actionType: z.enum(['temperature', 'alarm', 'power']),
   temperatureChange: z.enum(['increment', 'decrement']).nullable().optional(),
   temperatureAmount: z.number().nullable().optional(),
+  temperatureStepMode: temperatureStepModeSchema.nullable().optional(),
   powerBehavior: z.enum(['toggle', 'on', 'off']).nullable().optional(),
   alarmBehavior: z.enum(['snooze', 'dismiss']).nullable().optional(),
   alarmSnoozeDuration: z.number().nullable().optional(),
@@ -737,6 +740,7 @@ export const settingsRouter = router({
             actionType: z.literal('temperature'),
             temperatureChange: z.enum(['increment', 'decrement']),
             temperatureAmount: z.number().int().min(0).max(10),
+            temperatureStepMode: temperatureStepModeSchema.optional().default('level'),
             ...feedbackVibrationInputShape,
           })
           .strict(),
@@ -777,6 +781,7 @@ export const settingsRouter = router({
             actionType: input.actionType,
             temperatureChange: input.actionType === 'temperature' ? input.temperatureChange : null,
             temperatureAmount: input.actionType === 'temperature' ? input.temperatureAmount : null,
+            temperatureStepMode: input.actionType === 'temperature' ? input.temperatureStepMode : null,
             powerBehavior: input.actionType === 'power' ? input.powerBehavior : null,
             alarmBehavior: input.actionType === 'alarm' ? input.alarmBehavior : null,
             alarmSnoozeDuration: input.actionType === 'alarm' ? input.alarmSnoozeDuration ?? null : null,
@@ -868,6 +873,7 @@ export const settingsRouter = router({
             actionType: z.literal('temperature'),
             temperatureChange: z.enum(['increment', 'decrement']),
             temperatureAmount: z.number().int().min(0).max(10),
+            temperatureStepMode: temperatureStepModeSchema.optional().default('level'),
             ...feedbackVibrationInputShape,
           })
           .strict(),
@@ -919,6 +925,7 @@ export const settingsRouter = router({
             actionType: input.actionType,
             temperatureChange: input.actionType === 'temperature' ? input.temperatureChange : null,
             temperatureAmount: input.actionType === 'temperature' ? input.temperatureAmount : null,
+            temperatureStepMode: input.actionType === 'temperature' ? input.temperatureStepMode : null,
             powerBehavior: input.actionType === 'power' ? input.powerBehavior : null,
             alarmBehavior: input.actionType === 'alarm' ? input.alarmBehavior : null,
             alarmSnoozeDuration: input.actionType === 'alarm' ? input.alarmSnoozeDuration ?? null : null,

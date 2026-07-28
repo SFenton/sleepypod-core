@@ -27,8 +27,10 @@ const primeMock = vi.hoisted(() => {
 
 const alarmMock = vi.hoisted(() => {
   const state: { left: boolean, right: boolean } = { left: false, right: false }
-  const getAlarmState = vi.fn(() => state)
-  return { state, getAlarmState }
+  const getAlarmStatus = vi.fn((side: 'left' | 'right') => ({
+    state: state[side] ? 'ringing' : 'idle',
+  }))
+  return { state, getAlarmStatus }
 })
 
 const stallMock = vi.hoisted(() => {
@@ -58,15 +60,12 @@ vi.mock('@/src/hardware/primeNotification', () => ({
   getPrimeCompletedAt: primeMock.getPrimeCompletedAt,
 }))
 
-vi.mock('@/src/hardware/deviceStateSync', () => ({
-  getAlarmState: alarmMock.getAlarmState,
-}))
-
 vi.mock('@/src/hardware/pumpStallNotification', () => ({
   getAllPumpStallNotices: stallMock.getAllPumpStallNotices,
 }))
 
 vi.mock('@/src/hardware/snoozeManager', () => ({
+  getAlarmStatus: alarmMock.getAlarmStatus,
   getSnoozeStatus: snoozeMock.getSnoozeStatus,
 }))
 
@@ -98,8 +97,8 @@ beforeEach(() => {
   dacMock.getDacMonitorIfRunning.mockClear()
   piezoMock.broadcastFrame.mockClear()
   primeMock.getPrimeCompletedAt.mockClear()
-  alarmMock.getAlarmState.mockClear()
   stallMock.getAllPumpStallNotices.mockClear()
+  alarmMock.getAlarmStatus.mockClear()
   snoozeMock.getSnoozeStatus.mockClear()
   warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 })

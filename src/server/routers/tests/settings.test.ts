@@ -49,8 +49,9 @@ const dbState = vi.hoisted(() => ({
   // Sequential queue for db.update().set().where() awaitable result (lifecycle revert path)
   topUpdateQueue: [] as Array<unknown>,
   // Recorded .set(payload) arguments so tests can pin what actually gets written
-  txSetCalls: [] as unknown[],
   topSetCalls: [] as unknown[],
+  txValuesCalls: [] as unknown[],
+  txSetCalls: [] as unknown[],
   popTop(): unknown[] { return dbState.topRowsQueue.shift() ?? [] },
   popTx(): unknown[] { return dbState.txRowsQueue.shift() ?? [] },
 }))
@@ -76,9 +77,12 @@ const dbMock = vi.hoisted(() => {
     chain.where = vi.fn(() => chain)
     chain.limit = vi.fn(() => chain)
     chain.from = vi.fn(() => chain)
-    chain.values = vi.fn(() => chain)
-    chain.set = vi.fn((payload: unknown) => {
-      dbState.txSetCalls.push(payload)
+    chain.values = vi.fn((value: unknown) => {
+      dbState.txValuesCalls.push(value)
+      return chain
+    })
+    chain.set = vi.fn((value: unknown) => {
+      dbState.txSetCalls.push(value)
       return chain
     })
     chain.returning = vi.fn(() => chain)
@@ -135,8 +139,9 @@ beforeEach(() => {
   homekitMock.disable.mockReset().mockResolvedValue(undefined)
   dbState.topRowsQueue.length = 0
   dbState.txRowsQueue.length = 0
-  dbState.txSetCalls.length = 0
   dbState.topSetCalls.length = 0
+  dbState.txValuesCalls.length = 0
+  dbState.txSetCalls.length = 0
   dbMock.select.mockClear()
   dbMock.update.mockClear()
   dbMock.transaction.mockClear()
@@ -557,6 +562,29 @@ describe('settings.setGesture / deleteGesture', () => {
       temperatureAmount: 2,
     })
     expect(out.id).toBe(1)
+    expect(dbState.txValuesCalls[0]).toMatchObject({ temperatureStepMode: 'level' })
+  })
+
+  it('persists custom degree-step temperature gestures', async () => {
+    const created = {
+      id: 2, side: 'left', button: 'bottom', tapType: 'doubleTap', actionType: 'temperature',
+      temperatureChange: 'decrement', temperatureAmount: 2, temperatureStepMode: 'degree',
+      createdAt: new Date(0), updatedAt: new Date(0),
+    }
+    dbState.txRowsQueue.push([], [created])
+
+    const out = await caller.setGesture({
+      side: 'left',
+      button: 'bottom',
+      tapType: 'doubleTap',
+      actionType: 'temperature',
+      temperatureChange: 'decrement',
+      temperatureAmount: 2,
+      temperatureStepMode: 'degree',
+    })
+
+    expect(out.temperatureStepMode).toBe('degree')
+    expect(dbState.txValuesCalls[0]).toMatchObject({ temperatureStepMode: 'degree' })
   })
 
   it('updates an alarm gesture when the same button/tap already exists', async () => {
@@ -626,6 +654,7 @@ describe('settings.setCoverButtonAction', () => {
       temperatureAmount: 1,
     })
     expect(out.id).toBe(1)
+    expect(dbState.txValuesCalls[0]).toMatchObject({ temperatureStepMode: 'level' })
   })
 
   it('rejects center cover button actions', async () => {
@@ -932,8 +961,8 @@ describe('settings.getAll — defaults and partitioning', () => {
 
   it('routes each gesture to the bucket matching its own side', async () => {
     const gestures = [
-      { id: 1, side: 'left', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
-      { id: 2, side: 'right', tapType: 'doubleTap', actionType: 'alarm', alarmBehavior: 'snooze', createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: 1, side: 'left', button: 'surface', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: 2, side: 'right', button: 'surface', tapType: 'doubleTap', actionType: 'alarm', alarmBehavior: 'snooze', createdAt: new Date(0), updatedAt: new Date(0) },
     ]
     dbState.topRowsQueue.push([{ ...baseDevice }], [baseSide, baseRightSide], gestures)
     const result = await caller.getAll({})
@@ -1188,9 +1217,9 @@ describe('settings.setAlwaysOn — write payload and error surface', () => {
 
 describe('settings.setGesture — write payload and error surface', () => {
   it('writes the merged gesture payload when updating an existing row', async () => {
-    const existing = { id: 5, side: 'left', tapType: 'doubleTap' }
+    const existing = { id: 5, side: 'left', button: 'surface', tapType: 'doubleTap' }
     const updated = {
-      id: 5, side: 'left', tapType: 'doubleTap', actionType: 'alarm',
+      id: 5, side: 'left', button: 'surface', tapType: 'doubleTap', actionType: 'alarm',
       alarmBehavior: 'snooze', createdAt: new Date(0), updatedAt: new Date(0),
     }
     dbState.txRowsQueue.push([existing], [updated])
@@ -1203,9 +1232,20 @@ describe('settings.setGesture — write payload and error surface', () => {
     })
     expect(dbState.txSetCalls).toEqual([{
       side: 'left',
+      button: 'surface',
       tapType: 'doubleTap',
       actionType: 'alarm',
+      temperatureChange: null,
+      temperatureAmount: null,
+      temperatureStepMode: null,
+      powerBehavior: null,
       alarmBehavior: 'snooze',
+      alarmSnoozeDuration: null,
+      alarmInactiveBehavior: null,
+      feedbackVibrationEnabled: false,
+      feedbackVibrationIntensity: null,
+      feedbackVibrationPattern: null,
+      feedbackVibrationDuration: null,
       updatedAt: expect.any(Date),
     }])
   })
@@ -1241,7 +1281,7 @@ describe('settings.deleteGesture — error surface', () => {
     dbState.txRowsQueue.push([])
     await expect(caller.deleteGesture({ side: 'left', tapType: 'doubleTap' })).rejects.toMatchObject({
       code: 'NOT_FOUND',
-      message: 'Gesture for left doubleTap not found',
+      message: 'Gesture for left surface doubleTap not found',
     })
   })
 

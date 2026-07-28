@@ -15,8 +15,7 @@ import { getDacMonitorIfRunning } from '@/src/hardware/dacMonitor.instance'
 import { broadcastFrame } from './piezoStream'
 import { getPrimeCompletedAt } from '@/src/hardware/primeNotification'
 import { getAllPumpStallNotices } from '@/src/hardware/pumpStallNotification'
-import { getAlarmState } from '@/src/hardware/deviceStateSync'
-import { getSnoozeStatus } from '@/src/hardware/snoozeManager'
+import { getAlarmStatus, getSnoozeStatus } from '@/src/hardware/snoozeManager'
 
 export function broadcastMutationStatus(
   side?: 'left' | 'right',
@@ -28,10 +27,11 @@ export function broadcastMutationStatus(
     if (!lastStatus) return
 
     const primeCompletedAt = getPrimeCompletedAt()
-    const alarmState = getAlarmState()
     const stallNotices = getAllPumpStallNotices()
-    const leftSide = { ...lastStatus.leftSide, isAlarmVibrating: alarmState.left }
-    const rightSide = { ...lastStatus.rightSide, isAlarmVibrating: alarmState.right }
+    const leftAlarm = getAlarmStatus('left')
+    const rightAlarm = getAlarmStatus('right')
+    const leftSide = { ...lastStatus.leftSide, isAlarmVibrating: leftAlarm.state === 'ringing' }
+    const rightSide = { ...lastStatus.rightSide, isAlarmVibrating: rightAlarm.state === 'ringing' }
 
     if (side && sideOverlay) {
       if (side === 'left') Object.assign(leftSide, sideOverlay)

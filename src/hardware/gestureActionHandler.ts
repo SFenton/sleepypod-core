@@ -4,6 +4,7 @@ import type { GestureEvent } from './dacMonitor'
 import { getAutomationEngineIfRunning } from '@/src/automation'
 import { shouldBlock as pumpStallShouldBlock } from './pumpStallGuard'
 import { withSideLock } from '@/src/hardware/sideLock'
+import { getAlarmStatus, snoozeAlarm, stopAlarm } from './snoozeManager'
 
 // Re-export for callers that need to build deps
 export type { GestureActionDeps }
@@ -49,7 +50,6 @@ interface GestureActionDeps {
  */
 export class GestureActionHandler {
   private readonly deps: GestureActionDeps
-  private readonly snoozeTimeouts: Set<ReturnType<typeof setTimeout>> = new Set()
 
   constructor(
     private readonly socketPath: string,
@@ -70,16 +70,7 @@ export class GestureActionHandler {
     }
   }
 
-  /**
-   * Cancel all pending snooze restart timers.
-   * Call this during application shutdown to allow clean process exit.
-   */
-  cleanup = (): void => {
-    for (const id of this.snoozeTimeouts) {
-      clearTimeout(id)
-    }
-    this.snoozeTimeouts.clear()
-  }
+  cleanup = (): void => {}
 
   private execute = async (event: GestureEvent): Promise<void> => {
     const gesture = await this.deps.findGestureConfig(event.side, event.tapType)
@@ -130,40 +121,25 @@ export class GestureActionHandler {
     gesture: TapGestureRow
   ): Promise<void> => {
     const state = await this.deps.findDeviceState(event.side)
-    const isAlarmVibrating = state?.isAlarmVibrating ?? false
+    const alarmActive = getAlarmStatus(event.side).active || (state?.isAlarmVibrating ?? false)
 
-    if (isAlarmVibrating) {
+    if (alarmActive) {
       const client = this.deps.newHardwareClient(this.socketPath)
       try {
         await client.connect()
 
         if (gesture.alarmBehavior === 'dismiss') {
-          await client.clearAlarm(event.side)
-          // Lazy import to avoid circular dep chain (snoozeManager → dacMonitor.instance → db)
-          const { cancelSnooze } = await import('./snoozeManager')
-          cancelSnooze(event.side)
+          await stopAlarm(event.side, { client })
         }
         else if (gesture.alarmBehavior === 'snooze') {
-          await client.clearAlarm(event.side)
-          // Clamp to setTimeout's 32-bit ms ceiling — a larger delay wraps
-          // and fires immediately, restarting the alarm the user snoozed.
-          const snoozeDuration = Math.min(
-            gesture.alarmSnoozeDuration ?? 300,
-            Math.floor((2 ** 31 - 1) / 1000),
-          )
-          const timeoutId = setTimeout(() => {
-            this.snoozeTimeouts.delete(timeoutId)
-            const restartClient = this.deps.newHardwareClient(this.socketPath)
-            restartClient.connect()
-              .then(() => restartClient.setAlarm(event.side, {
-                vibrationIntensity: 50,
-                vibrationPattern: 'rise',
-                duration: 180,
-              }))
-              .catch(err => console.error('GestureActionHandler: snooze restart failed:', err))
-              .finally(() => restartClient.disconnect())
-          }, snoozeDuration * 1000)
-          this.snoozeTimeouts.add(timeoutId)
+          await snoozeAlarm(event.side, gesture.alarmSnoozeDuration ?? 300, {
+            client,
+            fallbackConfig: {
+              vibrationIntensity: 50,
+              vibrationPattern: 'rise',
+              duration: 180,
+            },
+          })
         }
       }
       finally {

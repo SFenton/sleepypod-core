@@ -99,12 +99,13 @@ class FakeDeviceStateSync {
   recordFlowData = stateSyncRecordFlowMock
 }
 
-const cancelSnoozeMock = vi.fn<(side: 'left' | 'right') => void>()
 const resetPrimingStateMock = vi.fn()
 const trackPrimingStateMock = vi.fn<(priming: boolean) => void>()
 const getPrimeCompletedAtMock = vi.fn(() => null as number | null)
 const getAllPumpStallNoticesMock = vi.fn<() => { left: unknown, right: unknown }>(() => ({ left: null, right: null }))
-const getAlarmStateMock = vi.fn(() => ({ left: false, right: false }))
+const getAlarmStatusMock = vi.fn<(side: 'left' | 'right') => { state: 'idle' | 'ringing' }>(
+  () => ({ state: 'idle' }),
+)
 const getSnoozeStatusMock = vi.fn<(side: 'left' | 'right') => { active: boolean, snoozeUntil: number | null }>(
   () => ({ active: false, snoozeUntil: null }),
 )
@@ -143,7 +144,6 @@ vi.mock('../coverButtonActionHandler.deps', () => ({
 
 vi.mock('../deviceStateSync', () => ({
   DeviceStateSync: FakeDeviceStateSync,
-  getAlarmState: () => getAlarmStateMock(),
 }))
 
 vi.mock('../primeNotification', () => ({
@@ -157,7 +157,7 @@ vi.mock('../pumpStallNotification', () => ({
 }))
 
 vi.mock('../snoozeManager', () => ({
-  cancelSnooze: (side: 'left' | 'right') => cancelSnoozeMock(side),
+  getAlarmStatus: (side: 'left' | 'right') => getAlarmStatusMock(side),
   getSnoozeStatus: (side: 'left' | 'right') => getSnoozeStatusMock(side),
 }))
 
@@ -223,12 +223,11 @@ describe('hardware/dacMonitor.instance', () => {
     coverButtonHandleMock.mockClear()
     stateSyncSyncMock.mockReset().mockResolvedValue(undefined)
     stateSyncRecordFlowMock.mockClear()
-    cancelSnoozeMock.mockClear()
     resetPrimingStateMock.mockClear()
     trackPrimingStateMock.mockClear()
     getPrimeCompletedAtMock.mockReset().mockReturnValue(null)
     getAllPumpStallNoticesMock.mockReset().mockReturnValue({ left: null, right: null })
-    getAlarmStateMock.mockReset().mockReturnValue({ left: false, right: false })
+    getAlarmStatusMock.mockReset().mockReturnValue({ state: 'idle' })
     getSnoozeStatusMock.mockReset().mockReturnValue({ active: false, snoozeUntil: null })
     broadcastFrameMock.mockClear()
     onServerFrameMock.mockReset().mockImplementation(() => () => {})
@@ -564,6 +563,9 @@ describe('hardware/dacMonitor.instance', () => {
       await mod.getDacMonitor()
       await flushMicrotasks()
       const monitor = monitorInstances[0]
+      getAlarmStatusMock.mockImplementation(side => ({
+        state: side === 'right' ? 'ringing' : 'idle',
+      }))
 
       const status: DeviceStatus = parseDeviceStatusMock('raw') // shape from default mock
       const beforeCalls = broadcastFrameMock.mock.calls.length
@@ -575,12 +577,20 @@ describe('hardware/dacMonitor.instance', () => {
       // Allow for frames already emitted during init wiring; require at least
       // one additional broadcast triggered by the emit above.
       expect(broadcastFrameMock.mock.calls.length).toBeGreaterThan(beforeCalls)
+      const lastFrame = broadcastFrameMock.mock.calls.at(-1)?.[0] as {
+        leftSide: { isAlarmVibrating: boolean }
+        rightSide: { isAlarmVibrating: boolean }
+      }
+      expect(lastFrame.leftSide.isAlarmVibrating).toBe(false)
+      expect(lastFrame.rightSide.isAlarmVibrating).toBe(true)
     })
 
     it('broadcasts the exact deviceStatus frame with alarm and snooze state', async () => {
       const mod = await freshModule()
       vi.spyOn(Date, 'now').mockReturnValue(1_720_000_123_456)
-      getAlarmStateMock.mockReturnValue({ left: true, right: false })
+      getAlarmStatusMock.mockImplementation(side => ({
+        state: side === 'left' ? 'ringing' : 'idle',
+      }))
       getSnoozeStatusMock.mockImplementation(side => side === 'left'
         ? { active: true, snoozeUntil: 123 }
         : { active: false, snoozeUntil: null })
@@ -782,8 +792,6 @@ describe('hardware/dacMonitor.instance', () => {
       expect(monitor.removeAllListeners).toHaveBeenCalledWith('status:updated')
       expect(gestureCleanupMock).toHaveBeenCalled()
       expect(disconnectDacMock).toHaveBeenCalled()
-      expect(cancelSnoozeMock).toHaveBeenCalledWith('left')
-      expect(cancelSnoozeMock).toHaveBeenCalledWith('right')
       expect(resetPrimingStateMock).toHaveBeenCalled()
       expect(mod.getDacServer()).toBeNull()
       expect(mod.getDacMonitorIfRunning()).toBeNull()

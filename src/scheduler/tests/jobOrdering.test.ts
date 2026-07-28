@@ -36,6 +36,21 @@ vi.mock('@/src/streaming/broadcastMutationStatus', () => ({
   broadcastMutationStatus: (side: 'left' | 'right', patch: Record<string, unknown>) => broadcastMutationStatus(side, patch),
 }))
 
+vi.mock('@/src/hardware/snoozeManager', () => ({
+  startAlarm: async (
+    side: 'left' | 'right',
+    config: { vibrationIntensity: number, vibrationPattern: 'double' | 'rise', duration: number },
+    options: { client: { setAlarm: AnyAsync }, broadcastOverlay?: Record<string, unknown> },
+  ) => {
+    await options.client.setAlarm(side, config)
+    broadcastMutationStatus(side, {
+      ...options.broadcastOverlay,
+      isAlarmVibrating: true,
+    })
+    return { state: 'ringing', active: true }
+  },
+}))
+
 const cancelAutoOffTimer = vi.fn<(side: 'left' | 'right') => void>()
 vi.mock('@/src/services/autoOffWatcher', () => ({
   cancelAutoOffTimer: (side: 'left' | 'right') => cancelAutoOffTimer(side),
@@ -100,6 +115,15 @@ function resetSchema(): void {
       target_temperature REAL,
       is_powered INTEGER NOT NULL DEFAULT 0,
       is_alarm_vibrating INTEGER NOT NULL DEFAULT 0,
+      alarm_state TEXT NOT NULL DEFAULT 'idle',
+      alarm_occurrence_id TEXT,
+      alarm_schedule_id INTEGER,
+      alarm_scheduled_for INTEGER,
+      alarm_snoozed_until INTEGER,
+      alarm_ringing_until INTEGER,
+      alarm_vibration_intensity INTEGER,
+      alarm_vibration_pattern TEXT,
+      alarm_duration INTEGER,
       water_level TEXT DEFAULT 'unknown',
       powered_on_at INTEGER,
       last_updated INTEGER NOT NULL DEFAULT (unixepoch())

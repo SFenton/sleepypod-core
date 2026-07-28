@@ -35,7 +35,8 @@ const primeMock = vi.hoisted(() => ({
 
 const snoozeMock = vi.hoisted(() => ({
   snoozeAlarm: vi.fn(),
-  cancelSnooze: vi.fn(),
+  startAlarm: vi.fn(),
+  stopAlarm: vi.fn(),
   getSnoozeStatus: vi.fn<(side?: string) => { active: boolean, snoozeUntil: number | null }>(() => ({ active: false, snoozeUntil: null })),
 }))
 
@@ -199,7 +200,54 @@ beforeEach(() => {
   primeMock.getPrimeCompletedAt.mockReset().mockReturnValue(null)
   primeMock.dismissPrimeNotification.mockReset()
   snoozeMock.snoozeAlarm.mockReset()
-  snoozeMock.cancelSnooze.mockReset()
+  snoozeMock.startAlarm.mockReset().mockImplementation(async (side, config, options) => {
+    await options.client.setAlarm(side, config)
+    broadcastMock.broadcastMutationStatus(side, { isAlarmVibrating: true })
+    return {
+      state: 'ringing',
+      active: true,
+      occurrenceId: 'manual-test',
+      scheduleId: null,
+      scheduledFor: 1,
+      snoozeUntil: null,
+      ringingUntil: 2,
+      vibrationIntensity: config.vibrationIntensity,
+      vibrationPattern: config.vibrationPattern,
+      duration: config.duration,
+    }
+  })
+  snoozeMock.stopAlarm.mockReset().mockImplementation(async (side, options) => {
+    await options.client.clearAlarm(side)
+    broadcastMock.broadcastMutationStatus(side, { isAlarmVibrating: false })
+    return {
+      state: 'idle',
+      active: false,
+      occurrenceId: null,
+      scheduleId: null,
+      scheduledFor: null,
+      snoozeUntil: null,
+      ringingUntil: null,
+      vibrationIntensity: null,
+      vibrationPattern: null,
+      duration: null,
+    }
+  })
+  snoozeMock.snoozeAlarm.mockImplementation(async (side, _duration, options) => {
+    await options.client.clearAlarm(side)
+    broadcastMock.broadcastMutationStatus(side, { isAlarmVibrating: false })
+    return {
+      state: 'snoozed',
+      active: true,
+      occurrenceId: 'manual-test',
+      scheduleId: null,
+      scheduledFor: 1,
+      snoozeUntil: 1_700_000_000,
+      ringingUntil: null,
+      vibrationIntensity: options.fallbackConfig.vibrationIntensity,
+      vibrationPattern: options.fallbackConfig.vibrationPattern,
+      duration: options.fallbackConfig.duration,
+    }
+  })
   snoozeMock.getSnoozeStatus.mockReset().mockReturnValue({ active: false, snoozeUntil: null })
   broadcastMock.broadcastMutationStatus.mockReset()
   transportMock.sendCommand.mockReset()
@@ -959,50 +1007,52 @@ describe('device.setAlarm / clearAlarm / snoozeAlarm', () => {
       duration: 60,
     })
 
-    expect(snoozeMock.cancelSnooze).toHaveBeenCalledWith('left')
+    expect(snoozeMock.startAlarm).toHaveBeenCalledWith(
+      'left',
+      {
+        vibrationIntensity: 50,
+        vibrationPattern: 'rise',
+        duration: 60,
+      },
+      { client: helpersMock.client },
+    )
     expect(helpersMock.client.setAlarm).toHaveBeenCalledWith('left', {
       vibrationIntensity: 50,
       vibrationPattern: 'rise',
       duration: 60,
     })
     expect(broadcastMock.broadcastMutationStatus).toHaveBeenCalledWith('left', { isAlarmVibrating: true })
-    expect(dbChain('update').set).toHaveBeenCalledWith({
-      isAlarmVibrating: true,
-      lastUpdated: expect.any(Date),
-    })
     expect(helpersMock.withHardwareClient.mock.calls[0]?.[1]).toBe('Failed to set alarm')
   })
 
   it('clearAlarm hits hardware and broadcasts vibrating=false', async () => {
     await caller.clearAlarm({ side: 'right' })
+    expect(snoozeMock.stopAlarm).toHaveBeenCalledWith('right', { client: helpersMock.client })
     expect(helpersMock.client.clearAlarm).toHaveBeenCalledWith('right')
     expect(broadcastMock.broadcastMutationStatus).toHaveBeenCalledWith('right', { isAlarmVibrating: false })
-    expect(dbChain('update').set).toHaveBeenCalledWith({
-      isAlarmVibrating: false,
-      lastUpdated: expect.any(Date),
-    })
     expect(helpersMock.withHardwareClient.mock.calls[0]?.[1]).toBe('Failed to clear alarm')
   })
 
   it('snoozeAlarm clears alarm + invokes snoozeManager and returns timestamp', async () => {
-    const snoozeUntil = new Date(1700000000000)
-    snoozeMock.snoozeAlarm.mockReturnValue(snoozeUntil)
-
     const result = await caller.snoozeAlarm({ side: 'left', duration: 300 })
     expect(helpersMock.client.clearAlarm).toHaveBeenCalledWith('left')
-    expect(snoozeMock.snoozeAlarm).toHaveBeenCalledTimes(1)
-    expect(result.success).toBe(true)
-    expect(result.snoozeUntil).toBe(Math.floor(snoozeUntil.getTime() / 1000))
     expect(snoozeMock.snoozeAlarm).toHaveBeenCalledWith('left', 300, {
-      vibrationIntensity: 50,
-      vibrationPattern: 'rise',
-      duration: 120,
+      client: helpersMock.client,
+      fallbackConfig: {
+        vibrationIntensity: 50,
+        vibrationPattern: 'rise',
+        duration: 120,
+      },
     })
-    expect(dbChain('update').set).toHaveBeenCalledWith({
-      isAlarmVibrating: false,
-      lastUpdated: expect.any(Date),
+    expect(result.success).toBe(true)
+    expect(result.snoozeUntil).toBe(1_700_000_000)
+  })
+
+  it('rejects snooze when no alarm occurrence is active', async () => {
+    snoozeMock.snoozeAlarm.mockResolvedValueOnce(null)
+    await expect(caller.snoozeAlarm({ side: 'left', duration: 300 })).rejects.toMatchObject({
+      code: 'PRECONDITION_FAILED',
     })
-    expect(helpersMock.withHardwareClient.mock.calls[0]?.[1]).toBe('Failed to snooze alarm')
   })
 })
 
@@ -1218,52 +1268,5 @@ describe('device.execute (raw command)', () => {
     sharedClientMock.sendRaw.mockResolvedValue('ok')
     await expect(caller.execute({ command: 'SET_TEMP', args: '50' })).rejects.toThrow(/Pump stall protection active/)
     expect(sharedClientMock.sendRaw).not.toHaveBeenCalled()
-  })
-})
-
-describe('device best-effort DB sync swallows errors', () => {
-  beforeEach(() => {
-    // Make `db.update(...)...` chain reject so the catch path fires.
-    const failingChain = () => {
-      const chain: Record<string, unknown> = {}
-      chain.then = (_resolve: unknown, reject: (reason: unknown) => unknown) =>
-        Promise.reject(new Error('db dead')).catch(reject)
-      chain.where = vi.fn(() => chain)
-      chain.set = vi.fn(() => chain)
-      return chain
-    }
-    dbMock.update.mockImplementation(failingChain)
-  })
-
-  it('setAlarm logs but still broadcasts when the DB sync fails', async () => {
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const result = await caller.setAlarm({
-      side: 'left', vibrationIntensity: 50, vibrationPattern: 'rise', duration: 120,
-    })
-    expect(result).toEqual({ success: true })
-    expect(broadcastMock.broadcastMutationStatus).toHaveBeenCalledWith('left', { isAlarmVibrating: true })
-    expect(errSpy).toHaveBeenCalledWith('Failed to sync alarm state to DB:', expect.any(Error))
-    errSpy.mockRestore()
-  })
-
-  it('clearAlarm logs but still broadcasts when the DB sync fails', async () => {
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const result = await caller.clearAlarm({ side: 'right' })
-    expect(result).toEqual({ success: true })
-    expect(broadcastMock.broadcastMutationStatus).toHaveBeenCalledWith('right', { isAlarmVibrating: false })
-    expect(errSpy).toHaveBeenCalledWith('Failed to sync alarm clear state to DB:', expect.any(Error))
-    errSpy.mockRestore()
-  })
-
-  it('snoozeAlarm logs but still broadcasts when the DB sync fails', async () => {
-    snoozeMock.snoozeAlarm.mockReturnValue(new Date(1700000000000))
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const result = await caller.snoozeAlarm({
-      side: 'left', duration: 300, vibrationIntensity: 50, vibrationPattern: 'rise', alarmDuration: 120,
-    })
-    expect(result.success).toBe(true)
-    expect(broadcastMock.broadcastMutationStatus).toHaveBeenCalledWith('left', { isAlarmVibrating: false })
-    expect(errSpy).toHaveBeenCalledWith('Failed to sync snooze state to DB:', expect.any(Error))
-    errSpy.mockRestore()
   })
 })
