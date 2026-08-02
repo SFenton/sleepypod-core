@@ -47,6 +47,7 @@ export const SUBSCRIBE_SUBJECTS = ['raw.sens.>', 'raw.frz.>'] as const
 // exit just because NATS blipped.)
 const MAX_RECONNECT_ATTEMPTS = -1
 const RECONNECT_TIME_WAIT_MS = 2_000
+const INITIAL_CONNECT_TIMEOUT_MS = 2_000
 const PROBE_TIMEOUT_MS = 2_000
 const PROBE_MAX_GREETING_BYTES = 16 * 1024
 // A live pod ticks capSense at 2 Hz, so a subscription silent this long past
@@ -155,9 +156,10 @@ async function connectNats(host: string, port: number): Promise<NatsConnection> 
     name: 'sleepypod-sensor-stream',
     maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
     reconnectTimeWait: RECONNECT_TIME_WAIT_MS,
-    // Bounds the very first handshake so a wedged server can't hang startup;
-    // the reachability probe already gated us here so this rarely bites.
-    waitOnFirstConnect: true,
+    // Reject a probe/connect race promptly so source selection can retry NATS
+    // on required firmware or choose RAW on confirmed legacy firmware.
+    waitOnFirstConnect: false,
+    timeout: INITIAL_CONNECT_TIMEOUT_MS,
   })
 }
 

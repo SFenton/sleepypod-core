@@ -174,14 +174,15 @@ describe('startNatsFrameSource', () => {
     nats.connect.mockClear()
   })
 
-  it('subscribes to the sensor subjects with infinite reconnect', async () => {
+  it('bounds the first connection and keeps infinite reconnect after success', async () => {
     const onFrame = vi.fn()
     await startNatsFrameSource({ decode, onFrame })
     expect(nats.state.subs.map(s => s.subject)).toEqual([...SUBSCRIBE_SUBJECTS])
     expect(nats.state.connectOpts).toMatchObject({
       servers: '127.0.0.1:4222',
       maxReconnectAttempts: -1,
-      waitOnFirstConnect: true,
+      waitOnFirstConnect: false,
+      timeout: 2_000,
     })
   })
 
