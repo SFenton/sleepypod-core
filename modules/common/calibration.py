@@ -208,6 +208,16 @@ class CalibrationStore:
                  duration_ms, triggered_by, error, int(time.time())),
             )
 
+    def prune_runs(self, created_before: int) -> int:
+        """Delete calibration audit rows older than the retention cutoff."""
+        conn = self._get_conn()
+        with conn:
+            cursor = conn.execute(
+                "DELETE FROM calibration_runs WHERE created_at < ?",
+                (created_before,),
+            )
+        return cursor.rowcount
+
     def get_profile_age_hours(self, side: str, sensor_type: str) -> Optional[float]:
         """Hours since last completed calibration, or None if never calibrated."""
         profile = self.get_active(side, sensor_type)

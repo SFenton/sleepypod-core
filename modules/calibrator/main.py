@@ -53,11 +53,12 @@ DAILY_HOUR = int(os.environ.get("CALIBRATION_HOUR", "6"))  # 06:00 UTC
 
 CAL_SIDES = ("left", "right")
 CAL_SENSOR_TYPES = ("capacitance", "piezo", "temperature")
-# How often to re-attempt still-missing/failed profiles. On a NATS-only pod
-# the live buffer starts empty, so the first capacitance/piezo attempt fails
-# ("No capSense records available"); it must retry as samples accrue rather
-# than persist that one-shot failure until the next process restart.
-CAL_RETRY_INTERVAL_S = 60
+# Missing profiles retry quickly while a new NATS buffer warms, then back off
+# so disconnected sensors cannot append six failed audit rows every minute.
+CAL_RETRY_INITIAL_S = 60
+CAL_RETRY_MAX_S = 3600
+CAL_RUN_RETENTION_S = 30 * 86400
+CAL_RUN_PRUNE_INTERVAL_S = 86400
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -253,6 +254,13 @@ def run_pending_calibrations(store: CalibrationStore, now: float,
     return compute_pending(store, time.time())
 
 
+def next_retry_interval(current: float, remaining: set) -> float:
+    """Reset after success; otherwise exponentially back off to one hour."""
+    if not remaining:
+        return CAL_RETRY_INITIAL_S
+    return min(CAL_RETRY_MAX_S, max(CAL_RETRY_INITIAL_S, current * 2))
+
+
 def should_run_daily(store: CalibrationStore, now: float, last_run: float) -> bool:
     """Fallback daily calibration if scheduler trigger didn't fire.
 
@@ -288,6 +296,11 @@ def main() -> None:
 
     store = CalibrationStore(BIOMETRICS_DB)
     watcher = CalibrationWatcher()
+    now = time.time()
+    pruned = store.prune_runs(int(now - CAL_RUN_RETENTION_S))
+    if pruned:
+        log.info("Pruned %d expired calibration audit rows", pruned)
+    last_prune = now
 
     # Select the record source once at startup (no mid-flight switching). On a
     # new-firmware pod NATS is reachable, so start a bounded live collector the
@@ -306,9 +319,9 @@ def main() -> None:
     # Attempt startup calibration for missing/expired profiles. `remaining` is
     # what still needs a profile; on a fresh NATS buffer that is everything,
     # and the retry loop below fills them in as samples accrue.
-    now = time.time()
     remaining = run_pending_calibrations(store, now, "startup", buffer=nats_buffer)
     last_retry = time.time()
+    retry_interval = CAL_RETRY_INITIAL_S
     daily_last_run = 0.0
 
     try:
@@ -334,6 +347,8 @@ def main() -> None:
 
                 watcher.clear_trigger()
                 remaining = compute_pending(store, time.time())
+                retry_interval = CAL_RETRY_INITIAL_S
+                last_retry = time.time()
 
             # Check daily schedule
             now = time.time()
@@ -345,13 +360,22 @@ def main() -> None:
                                         buffer=nats_buffer)
                 daily_last_run = now
                 remaining = compute_pending(store, time.time())
+                retry_interval = CAL_RETRY_INITIAL_S
+                last_retry = time.time()
+
+            if now - last_prune >= CAL_RUN_PRUNE_INTERVAL_S:
+                pruned = store.prune_runs(int(now - CAL_RUN_RETENTION_S))
+                if pruned:
+                    log.info("Pruned %d expired calibration audit rows", pruned)
+                last_prune = now
 
             # Retry any still-missing/failed profiles as samples accrue.
             now = time.time()
-            if now - last_retry >= CAL_RETRY_INTERVAL_S:
+            if remaining and now - last_retry >= retry_interval:
                 last_retry = now
                 remaining = run_pending_calibrations(store, now, "retry",
                                                      buffer=nats_buffer)
+                retry_interval = next_retry_interval(retry_interval, remaining)
                 if not remaining:
                     log.info("All calibration profiles now present")
 
