@@ -497,10 +497,11 @@ class PumpGateCapSense:
         self._ref_anomaly_active: bool = False
 
     def update_pump_state(self, record: dict) -> None:
-        """Update pump RPM state from a frzHealth or frzTherm record.
+        """Update pump RPM state from a frzHealth or pump-specific record.
 
         frzHealth format: { type: "frzHealth", ts, left: {..., pumpRpm: N}, right: {..., pumpRpm: N}, fan: {...} }
-        frzTherm format:  { type: "frzTherm", ts, left: {..., pumpDuty: N}, right: {..., pumpDuty: N} }
+        frzTherm ``power`` is TEC thermal output, not pump activity. Only
+        explicit pump RPM/duty fields are accepted from that record type.
 
         The exact field names depend on firmware version. We check multiple
         possible field names for robustness.
@@ -512,7 +513,7 @@ class PumpGateCapSense:
             if not isinstance(side_data, dict):
                 continue
 
-            rpm = 0.0
+            rpm = None
             if rtype == "frzHealth":
                 # Try known field names for pump RPM
                 for key in ("pumpRpm", "pump_rpm", "pumpRPM", "rpm"):
@@ -525,7 +526,7 @@ class PumpGateCapSense:
                         break
                 # NATS Pod 5 frzHealth nests pump state under side.pump.
                 pump = side_data.get("pump")
-                if rpm == 0 and isinstance(pump, dict):
+                if rpm is None and isinstance(pump, dict):
                     val = pump.get("rpm")
                     if val is not None:
                         try:
@@ -533,7 +534,7 @@ class PumpGateCapSense:
                         except (TypeError, ValueError):
                             pass
                 # Also check pumpDuty as fallback — any duty > 0 means pump is running
-                if rpm == 0:
+                if rpm is None:
                     duty = next((side_data.get(key) for key in
                                  ("pumpDuty", "pump_duty", "duty")
                                  if side_data.get(key) is not None), None)
@@ -547,9 +548,9 @@ class PumpGateCapSense:
                             pass
 
             elif rtype == "frzTherm":
-                # frzTherm may carry pump duty cycle
+                # Never use the captured `power` field here: it is TEC output.
                 for key in ("pumpDuty", "pump_duty", "duty", "pumpRpm",
-                            "pump_rpm", "power"):
+                            "pump_rpm"):
                     val = side_data.get(key)
                     if val is not None:
                         try:
@@ -558,7 +559,8 @@ class PumpGateCapSense:
                             pass
                         break
 
-            self._pump_rpm[side] = rpm
+            if rpm is not None:
+                self._pump_rpm[side] = rpm
 
         # Track per-side pump-off transitions for the guard period
         for side in ("left", "right"):

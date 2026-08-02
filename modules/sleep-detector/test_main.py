@@ -291,12 +291,17 @@ class TestPumpGatePerSide:
         assert gate.is_gated({}, "left") is True
         assert gate.is_gated({}, "right") is False
 
-    def test_captured_nats_therm_power(self):
+    def test_captured_nats_therm_power_does_not_overwrite_pump_rpm(self):
         gate = main.PumpGateCapSense()
         gate.update_pump_state({
+            "type": "frzHealth",
+            "left": {"pump": {"rpm": 1200}},
+            "right": {"pump": {"rpm": 0}},
+        })
+        gate.update_pump_state({
             "type": "frzTherm",
-            "left": {"power": 0.024},
-            "right": {"power": 0.0},
+            "left": {"power": 0.0},
+            "right": {"power": 0.024},
         })
         assert gate.is_gated({}, "left") is True
         assert gate.is_gated({}, "right") is False
