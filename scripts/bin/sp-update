@@ -71,11 +71,20 @@ fi
 
 # Cleanup — re-block WAN, rollback code, and restart service on failure
 ROLLBACK_READY=false
+MODULE_SWAP_ACTIVE=false
 cleanup() {
   local exit_code=$?
   if [ "$WAN_WAS_BLOCKED" = true ]; then
     restore_wan
     WAN_WAS_BLOCKED=false
+  fi
+  if [ "$exit_code" -ne 0 ] && [ "$MODULE_SWAP_ACTIVE" = true ] \
+     && declare -F rollback_module_update >/dev/null; then
+    echo "Rolling back staged biometrics module update..." >&2
+    rollback_module_update || true
+    [ -n "${MODULES_STAGE:-}" ] && rm -rf "$MODULES_STAGE"
+    [ -n "${MODULES_BACKUP:-}" ] && rm -rf "$MODULES_BACKUP"
+    MODULE_SWAP_ACTIVE=false
   fi
   if [ "$exit_code" -ne 0 ] && [ "$ROLLBACK_READY" = true ]; then
     echo "Update failed, rolling back..." >&2
@@ -397,6 +406,7 @@ if [ -d "$INSTALL_DIR/modules" ]; then
     chmod -R o+rX "$stage/.venv" 2>/dev/null || true
   done
 
+  MODULE_SWAP_ACTIVE=true
   if [ -d "$INSTALL_DIR/modules/common" ]; then
     mkdir -p "$MODULES_STAGE/common"
     cp -r "$INSTALL_DIR/modules/common/." "$MODULES_STAGE/common/"
@@ -408,6 +418,7 @@ if [ -d "$INSTALL_DIR/modules" ]; then
         mv "$MODULES_BACKUP/common" "$MODULES_DEST/common"
       fi
       rm -rf "$MODULES_STAGE" "$MODULES_BACKUP"
+      MODULE_SWAP_ACTIVE=false
       exit 1
     fi
     COMMON_SWAPPED=true
@@ -429,6 +440,7 @@ if [ -d "$INSTALL_DIR/modules" ]; then
       fi
       rollback_module_update
       rm -rf "$MODULES_STAGE" "$MODULES_BACKUP"
+      MODULE_SWAP_ACTIVE=false
       exit 1
     fi
     SWAPPED_MODULES+=("$mod")
@@ -457,11 +469,13 @@ if [ -d "$INSTALL_DIR/modules" ]; then
       echo "ERROR: updated module $mod failed to start — restoring previous module." >&2
       rollback_module_update
       rm -rf "$MODULES_STAGE" "$MODULES_BACKUP"
+      MODULE_SWAP_ACTIVE=false
       exit 1
     fi
   done
 
   rm -rf "$MODULES_STAGE" "$MODULES_BACKUP"
+  MODULE_SWAP_ACTIVE=false
 fi
 
 # Biometrics archiver — tmpfs RAW writes + frank.sh cd patch. Module

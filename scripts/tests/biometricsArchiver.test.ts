@@ -158,6 +158,7 @@ describe('module deployment guards', () => {
     expect(update).toContain('ERROR: uv unavailable — refusing to replace biometrics modules.')
     expect(update).toContain('if ! (cd "$stage" && uv sync')
     expect(update).toContain('rollback_module_update')
+    expect(update).toContain('if [ "$exit_code" -ne 0 ] && [ "$MODULE_SWAP_ACTIVE" = true ]')
     expect(update).toContain('if ! systemctl restart "$svc"; then')
     expect(update).not.toContain('Warning: uv sync failed for module $mod')
 
