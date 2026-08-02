@@ -474,8 +474,9 @@ if [ -d "$INSTALL_DIR/modules" ]; then
     fi
   done
 
-  rm -rf "$MODULES_STAGE" "$MODULES_BACKUP"
-  MODULE_SWAP_ACTIVE=false
+  # The staged tree is no longer needed, but retain prior modules and rollback
+  # eligibility through RAW/NATS migration and final application health.
+  rm -rf "$MODULES_STAGE"
 fi
 
 # Biometrics archiver — tmpfs RAW writes + frank.sh cd patch. Module
@@ -542,6 +543,10 @@ systemctl start sleepypod.service
 
 sleep 5
 if systemctl is-active --quiet sleepypod.service; then
+  if [ "$MODULE_SWAP_ACTIVE" = true ]; then
+    rm -rf "$MODULES_BACKUP"
+    MODULE_SWAP_ACTIVE=false
+  fi
   echo "Update complete! Service is running."
   exit 0
 fi

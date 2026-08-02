@@ -142,13 +142,17 @@ describe('module deployment guards', () => {
     const script = readFileSync(updateScript, 'utf8')
     const stageSync = script.indexOf('(cd "$stage" && uv sync')
     const commonSwap = script.indexOf('mv "$MODULES_STAGE/common" "$MODULES_DEST/common"')
-    const completedSwapCleanup = script.lastIndexOf('rm -rf "$MODULES_STAGE" "$MODULES_BACKUP"')
+    const stageCleanup = script.lastIndexOf('rm -rf "$MODULES_STAGE"')
     const natsCleanup = script.indexOf('  install_biometrics_archiver\n')
+    const healthCheck = script.indexOf('if systemctl is-active --quiet sleepypod.service; then')
+    const backupRelease = script.indexOf('rm -rf "$MODULES_BACKUP"', healthCheck)
 
     expect(stageSync).toBeGreaterThanOrEqual(0)
     expect(stageSync).toBeLessThan(commonSwap)
-    expect(commonSwap).toBeLessThan(completedSwapCleanup)
-    expect(completedSwapCleanup).toBeLessThan(natsCleanup)
+    expect(commonSwap).toBeLessThan(stageCleanup)
+    expect(stageCleanup).toBeLessThan(natsCleanup)
+    expect(natsCleanup).toBeLessThan(healthCheck)
+    expect(healthCheck).toBeLessThan(backupRelease)
   })
 
   it('fails closed and rolls swapped modules back instead of skipping failed venvs', () => {
@@ -165,7 +169,11 @@ describe('module deployment guards', () => {
     expect(install).toContain(
       'Error: uv installation failed — refusing to continue without biometrics modules',
     )
-    expect(install).toContain('Error: uv sync failed for module $name')
+    expect(install).toContain('if ! (cd "$stage" && uv sync')
+    expect(install).toContain('rollback_install_modules')
+    expect(install).toContain('INSTALL_MODULE_SWAP_ACTIVE=true')
+    expect(install).toContain('Error: uv sync failed for module $name — live modules were not replaced')
+    expect(install).not.toContain('(cd "$dest" && uv sync')
   })
 
   it('requires frank to adopt the tmpfs before consumers switch or root RAW files migrate', () => {
