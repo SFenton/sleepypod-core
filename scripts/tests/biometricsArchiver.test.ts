@@ -58,6 +58,7 @@ function runHelper(extraEnv: Partial<NodeJS.ProcessEnv> = {}) {
       CALLS_FILE: callsFile,
       UNMOUNTED_FILE: unmountedFile,
       FAIL_RESTART: '0',
+      FAIL_CONSUMER_RESTART: '0',
       STOP_LEAVES_MOUNTED: '0',
       ...extraEnv,
     },
@@ -86,6 +87,9 @@ beforeEach(() => {
     '#!/usr/bin/env bash',
     'echo "$*" >> "$CALLS_FILE"',
     'if [ "$1" = "restart" ] && [ "$2" = "frank.service" ] && [ "$FAIL_RESTART" = "1" ]; then',
+    '  exit 1',
+    'fi',
+    'if [ "$1" = "restart" ] && [ "$2" = "sleepypod-calibrator.service" ] && [ "$FAIL_CONSUMER_RESTART" = "1" ]; then',
     '  exit 1',
     'fi',
     'if [ "$1" = "stop" ] && [ "$2" = "persistent-biometrics.mount" ]; then',
@@ -226,6 +230,16 @@ describe('remove_biometrics_archiver_for_nats', () => {
     expect(result.status).toBe(1)
     expect(calls()).toContain('restart sleepypod-piezo-processor.service')
     expect(calls()).toContain('restart sleepypod-calibrator.service')
+  })
+
+  it('fails cleanup when an active RAW consumer cannot be restored', () => {
+    const result = runHelper({ FAIL_CONSUMER_RESTART: '1' })
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(
+      'failed to restart sleepypod-calibrator.service after NATS firmware cleanup',
+    )
+    expect(calls()).toContain('restart sleepypod-cover-buttons.service')
   })
 
   it('restores a patched frank.sh and restarts frank.service', () => {

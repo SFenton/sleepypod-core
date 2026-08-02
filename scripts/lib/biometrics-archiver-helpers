@@ -44,9 +44,14 @@ remove_biometrics_archiver_for_nats() {
 
   restart_biometrics_consumers() {
     local service
+    local restart_failed=false
     for service in "${active_consumers[@]}"; do
-      systemctl restart "$service" 2>/dev/null || true
+      if ! systemctl restart "$service" 2>/dev/null; then
+        echo "Error: failed to restart $service after NATS firmware cleanup" >&2
+        restart_failed=true
+      fi
     done
+    [ "$restart_failed" = false ]
   }
 
   # Readers can retain an open descriptor into the tmpfs even after frank
@@ -57,7 +62,7 @@ remove_biometrics_archiver_for_nats() {
       active_consumers+=("$consumer")
       if ! systemctl stop "$consumer" 2>/dev/null; then
         echo "Error: failed to stop $consumer before NATS firmware cleanup" >&2
-        restart_biometrics_consumers
+        restart_biometrics_consumers || true
         return 1
       fi
     fi
@@ -101,7 +106,7 @@ remove_biometrics_archiver_for_nats() {
   rmdir "$systemd_dir/frank.service.d" 2>/dev/null || true
   if ! systemctl daemon-reload 2>/dev/null; then
     echo "Error: failed to reload systemd before NATS firmware cleanup" >&2
-    restart_biometrics_consumers
+    restart_biometrics_consumers || true
     return 1
   fi
 
@@ -112,7 +117,7 @@ remove_biometrics_archiver_for_nats() {
   if [ "$restart_frank" = true ] || mountpoint -q "$tmpfs_dir"; then
     if ! systemctl restart frank.service 2>/dev/null; then
       echo "Error: failed to restart frank.service; preserving RAW tmpfs and recovery tools" >&2
-      restart_biometrics_consumers
+      restart_biometrics_consumers || true
       return 1
     fi
   fi
@@ -126,7 +131,7 @@ remove_biometrics_archiver_for_nats() {
     if [ -x "$archiver_bin" ] \
        && ! KEEP_RECENT_MIN=-1 "$archiver_bin"; then
       echo "Error: failed to archive all remaining tmpfs RAW frames; preserving mount and recovery tools" >&2
-      restart_biometrics_consumers
+      restart_biometrics_consumers || true
       return 1
     fi
 
@@ -141,7 +146,7 @@ remove_biometrics_archiver_for_nats() {
       [ -f "$raw_file" ] || continue
       if [ "$(basename "$raw_file")" != "SEQNO.RAW" ]; then
         echo "Error: unarchived RAW frame remains at $raw_file; preserving mount and recovery tools" >&2
-        restart_biometrics_consumers
+        restart_biometrics_consumers || true
         return 1
       fi
     done
@@ -161,12 +166,12 @@ remove_biometrics_archiver_for_nats() {
   if ! systemctl stop persistent-biometrics.mount 2>/dev/null \
      && [ "$tmpfs_was_mounted" = true ]; then
     echo "Error: failed to stop persistent-biometrics.mount; preserving recovery tools" >&2
-    restart_biometrics_consumers
+    restart_biometrics_consumers || true
     return 1
   fi
   if mountpoint -q "$tmpfs_dir"; then
     echo "Error: $tmpfs_dir is still mounted; preserving recovery tools" >&2
-    restart_biometrics_consumers
+    restart_biometrics_consumers || true
     return 1
   fi
   systemctl disable persistent-biometrics.mount 2>/dev/null || true
@@ -181,7 +186,9 @@ remove_biometrics_archiver_for_nats() {
         "$local_bin_dir/sleepypod-biometrics-archiver" \
         "$local_bin_dir/sleepypod-biometrics-pruner"
   systemctl daemon-reload 2>/dev/null || true
-  restart_biometrics_consumers
+  if ! restart_biometrics_consumers; then
+    return 1
+  fi
   echo "biometrics-archiver: removed legacy RAW tmpfs units for NATS firmware (cold archive preserved)"
 }
 
