@@ -389,13 +389,14 @@ class CapSense2Calibrator:
             else:
                 channels["REF"].append(None)  # keep aligned with timestamps
 
-        if len(timestamps) < 60:
+        if len(timestamps) < self.MIN_WINDOW_SAMPLES:
             raise ValueError(
-                f"Insufficient capSense2 data: {len(timestamps)} samples (need >= 60)"
+                f"Insufficient capSense2 data: {len(timestamps)} samples "
+                f"(need >= {self.MIN_WINDOW_SAMPLES})"
             )
 
         # Find quietest 5-min window across sensing channels only
-        window = min(self.MIN_WINDOW_SAMPLES, len(timestamps))
+        window = self.MIN_WINDOW_SAMPLES
         best_start = 0
         best_variance = float("inf")
         sense_names = [name for name, _, _ in self.SENSE_PAIRS]
