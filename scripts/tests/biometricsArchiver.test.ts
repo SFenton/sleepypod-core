@@ -217,7 +217,10 @@ describe('module deployment guards', () => {
     const helper = readFileSync(helperPath, 'utf8')
     const unmounted = helper.indexOf('if mountpoint -q "$tmpfs_dir"; then')
     const guard = helper.indexOf('if [ "$migration_changed" = true ]; then')
-    const committed = helper.indexOf('SLEEPYPOD_NATS_MIGRATION_COMMITTED=true')
+    const committed = helper.indexOf(
+      'SLEEPYPOD_NATS_MIGRATION_COMMITTED=true',
+      guard,
+    )
     const assetRemoval = helper.indexOf('if ! rm -f "$systemd_dir/sleepypod-biometrics-archiver.service"')
     const consumers = helper.lastIndexOf('if ! restart_biometrics_consumers; then')
 
@@ -374,6 +377,21 @@ describe('remove_biometrics_archiver_for_nats', () => {
     expect(calls()).not.toContain('stop persistent-biometrics.mount')
     expect(existsSync(mountUnit)).toBe(true)
     expect(existsSync(recoveryTool)).toBe(true)
+  })
+
+  it('restores patched firmware routing when archival fails before unmount', () => {
+    writeRaw()
+    writeExecutable(archiverBin, ['#!/usr/bin/env bash', 'exit 1'])
+    const patched = '#!/usr/bin/env bash\ncd /persistent/biometrics && exec ./frankenfirmware\n'
+    const original = '#!/usr/bin/env bash\ncd /persistent && exec ./frankenfirmware\n'
+    writeFileSync(frankSh, patched)
+    writeFileSync(`${frankSh}.bak-pre-tmpfs-1`, original)
+
+    const result = runHelper()
+
+    expect(result.status).toBe(1)
+    expect(readFileSync(frankSh, 'utf8')).toBe(patched)
+    expect(calls()).toContain('restart frank.service')
   })
 
   it('preserves recovery tools when the mount remains active after stop', () => {
