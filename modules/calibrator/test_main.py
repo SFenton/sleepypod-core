@@ -88,10 +88,13 @@ class TestShouldRunDaily:
 
 
 from main import (  # noqa: E402
+    CAL_RETRY_INITIAL_S,
+    CAL_RETRY_MAX_S,
     CAL_SIDES,
     CAL_SENSOR_TYPES,
     compute_pending,
     load_recent_records,
+    next_retry_interval,
     run_pending_calibrations,
 )
 
@@ -176,6 +179,20 @@ class TestRunPendingCalibrations:
         monkeypatch.setattr(main, "run_calibration", fake_run)
         remaining = run_pending_calibrations(store, now, "startup")
         assert remaining == _ALL - ok
+
+
+class TestRetryBackoff:
+    def test_backoff_doubles_to_one_hour_and_resets_after_success(self):
+        remaining = {("left", "piezo")}
+        interval = CAL_RETRY_INITIAL_S
+        observed = []
+        for _ in range(10):
+            interval = next_retry_interval(interval, remaining)
+            observed.append(interval)
+
+        assert observed[:4] == [120, 240, 480, 960]
+        assert observed[-1] == CAL_RETRY_MAX_S
+        assert next_retry_interval(interval, set()) == CAL_RETRY_INITIAL_S
 
 
 class TestLoadRecentRecordsBuffer:

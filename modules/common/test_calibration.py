@@ -44,6 +44,21 @@ def create_store(tmp_path):
         );
         CREATE UNIQUE INDEX uq_cal_side_type_active
           ON calibration_profiles (side, sensor_type);
+        CREATE TABLE calibration_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          side TEXT NOT NULL,
+          sensor_type TEXT NOT NULL,
+          status TEXT NOT NULL,
+          parameters TEXT,
+          quality_score REAL,
+          source_window_start INTEGER,
+          source_window_end INTEGER,
+          samples_used INTEGER,
+          duration_ms INTEGER,
+          triggered_by TEXT NOT NULL,
+          error_message TEXT,
+          created_at INTEGER NOT NULL
+        );
         """
     )
     conn.close()
@@ -158,5 +173,27 @@ def test_first_failed_calibration_remains_retryable(tmp_path):
             "WHERE side='right' AND sensor_type='capacitance'"
         ).fetchone()
         assert tuple(row) == ("failed", "buffer still warming")
+    finally:
+        store.close()
+
+
+def test_prune_runs_removes_only_rows_older_than_cutoff(tmp_path):
+    store = create_store(tmp_path)
+    try:
+        conn = store._get_conn()
+        with conn:
+            for created_at in (100, 200, 300):
+                conn.execute(
+                    """INSERT INTO calibration_runs
+                       (side, sensor_type, status, triggered_by, created_at)
+                       VALUES ('left', 'piezo', 'failed', 'retry', ?)""",
+                    (created_at,),
+                )
+
+        assert store.prune_runs(250) == 2
+        rows = conn.execute(
+            "SELECT created_at FROM calibration_runs ORDER BY created_at"
+        ).fetchall()
+        assert [row[0] for row in rows] == [300]
     finally:
         store.close()
