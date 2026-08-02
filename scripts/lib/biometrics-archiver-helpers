@@ -31,6 +31,7 @@ remove_biometrics_archiver_for_nats() {
   local frank_sh="${BIOMETRICS_FRANK_SH:-/opt/eight/bin/frank.sh}"
   local dropin="$systemd_dir/frank.service.d/sleepypod-biometrics-tmpfs.conf"
   local restart_frank=false
+  local migration_changed=false
   local u
   local consumer
   local consumers=(
@@ -47,6 +48,14 @@ remove_biometrics_archiver_for_nats() {
     sleepypod-biometrics-pruner.timer
   )
   local active_timers=()
+
+  if mountpoint -q "$tmpfs_dir" \
+     || [ -f "$dropin" ] \
+     || [ -f "$systemd_dir/persistent-biometrics.mount" ] \
+     || [ -x "$archiver_bin" ] \
+     || { [ -f "$frank_sh" ] && grep -q 'cd /persistent/biometrics' "$frank_sh"; }; then
+    migration_changed=true
+  fi
 
   restart_biometrics_consumers() {
     local service
@@ -232,7 +241,9 @@ remove_biometrics_archiver_for_nats() {
   # units and recovery tools are gone. Callers source this helper, so publish a
   # shared marker before consumer restarts; a late restart failure must retain
   # NATS-capable code/modules instead of rolling back to RAW-only versions.
-  SLEEPYPOD_NATS_MIGRATION_COMMITTED=true
+  if [ "$migration_changed" = true ]; then
+    SLEEPYPOD_NATS_MIGRATION_COMMITTED=true
+  fi
 
   if ! restart_biometrics_consumers; then
     return 1
