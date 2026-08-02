@@ -216,6 +216,38 @@ describe('startPiezoStreamServer — source selection', () => {
     expect(natsReachable).toHaveBeenCalled()
   })
 
+  it('processes bytes appended to an existing RAW file during the NATS grace window', async () => {
+    natsMock.reachable = false
+    const rawPath = path.join(tmpRawDir, 'grace-window.RAW')
+    const now = Math.floor(Date.now() / 1000)
+    fs.writeFileSync(
+      rawPath,
+      buildOuterRecord(5, {
+        type: 'capSense',
+        ts: now,
+        left: { out: 1, cen: 2, in: 3 },
+        right: { out: 4, cen: 5, in: 6 },
+      }),
+    )
+
+    startPiezoStreamServer()
+
+    fs.appendFileSync(
+      rawPath,
+      buildOuterRecord(6, {
+        type: 'capSense',
+        ts: now + 1,
+        left: { out: 45, cen: 46, in: 47 },
+        right: { out: 48, cen: 49, in: 50 },
+      }),
+    )
+
+    await waitFor(() => {
+      const left = getLatestCapSenseSnapshot()?.left
+      return Array.isArray(left) && left[0] === 45
+    })
+  })
+
   it('continues probing after a reachability probe throws, then selects RAW', async () => {
     natsMock.probeErrorOnce = true
     natsMock.reachable = false

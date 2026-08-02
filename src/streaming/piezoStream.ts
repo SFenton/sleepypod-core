@@ -707,9 +707,16 @@ export function startPiezoStreamServer(): WebSocketServer {
   latestCapSenseSnapshot = null
   wss = new WebSocketServer({ port: WS_PORT, maxPayload: WS_MAX_PAYLOAD_BYTES })
   console.log(`[sensorStream] WebSocket server listening on port ${WS_PORT}`)
-  const rawFilesAtStartup = new Set<string>()
+  const rawFilesAtStartup = new Map<string, number>()
   const startupRawPath = findLatestRaw(RAW_DATA_DIR)
-  if (startupRawPath) rawFilesAtStartup.add(startupRawPath)
+  if (startupRawPath) {
+    try {
+      rawFilesAtStartup.set(startupRawPath, fs.statSync(startupRawPath).size)
+    }
+    catch {
+      rawFilesAtStartup.set(startupRawPath, 0)
+    }
+  }
 
   wss.on('connection', (ws) => {
     console.log('[sensorStream] Client connected')
@@ -751,7 +758,7 @@ export function startPiezoStreamServer(): WebSocketServer {
  */
 async function selectAndStartSource(
   server: WebSocketServer,
-  rawFilesAtStartup: ReadonlySet<string>,
+  rawFilesAtStartup: ReadonlyMap<string, number>,
 ): Promise<void> {
   const natsRequired = natsSourceRequired()
   if (!NATS_SOURCE_DISABLED) {
@@ -794,7 +801,7 @@ async function selectAndStartSource(
 /** Connect the loopback-NATS source, feeding decoded frames into the shared dispatch. */
 async function startNatsSource(
   server: WebSocketServer,
-  rawFilesAtStartup: ReadonlySet<string>,
+  rawFilesAtStartup: ReadonlyMap<string, number>,
 ): Promise<boolean> {
   try {
     const source = await startNatsFrameSource({
@@ -905,7 +912,7 @@ function dispatchSensorFrame(frame: Record<string, unknown>): void {
  * can be replayed. Broadcasting is per-client guarded, so an idle loop does no
  * fan-out.
  */
-function startRawTailingLoop(rawFilesAtStartup: ReadonlySet<string>): void {
+function startRawTailingLoop(rawFilesAtStartup: ReadonlyMap<string, number>): void {
   if (streamingInterval) return
 
   let currentPath: string | null = null
@@ -921,15 +928,7 @@ function startRawTailingLoop(rawFilesAtStartup: ReadonlySet<string>): void {
 
     // Switch files if a newer one appeared
     if (latest !== currentPath) {
-      const startOffset = (() => {
-        if (!rawFilesAtStartup.has(latest)) return 0
-        try {
-          return fs.statSync(latest).size
-        }
-        catch {
-          return 0
-        }
-      })()
+      const startOffset = rawFilesAtStartup.get(latest) ?? 0
       console.log(`[sensorStream] Switched to RAW file: ${path.basename(latest)} (tailing from ${startOffset} bytes)`)
       currentPath = latest
       fileBuffer = Buffer.alloc(0)
