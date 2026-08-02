@@ -302,21 +302,30 @@ function findNextRecordMarker(buf: Buffer, from: number): number {
 // RAW file follower
 // ---------------------------------------------------------------------------
 
-function findLatestRawIn(dir: string): string | null {
+interface RawFileInfo {
+  path: string
+  mtime: number
+  size: number
+}
+
+function listRawFilesIn(dir: string): RawFileInfo[] {
   try {
-    const entries = fs.readdirSync(dir)
-    const rawFiles = entries
+    return fs.readdirSync(dir)
       .filter(e => e.endsWith('.RAW') && e !== 'SEQNO.RAW')
-      .map(e => ({
-        name: e,
-        mtime: fs.statSync(path.join(dir, e)).mtimeMs,
-      }))
-      .sort((a, b) => b.mtime - a.mtime)
-    return rawFiles.length > 0 ? path.join(dir, rawFiles[0].name) : null
+      .map((entry) => {
+        const filePath = path.join(dir, entry)
+        const stat = fs.statSync(filePath)
+        return { path: filePath, mtime: stat.mtimeMs, size: stat.size }
+      })
+      .sort((a, b) => a.mtime - b.mtime)
   }
   catch {
-    return null
+    return []
   }
+}
+
+function findLatestRawIn(dir: string): string | null {
+  return listRawFilesIn(dir).at(-1)?.path ?? null
 }
 
 // Probes `dir` first, then `<dir>/<RAW_DATA_FALLBACK_SUBDIR>`. The split exists
@@ -327,6 +336,14 @@ export function findLatestRaw(dir: string): string | null {
   const direct = findLatestRawIn(dir)
   if (direct) return direct
   return findLatestRawIn(path.join(dir, RAW_DATA_FALLBACK_SUBDIR))
+}
+
+function snapshotRawFilesAtStartup(dir: string): Map<string, number> {
+  const direct = listRawFilesIn(dir)
+  const files = direct.length > 0
+    ? direct
+    : listRawFilesIn(path.join(dir, RAW_DATA_FALLBACK_SUBDIR))
+  return new Map(files.map(file => [file.path, file.size]))
 }
 
 // ---------------------------------------------------------------------------
@@ -707,16 +724,7 @@ export function startPiezoStreamServer(): WebSocketServer {
   latestCapSenseSnapshot = null
   wss = new WebSocketServer({ port: WS_PORT, maxPayload: WS_MAX_PAYLOAD_BYTES })
   console.log(`[sensorStream] WebSocket server listening on port ${WS_PORT}`)
-  const rawFilesAtStartup = new Map<string, number>()
-  const startupRawPath = findLatestRaw(RAW_DATA_DIR)
-  if (startupRawPath) {
-    try {
-      rawFilesAtStartup.set(startupRawPath, fs.statSync(startupRawPath).size)
-    }
-    catch {
-      rawFilesAtStartup.set(startupRawPath, 0)
-    }
-  }
+  const rawFilesAtStartup = snapshotRawFilesAtStartup(RAW_DATA_DIR)
 
   wss.on('connection', (ws) => {
     console.log('[sensorStream] Client connected')
@@ -918,17 +926,30 @@ function startRawTailingLoop(rawFilesAtStartup: ReadonlyMap<string, number>): vo
   let currentPath: string | null = null
   let fileBuffer = Buffer.alloc(0)
   let readOffset = 0 // offset into the actual file (not the buffer)
+  let drainingStartupFile = false
+  const startupOffsets = new Map(rawFilesAtStartup)
+  const startupQueue = [...startupOffsets.keys()]
 
   streamingInterval = setInterval(() => {
     if (!wss) return
 
-    // Find the latest RAW file
-    const latest = findLatestRaw(RAW_DATA_DIR)
+    while (currentPath === null && startupQueue.length > 0
+      && !fs.existsSync(startupQueue[0])) {
+      startupOffsets.delete(startupQueue.shift() as string)
+    }
+
+    // Drain files that existed before the NATS grace window in chronological
+    // order. Once they are caught up, attach to the normal latest-file tail.
+    const startupPath = currentPath === null ? startupQueue[0] : null
+    const latest = currentPath !== null && drainingStartupFile
+      ? currentPath
+      : startupPath ?? findLatestRaw(RAW_DATA_DIR)
     if (!latest) return
 
     // Switch files if a newer one appeared
     if (latest !== currentPath) {
-      const startOffset = rawFilesAtStartup.get(latest) ?? 0
+      drainingStartupFile = startupOffsets.has(latest)
+      const startOffset = startupOffsets.get(latest) ?? 0
       console.log(`[sensorStream] Switched to RAW file: ${path.basename(latest)} (tailing from ${startOffset} bytes)`)
       currentPath = latest
       fileBuffer = Buffer.alloc(0)
@@ -953,6 +974,17 @@ function startRawTailingLoop(rawFilesAtStartup: ReadonlyMap<string, number>): vo
 
       if (fileSize <= readOffset) {
         fs.closeSync(fd)
+        fd = null
+        if (drainingStartupFile) {
+          const newest = findLatestRaw(RAW_DATA_DIR)
+          if (newest !== currentPath) {
+            const drained = startupQueue.shift()
+            if (drained) startupOffsets.delete(drained)
+            currentPath = null
+            drainingStartupFile = false
+            fileBuffer = Buffer.alloc(0)
+          }
+        }
         return // no new data
       }
 
@@ -1035,6 +1067,13 @@ function startRawTailingLoop(rawFilesAtStartup: ReadonlyMap<string, number>): vo
         }
         catch { /* ignore */ }
       }
+      if (drainingStartupFile && currentPath && !fs.existsSync(currentPath)) {
+        const drained = startupQueue.shift()
+        if (drained) startupOffsets.delete(drained)
+        currentPath = null
+        drainingStartupFile = false
+        fileBuffer = Buffer.alloc(0)
+      }
       // Non-fatal — file may be temporarily unavailable
     }
   }, FILE_POLL_INTERVAL_MS)
@@ -1105,6 +1144,7 @@ export const __test__ = {
   dispatchSensorFrame,
   envMilliseconds,
   natsSourceRequired,
+  snapshotRawFilesAtStartup,
   warnedUnknownTypes,
   get frameIndex(): readonly FrameIndexEntry[] { return frameIndex },
   get natsSourceActive(): boolean { return natsSource !== null },
