@@ -14,7 +14,7 @@ _cbor2_stub = type(sys)("cbor2")
 sys.modules.setdefault("cbor2", _cbor2_stub)
 
 import main  # noqa: E402
-from main import DAILY_HOUR, should_run_daily  # noqa: E402
+from main import DAILY_HOUR, DAILY_MIN_AGE_HOURS, should_run_daily  # noqa: E402
 
 
 def _ts_at_hour(hour: int) -> float:
@@ -69,7 +69,7 @@ class TestShouldRunDaily:
         assert should_run_daily(store, now, last_run=0.0) is False
 
     def test_recent_in_process_run_short_circuits(self):
-        """A run in the last 25h suppresses the fallback without consulting
+        """A run in the current daily window suppresses the fallback without consulting
         the store."""
         now = _ts_at_hour(DAILY_HOUR)
 
@@ -78,6 +78,13 @@ class TestShouldRunDaily:
                 raise AssertionError("store must not be queried")
 
         assert should_run_daily(ExplodingStore(), now, last_run=now - 3600) is False
+
+    def test_previous_day_run_allows_the_next_daily_window(self):
+        now = _ts_at_hour(DAILY_HOUR)
+        store = FakeStore(_fresh_ages(hours=24.0))
+        assert should_run_daily(
+            store, now, last_run=now - 24 * 3600) is True
+        assert DAILY_MIN_AGE_HOURS < 24
 
     def test_single_stale_sensor_triggers_run(self):
         now = _ts_at_hour(DAILY_HOUR)
@@ -197,10 +204,17 @@ class TestRetryBackoff:
 
 class TestLoadRecentRecordsBuffer:
     def test_buffer_snapshot_drives_records(self):
+        now = time.time()
+
         class FakeBuffer:
             def snapshot(self):
-                return {"capSense": [{"type": "capSense"}, {"type": "capSense"}],
-                        "piezo-dual": [{"type": "piezo-dual"}]}
+                return {
+                    "capSense": [
+                        {"type": "capSense", "ts": now - 10},
+                        {"type": "capSense", "ts": now - 20},
+                    ],
+                    "piezo-dual": [{"type": "piezo-dual", "ts": now - 30}],
+                }
 
         recs = load_recent_records(hours=6, buffer=FakeBuffer())
         assert len(recs["capSense"]) == 2
@@ -208,3 +222,21 @@ class TestLoadRecentRecordsBuffer:
         # Missing types default to empty lists (never KeyError downstream).
         assert recs["capSense2"] == []
         assert recs["bedTemp"] == []
+
+    def test_buffer_snapshot_excludes_stale_and_invalid_records(self):
+        now = time.time()
+
+        class FakeBuffer:
+            def snapshot(self):
+                return {
+                    "capSense": [
+                        {"type": "capSense", "ts": now - 7 * 3600},
+                        {"type": "capSense", "ts": now - 60},
+                        {"type": "capSense", "ts": "invalid"},
+                    ],
+                }
+
+        recs = load_recent_records(hours=6, buffer=FakeBuffer())
+        assert recs["capSense"] == [
+            {"type": "capSense", "ts": now - 60},
+        ]

@@ -18,6 +18,7 @@ See docs/adr/0014-sensor-calibration.md for architecture rationale.
 import os
 import sys
 import time
+import math
 import signal
 import logging
 import sqlite3
@@ -50,6 +51,7 @@ BIOMETRICS_DB = Path(os.environ.get(
     "file:/persistent/sleepypod-data/biometrics.db",
 ).replace("file:", ""))
 DAILY_HOUR = int(os.environ.get("CALIBRATION_HOUR", "6"))  # 06:00 UTC
+DAILY_MIN_AGE_HOURS = 23
 
 CAL_SIDES = ("left", "right")
 CAL_SENSOR_TYPES = ("capacitance", "piezo", "temperature")
@@ -101,14 +103,24 @@ def load_recent_records(hours: int = 6, buffer=None) -> dict:
     cutoff. Does NOT use RawFileFollower (which tails live data and would
     hang/spin on stale files).
     """
+    now = time.time()
+    cutoff = now - hours * 3600
+
     if buffer is not None:
         snap = buffer.snapshot()
         records = {"capSense": [], "capSense2": [], "piezo-dual": [], "bedTemp": [], "bedTemp2": []}
         for rtype in records:
-            records[rtype] = list(snap.get(rtype, []))
+            recent = []
+            for record in snap.get(rtype, []):
+                try:
+                    ts = float(record.get("ts"))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if math.isfinite(ts) and cutoff <= ts <= now + 60:
+                    recent.append(record)
+            records[rtype] = recent
         return records
 
-    cutoff = time.time() - hours * 3600
     records: dict = {"capSense": [], "capSense2": [], "piezo-dual": [], "bedTemp": [], "bedTemp2": []}
 
     # Find all RAW files, newest first
@@ -265,8 +277,9 @@ def should_run_daily(store: CalibrationStore, now: float, last_run: float) -> bo
     """Fallback daily calibration if scheduler trigger didn't fire.
 
     The primary trigger is the jobManager's pre-prime-calibration job
-    (30min before pod priming). This fallback only fires if no calibration
-    has run in the last 25 hours — covers the case where priming is disabled.
+    (30min before pod priming). This fallback only fires in the configured UTC
+    hour when profiles are at least 23 hours old — daily without duplicate
+    runs inside the same window, including when priming is disabled.
 
     Gated on PERSISTED profile age, not just the in-memory last_run:
     last_run starts at 0 on every process start, so without the persisted
@@ -274,14 +287,14 @@ def should_run_daily(store: CalibrationStore, now: float, last_run: float) -> bo
     DAILY_HOUR UTC window so the fallback fires at the configured quiet hour
     instead of whenever the process happens to (re)start.
     """
-    if now - last_run < 25 * 3600:
+    if now - last_run < DAILY_MIN_AGE_HOURS * 3600:
         return False
     if time.gmtime(now).tm_hour != DAILY_HOUR:
         return False
     for side in ("left", "right"):
         for sensor_type in ("capacitance", "piezo", "temperature"):
             age = store.get_profile_age_hours(side, sensor_type)
-            if age is None or age >= 25:
+            if age is None or age >= DAILY_MIN_AGE_HOURS:
                 return True
     return False
 
