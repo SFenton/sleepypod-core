@@ -29,7 +29,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cbor2
-from common.nats_follower import create_follower
+from common.nats_follower import NatsFollower, create_follower
 from common.dialect import (
     KNOWN_RECORD_TYPES,
     normalize_bed_temp,
@@ -59,29 +59,34 @@ MIN_VALID_WALL_CLOCK_TS = 1577836800.0  # 2020-01-01 00:00:00 UTC
 MAX_FUTURE_SKEW_S = 60.0
 
 
-def sanitize_ts(raw_ts) -> float:
+def sanitize_ts(raw_ts, receipt_fallback: bool = False) -> Optional[float]:
     """Coerce a RAW frame's `ts` field into a sane wall-clock timestamp.
 
     The downsample cursors seed from MAX(timestamp) at startup, so a single
     far-future timestamp written to the DB would permanently block all
-    subsequent writes — surviving restarts. Falls back to time.time() when:
+    subsequent writes — surviving restarts. The timestamp is invalid when:
       - the field is missing or not a number
       - the value is NaN or +/-inf (CBOR-encoded IEEE 754 specials)
       - the value is < 2020-01-01 epoch (firmware emitted a relative
         timestamp before establishing wall-clock)
       - the value is more than MAX_FUTURE_SKEW_S in the future
+
+    Live NATS messages may use receipt time while firmware establishes its
+    clock. Replayable RAW files must reject invalid timestamps so historical
+    frames cannot be rewritten as current readings after a restart.
     """
     now = time.time()
+    fallback = now if receipt_fallback else None
     try:
-        ts = float(raw_ts) if raw_ts is not None else now
+        ts = float(raw_ts) if raw_ts is not None else fallback
     except (TypeError, ValueError):
-        return now
-    if not math.isfinite(ts):
-        return now
+        return fallback
+    if ts is None or not math.isfinite(ts):
+        return fallback
     if ts < MIN_VALID_WALL_CLOCK_TS:
-        return now
+        return fallback
     if ts > now + MAX_FUTURE_SKEW_S:
-        return now
+        return fallback
     return ts
 
 # Hardware sentinel for "no sensor connected"
@@ -261,6 +266,7 @@ def main() -> None:
         poll_interval=0.5,
         subjects=ENVIRONMENT_NATS_SUBJECTS,
     )
+    receipt_fallback = isinstance(follower, NatsFollower)
 
     # Seed cursors from DB so restarts don't replay already-ingested samples.
     # Clamp to now so a DB already poisoned by a far-future timestamp (written
@@ -289,7 +295,9 @@ def main() -> None:
                 continue
             if rtype not in ("bedTemp", "bedTemp2", "frzTemp"):
                 continue
-            ts = sanitize_ts(record.get("ts"))
+            ts = sanitize_ts(record.get("ts"), receipt_fallback=receipt_fallback)
+            if ts is None:
+                continue
 
             if rtype in ("bedTemp", "bedTemp2"):
                 if ts - last_bed_write >= DOWNSAMPLE_INTERVAL_S:

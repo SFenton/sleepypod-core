@@ -7,6 +7,8 @@ values are not inserted into the freezer_temp table as valid readings.
 import sqlite3
 import sys
 
+import pytest
+
 # Stub pod-only imports so this test runs on a developer machine.
 _cbor2_stub = type(sys)("cbor2")
 _common_stub = type(sys)("common")
@@ -14,6 +16,7 @@ _raw_follower_stub = type(sys)("common.raw_follower")
 _raw_follower_stub.RawFileFollower = None
 _nats_follower_stub = type(sys)("common.nats_follower")
 _nats_follower_stub.create_follower = None
+_nats_follower_stub.NatsFollower = type("NatsFollower", (), {})
 _dialect_stub = type(sys)("common.dialect")
 # Pass-through stub: tests use already-normalized records, so identity is fine.
 _dialect_stub.normalize_bed_temp = lambda record, *a, **kw: record
@@ -155,33 +158,45 @@ class TestSanitizeTs:
     def test_far_future_falls_back_to_now(self):
         import time
         before = time.time()
-        result = sanitize_ts(before + 10 * 365 * 86400)
+        result = sanitize_ts(
+            before + 10 * 365 * 86400, receipt_fallback=True)
         assert before <= result <= time.time() + 1
 
     def test_pre_2020_falls_back_to_now(self):
         import time
         before = time.time()
-        result = sanitize_ts(MIN_VALID_WALL_CLOCK_TS - 1)
+        result = sanitize_ts(
+            MIN_VALID_WALL_CLOCK_TS - 1, receipt_fallback=True)
         assert before <= result <= time.time() + 1
 
     def test_missing_falls_back_to_now(self):
         import time
         before = time.time()
-        result = sanitize_ts(None)
+        result = sanitize_ts(None, receipt_fallback=True)
         assert before <= result <= time.time() + 1
 
     def test_nan_and_inf_fall_back_to_now(self):
         import time
         for bad in (float("nan"), float("inf"), float("-inf")):
             before = time.time()
-            result = sanitize_ts(bad)
+            result = sanitize_ts(bad, receipt_fallback=True)
             assert before <= result <= time.time() + 1
 
     def test_non_numeric_falls_back_to_now(self):
         import time
         before = time.time()
-        result = sanitize_ts("not-a-timestamp")
+        result = sanitize_ts("not-a-timestamp", receipt_fallback=True)
         assert before <= result <= time.time() + 1
+
+    @pytest.mark.parametrize("bad", [
+        None,
+        "not-a-timestamp",
+        float("nan"),
+        float("inf"),
+        MIN_VALID_WALL_CLOCK_TS - 1,
+    ])
+    def test_replayable_raw_rejects_invalid_timestamps(self, bad):
+        assert sanitize_ts(bad) is None
 
 
 # NOTE: bed_temp sentinel filtering moved into common.dialect.normalize_bed_temp
