@@ -6,6 +6,7 @@ recalibration regardless of how fresh the persisted profiles were.
 """
 
 import calendar
+import json
 import sys
 import time
 
@@ -100,6 +101,7 @@ from main import (  # noqa: E402
     CAL_SIDES,
     CAL_SENSOR_TYPES,
     compute_pending,
+    live_capacitance_format,
     load_recent_records,
     next_retry_interval,
     run_pending_calibrations,
@@ -116,8 +118,14 @@ class ProfileStore:
     def get_active(self, side, sensor_type):
         return self.profiles.get((side, sensor_type))
 
-    def complete(self, side, sensor_type):
-        self.profiles[(side, sensor_type)] = {"expires_at": self._now + 100000}
+    def complete(self, side, sensor_type, profile_format=None):
+        params = {}
+        if profile_format is not None:
+            params["format"] = profile_format
+        self.profiles[(side, sensor_type)] = {
+            "expires_at": self._now + 100000,
+            "parameters": json.dumps(params),
+        }
 
     def expire(self, side, sensor_type):
         self.profiles[(side, sensor_type)] = {"expires_at": self._now - 1}
@@ -144,6 +152,37 @@ class TestComputePending:
         store = ProfileStore(now)
         store.expire("right", "piezo")
         assert ("right", "piezo") in compute_pending(store, now)
+
+    def test_live_capacitance_dialect_invalidates_mismatched_profile(self):
+        now = time.time()
+        store = ProfileStore(now)
+        for side, sensor_type in _ALL:
+            store.complete(side, sensor_type, profile_format="capSense2")
+
+        class Buffer:
+            def snapshot(self):
+                return {
+                    "capSense": [{"type": "capSense", "ts": now}],
+                    "capSense2": [],
+                }
+
+        pending = compute_pending(store, now, buffer=Buffer())
+        assert pending == {
+            ("left", "capacitance"),
+            ("right", "capacitance"),
+        }
+
+    def test_newest_buffered_dialect_wins(self):
+        now = time.time()
+
+        class Buffer:
+            def snapshot(self):
+                return {
+                    "capSense": [{"type": "capSense", "ts": now - 1}],
+                    "capSense2": [{"type": "capSense2", "ts": now}],
+                }
+
+        assert live_capacitance_format(Buffer()) == "capSense2"
 
 
 class TestRunPendingCalibrations:
