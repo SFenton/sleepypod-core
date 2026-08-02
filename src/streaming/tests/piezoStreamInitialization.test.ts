@@ -247,7 +247,7 @@ describe('piezoStream module initialization contracts', () => {
     expect(fsMock.readdir).toHaveBeenCalledTimes(2)
     await vi.advanceTimersByTimeAsync(25)
     expect(fsMock.readdir).toHaveBeenCalledTimes(4)
-    expect(fsMock.readdirSync).not.toHaveBeenCalled()
+    expect(fsMock.readdirSync).toHaveBeenCalledTimes(2)
     expect(fsMock.statSync).not.toHaveBeenCalled()
   })
 

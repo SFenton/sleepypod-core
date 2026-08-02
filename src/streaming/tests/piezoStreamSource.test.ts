@@ -338,10 +338,12 @@ describe('startPiezoStreamServer — source selection', () => {
 
   it('skips the grace window on confirmed RAW firmware after one failed greeting probe', async () => {
     vi.mocked(discoverSensorSource).mockResolvedValue('raw')
-    fs.writeFileSync(path.join(tmpRawDir, 'confirmed-raw.RAW'), buildOuterRecord(1, {
+    const filePath = path.join(tmpRawDir, 'confirmed-raw.RAW')
+    fs.writeFileSync(filePath, Buffer.alloc(0))
+    startPiezoStreamServer()
+    fs.appendFileSync(filePath, buildOuterRecord(1, {
       type: 'capSense', ts: 123, left: 35, right: 36,
     }))
-    startPiezoStreamServer()
 
     await waitFor(() => getLatestCapSenseSnapshot()?.ts === 123)
     expect(natsReachable).toHaveBeenCalledTimes(1)
@@ -433,10 +435,12 @@ describe('startPiezoStreamServer — source selection', () => {
   it('honors an explicit RAW override without discovery or a NATS greeting', async () => {
     process.env.PIEZO_SENSOR_SOURCE = 'raw'
     natsMock.reachable = true
-    fs.writeFileSync(path.join(tmpRawDir, 'override-raw.RAW'), buildOuterRecord(1, {
+    const filePath = path.join(tmpRawDir, 'override-raw.RAW')
+    fs.writeFileSync(filePath, Buffer.alloc(0))
+    startPiezoStreamServer()
+    fs.appendFileSync(filePath, buildOuterRecord(1, {
       type: 'capSense', ts: 789, left: 10, right: 11,
     }))
-    startPiezoStreamServer()
 
     await waitFor(() => getLatestCapSenseSnapshot()?.ts === 789)
     expect(discoverSensorSource).not.toHaveBeenCalled()

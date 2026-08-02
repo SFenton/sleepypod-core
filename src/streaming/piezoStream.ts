@@ -729,6 +729,19 @@ export function startPiezoStreamServer(): WebSocketServer {
 
   streamState.wss = new WebSocketServer({ port: WS_PORT, maxPayload: WS_MAX_PAYLOAD_BYTES })
   console.log(`[sensorStream] WebSocket server listening on port ${WS_PORT}`)
+  const rawFilesAtStartup = new Map<string, { size: number, dev: number, ino: number }>()
+  const startupRawPath = findLatestRaw(RAW_DATA_DIR)
+  if (startupRawPath) {
+    try {
+      const info = fs.statSync(startupRawPath)
+      rawFilesAtStartup.set(startupRawPath, {
+        size: info.size,
+        dev: info.dev,
+        ino: info.ino,
+      })
+    }
+    catch { /* The file may rotate between discovery and the startup snapshot. */ }
+  }
 
   streamState.wss.on('connection', (ws) => {
     console.log('[sensorStream] Client connected')
@@ -756,7 +769,7 @@ export function startPiezoStreamServer(): WebSocketServer {
   // The WS server is already accepting clients; pick and attach the frame source
   // (RAW file tailer vs loopback NATS) asynchronously so a slow NATS probe never
   // blocks client connections.
-  void selectAndStartSource(streamState.wss)
+  void selectAndStartSource(streamState.wss, rawFilesAtStartup)
 
   return streamState.wss
 }
@@ -764,10 +777,13 @@ export function startPiezoStreamServer(): WebSocketServer {
 /** Select once per server lifetime using this Pod's installation and a live
  * greeting. Unknown installations retain a grace window; known NATS firmware
  * keeps waiting through delayed starts. Sources never ingest concurrently. */
-async function selectAndStartSource(expectedServer: WebSocketServer): Promise<void> {
+async function selectAndStartSource(
+  expectedServer: WebSocketServer,
+  rawFilesAtStartup: ReadonlyMap<string, { size: number, dev: number, ino: number }>,
+): Promise<void> {
   const override = process.env.PIEZO_SENSOR_SOURCE
   if (NATS_SOURCE_DISABLED || override === 'raw') {
-    startRawTailingLoop()
+    startRawTailingLoop(rawFilesAtStartup)
     return
   }
   let discovery = override === 'nats' ? 'nats' : await discoverSensorSource()
@@ -796,7 +812,7 @@ async function selectAndStartSource(expectedServer: WebSocketServer): Promise<vo
   }
   if (streamState.wss !== expectedServer) return
   console.log('[sensorStream] selecting RAW source (%s installation)', discovery)
-  startRawTailingLoop()
+  startRawTailingLoop(rawFilesAtStartup)
 }
 
 /** Connect the loopback-NATS source, feeding decoded frames into the shared dispatch. */
@@ -909,7 +925,9 @@ function dispatchSensorFrame(frame: Record<string, unknown>): void {
  * can be replayed. Broadcasting is per-client guarded, so an idle loop does no
  * fan-out.
  */
-function startRawTailingLoop(): void {
+function startRawTailingLoop(
+  rawFilesAtStartup: ReadonlyMap<string, { size: number, dev: number, ino: number }>,
+): void {
   if (streamState.streamingInterval) return
   const expectedServer = streamState.wss
   if (!expectedServer) return
@@ -950,11 +968,24 @@ function startRawTailingLoop(): void {
           replaced = openInfo.ino !== pathInfo.ino || openInfo.dev !== pathInfo.dev
         }
         if (latest && (latest !== currentPath || replaced)) {
+          const startupFile = currentPath === null ? rawFilesAtStartup.get(latest) : undefined
+          let startOffset = 0
+          if (startupFile) {
+            try {
+              const info = await fs.promises.stat(latest)
+              if (info.dev === startupFile.dev && info.ino === startupFile.ino) {
+                startOffset = Math.min(startupFile.size, info.size)
+              }
+            }
+            catch { /* The file may rotate before the first open; read its replacement from zero. */ }
+          }
           await handle?.close()
           handle = null
           currentPath = latest
           reset()
-          console.log(`[sensorStream] Switched to RAW file: ${path.basename(latest)}`)
+          readOffset = startOffset
+          if (!active()) return
+          console.log(`[sensorStream] Switched to RAW file: ${path.basename(latest)} (tailing from ${readOffset} bytes)`)
         }
       }
       if (!active() || !currentPath) return

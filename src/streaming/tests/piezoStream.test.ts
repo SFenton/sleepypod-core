@@ -1917,7 +1917,7 @@ describe('piezoStream — server lifecycle and protocol', () => {
     }
   })
 
-  it('does not fan non-frzHealth file frames out to server-side listeners', async () => {
+  it('fans non-frzHealth file frames out to server-side listeners', async () => {
     const filePath = path.join(tmpRawDir, 'not-health.RAW')
     const rec = buildOuterRecord(1, [{ type: 'capSense', ts: 2300, left: 0, right: 0 }])
 
@@ -1928,7 +1928,7 @@ describe('piezoStream — server lifecycle and protocol', () => {
       const client = await connectClient(port)
       fs.writeFileSync(filePath, rec)
       await client.waitFor(m => m.type === 'capSense' && m.ts === 2300)
-      expect(cb).not.toHaveBeenCalled()
+      expect(cb).toHaveBeenCalledWith(expect.objectContaining({ type: 'capSense', ts: 2300 }))
       await client.close()
     }
     finally {
