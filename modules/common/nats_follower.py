@@ -28,6 +28,7 @@ annotations — ``Optional[...]`` only.
 
 import asyncio
 import logging
+import os
 import queue
 import socket
 import threading
@@ -50,6 +51,7 @@ NATS_DEFAULT_SERVER = "nats://127.0.0.1:4222"
 NATS_DEFAULT_HOST = "127.0.0.1"
 NATS_DEFAULT_PORT = 4222
 NATS_INFO_MAX_BYTES = 4096
+NATS_FIRMWARE_MARKER = Path("/persistent/jetstream")
 
 # Subjects consumed by the biometrics modules. raw.log lives outside these
 # prefixes on purpose — it is a firmware log channel surfaced by sp-status,
@@ -83,6 +85,22 @@ _FATAL = object()
 class NatsFollowerError(RuntimeError):
     """Raised out of NatsFollower.read_records() when the NATS connection is
     permanently lost, so the module exits and systemd restarts + re-probes."""
+
+
+def nats_firmware_expected(marker_path: Path = NATS_FIRMWARE_MARKER) -> bool:
+    """Return whether this pod generation requires NATS sensor ingestion.
+
+    The installer uses the persistent JetStream directory plus the installed
+    nats-server unit to identify new firmware. Runtime readers use the durable
+    directory marker; an environment override keeps tests and recovery paths
+    explicit without coupling Python modules to systemctl.
+    """
+    override = os.environ.get("SLEEPYPOD_FRAME_SOURCE", "").strip().lower()
+    if override == "nats":
+        return True
+    if override == "raw":
+        return False
+    return marker_path.is_dir()
 
 
 def nats_reachable(host: str = NATS_DEFAULT_HOST, port: int = NATS_DEFAULT_PORT,
@@ -346,7 +364,8 @@ class NatsFollower:
 def create_follower(raw_data_dir: Path, shutdown_event,
                     poll_interval: float = 0.5,
                     grace_seconds: float = NATS_GRACE_SECONDS,
-                    servers=NATS_DEFAULT_SERVER):
+                    servers=NATS_DEFAULT_SERVER,
+                    nats_required: Optional[bool] = None):
     """Select the record source once, at startup.
 
     Reachability decides; traffic does not (robustness over startup latency).
@@ -360,6 +379,12 @@ def create_follower(raw_data_dir: Path, shutdown_event,
     if wait_for_nats(shutdown_event, grace_seconds=grace_seconds):
         log.info("NATS reachable — using NatsFollower (new-firmware source)")
         return NatsFollower(shutdown_event, servers=servers)
+    required = (nats_firmware_expected()
+                if nats_required is None else nats_required)
+    if required and not shutdown_event.is_set():
+        raise NatsFollowerError(
+            "NATS firmware detected but NATS was unavailable after %.0fs"
+            % grace_seconds)
     log.info("NATS not reachable — tailing %s (.RAW source)", raw_data_dir)
     return RawFileFollower(raw_data_dir, shutdown_event, poll_interval=poll_interval)
 
