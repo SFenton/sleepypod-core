@@ -207,9 +207,12 @@ describe('module deployment guards', () => {
 
   it('publishes the irreversible NATS boundary before restarting consumers', () => {
     const helper = readFileSync(helperPath, 'utf8')
+    const guard = helper.indexOf('if [ "$migration_changed" = true ]; then')
     const committed = helper.indexOf('SLEEPYPOD_NATS_MIGRATION_COMMITTED=true')
     const consumers = helper.lastIndexOf('if ! restart_biometrics_consumers; then')
 
+    expect(guard).toBeGreaterThanOrEqual(0)
+    expect(guard).toBeLessThan(committed)
     expect(committed).toBeGreaterThanOrEqual(0)
     expect(committed).toBeLessThan(consumers)
   })
