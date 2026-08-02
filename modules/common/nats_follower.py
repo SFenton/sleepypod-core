@@ -365,7 +365,8 @@ def create_follower(raw_data_dir: Path, shutdown_event,
                     poll_interval: float = 0.5,
                     grace_seconds: float = NATS_GRACE_SECONDS,
                     servers=NATS_DEFAULT_SERVER,
-                    nats_required: Optional[bool] = None):
+                    nats_required: Optional[bool] = None,
+                    subjects: Iterable[str] = NATS_SENSOR_SUBJECTS):
     """Select the record source once, at startup.
 
     Reachability decides; traffic does not (robustness over startup latency).
@@ -378,7 +379,7 @@ def create_follower(raw_data_dir: Path, shutdown_event,
     """
     if wait_for_nats(shutdown_event, grace_seconds=grace_seconds):
         log.info("NATS reachable — using NatsFollower (new-firmware source)")
-        return NatsFollower(shutdown_event, servers=servers)
+        return NatsFollower(shutdown_event, servers=servers, subjects=subjects)
     required = (nats_firmware_expected()
                 if nats_required is None else nats_required)
     if required and not shutdown_event.is_set():

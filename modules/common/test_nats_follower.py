@@ -293,8 +293,11 @@ class TestCreateFollower:
     def test_selects_nats_when_reachable(self, monkeypatch, tmp_path):
         monkeypatch.setattr("common.nats_follower.nats_reachable",
                             lambda *a, **k: True)
-        src = create_follower(tmp_path, threading.Event(), poll_interval=0.01)
+        subjects = ("raw.sens.bedtemp", "raw.frz.temp")
+        src = create_follower(
+            tmp_path, threading.Event(), poll_interval=0.01, subjects=subjects)
         assert isinstance(src, NatsFollower)
+        assert src._subjects == subjects
 
     def test_falls_back_to_raw_when_unreachable(self, monkeypatch, tmp_path):
         monkeypatch.setattr("common.nats_follower.nats_reachable",
