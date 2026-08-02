@@ -180,11 +180,22 @@ fi
 WAN_WAS_BLOCKED=false
 DOWNLOAD_DIR=""
 INSTALL_MODULE_SWAP_ACTIVE=false
+SLEEPYPOD_NATS_MIGRATION_COMMITTED=false
 
 cleanup() {
   local exit_code=$?
 
-  if [ "$exit_code" -ne 0 ] && [ "$INSTALL_MODULE_SWAP_ACTIVE" = true ] \
+  if [ "$exit_code" -ne 0 ] && [ "$SLEEPYPOD_NATS_MIGRATION_COMMITTED" = true ]; then
+    echo "Installation failed after NATS migration; retaining NATS-capable modules." >&2
+    [ -n "${INSTALL_MODULE_STAGE:-}" ] && rm -rf "$INSTALL_MODULE_STAGE"
+    [ -n "${INSTALL_MODULE_BACKUP:-}" ] && rm -rf "$INSTALL_MODULE_BACKUP"
+    INSTALL_MODULE_SWAP_ACTIVE=false
+    if declare -p INSTALL_MODULE_NAMES >/dev/null 2>&1; then
+      for name in "${INSTALL_MODULE_NAMES[@]}"; do
+        systemctl restart "sleepypod-$name.service" 2>/dev/null || true
+      done
+    fi
+  elif [ "$exit_code" -ne 0 ] && [ "$INSTALL_MODULE_SWAP_ACTIVE" = true ] \
      && declare -F rollback_install_modules >/dev/null; then
     echo "Rolling back biometrics module installation..." >&2
     rollback_install_modules || true
@@ -1806,20 +1817,15 @@ fi
 # same state as fresh installs (issue #576). Guarded with -f to match the
 # pattern used for every other lib source above — without the guard,
 # --local mode against a pre-#576 working tree would abort under set -e.
-INSTALL_NATS_MIGRATION_COMMITTED=false
 if [ -f "$INSTALL_DIR/scripts/lib/biometrics-archiver-helpers" ]; then
   source "$INSTALL_DIR/scripts/lib/biometrics-archiver-helpers"
-  if [ -d /persistent/jetstream ] \
-     && systemctl cat nats-server.service >/dev/null 2>&1; then
-    INSTALL_NATS_MIGRATION_COMMITTED=true
-  fi
   install_biometrics_archiver
 fi
 if [ "$INSTALL_MODULE_SWAP_ACTIVE" = true ]; then
   sleep 5
   for name in "${INSTALL_MODULE_NAMES[@]}"; do
     if ! systemctl is-active --quiet "sleepypod-$name.service"; then
-      if [ "$INSTALL_NATS_MIGRATION_COMMITTED" = true ]; then
+      if [ "$SLEEPYPOD_NATS_MIGRATION_COMMITTED" = true ]; then
         echo "Error: module $name failed after NATS migration; retaining NATS-capable modules" >&2
         rm -rf "$INSTALL_MODULE_BACKUP"
         INSTALL_MODULE_SWAP_ACTIVE=false
