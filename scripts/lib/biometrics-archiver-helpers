@@ -32,6 +32,9 @@ remove_biometrics_archiver_for_nats() {
   local dropin="$systemd_dir/frank.service.d/sleepypod-biometrics-tmpfs.conf"
   local restart_frank=false
   local migration_changed=false
+  local routing_changed=false
+  local frank_routing_backup=""
+  local dropin_routing_backup=""
   local u
   local consumer
   local consumers=(
@@ -48,6 +51,41 @@ remove_biometrics_archiver_for_nats() {
     sleepypod-biometrics-pruner.timer
   )
   local active_timers=()
+
+  restore_previous_firmware_routing() {
+    local restore_failed=false
+    if [ -n "$frank_routing_backup" ] && [ -f "$frank_routing_backup" ]; then
+      if ! cp -pf "$frank_routing_backup" "$frank_sh"; then
+        echo "Error: failed to restore the prior frank.sh routing" >&2
+        restore_failed=true
+      fi
+    fi
+    if [ -n "$dropin_routing_backup" ] && [ -f "$dropin_routing_backup" ]; then
+      mkdir -p "$(dirname "$dropin")"
+      if ! cp -pf "$dropin_routing_backup" "$dropin"; then
+        echo "Error: failed to restore the prior frank.service drop-in" >&2
+        restore_failed=true
+      fi
+    fi
+    if [ "$routing_changed" = true ]; then
+      if ! systemctl daemon-reload 2>/dev/null \
+         || ! systemctl restart frank.service 2>/dev/null; then
+        echo "Error: failed to reactivate the previous firmware RAW routing" >&2
+        restore_failed=true
+      fi
+    fi
+    rm -f "$frank_routing_backup" "$dropin_routing_backup" 2>/dev/null || true
+    [ "$restore_failed" = false ]
+  }
+
+  abort_before_nats_boundary() {
+    if ! restore_previous_firmware_routing; then
+      # If RAW routing cannot be restored, retain the NATS-capable consumers
+      # instead of rolling back to modules that require a detached tmpfs.
+      SLEEPYPOD_NATS_MIGRATION_COMMITTED=true
+    fi
+    restore_biometrics_runtime || true
+  }
 
   if mountpoint -q "$tmpfs_dir" \
      || [ -f "$dropin" ] \
@@ -125,6 +163,12 @@ remove_biometrics_archiver_for_nats() {
   # firmware upgrade.
   if [ -f "$frank_sh" ] \
      && grep -q 'cd /persistent/biometrics' "$frank_sh"; then
+    frank_routing_backup="/tmp/sleepypod-frank-routing.$$"
+    if ! cp -pf "$frank_sh" "$frank_routing_backup"; then
+      echo "Error: failed to back up the current frank.sh routing" >&2
+      restore_biometrics_runtime || true
+      return 1
+    fi
     local backups newest_backup backup
     shopt -s nullglob
     backups=("$frank_sh".bak-pre-tmpfs-*)
@@ -138,37 +182,45 @@ remove_biometrics_archiver_for_nats() {
       done
       if ! cp -f "$newest_backup" "$frank_sh"; then
         echo "Error: failed to restore $frank_sh from $newest_backup" >&2
-        restore_biometrics_runtime || true
+        abort_before_nats_boundary
         return 1
       fi
     else
       if ! sed -i 's|cd /persistent/biometrics \&\&|cd /persistent \&\&|' \
         "$frank_sh"; then
         echo "Error: failed to restore the legacy frank.sh working directory" >&2
-        restore_biometrics_runtime || true
+        abort_before_nats_boundary
         return 1
       fi
     fi
+    routing_changed=true
     if grep -q 'cd /persistent/biometrics' "$frank_sh"; then
       echo "Error: frank.sh still points at the biometrics tmpfs after restoration" >&2
-      restore_biometrics_runtime || true
+      abort_before_nats_boundary
       return 1
     fi
     restart_frank=true
   fi
 
   if [ -f "$dropin" ]; then
-    if ! rm -f "$dropin"; then
-      echo "Error: failed to remove $dropin" >&2
-      restore_biometrics_runtime || true
+    dropin_routing_backup="/tmp/sleepypod-frank-dropin.$$"
+    if ! cp -pf "$dropin" "$dropin_routing_backup"; then
+      echo "Error: failed to back up $dropin" >&2
+      abort_before_nats_boundary
       return 1
     fi
+    if ! rm -f "$dropin"; then
+      echo "Error: failed to remove $dropin" >&2
+      abort_before_nats_boundary
+      return 1
+    fi
+    routing_changed=true
     restart_frank=true
   fi
   rmdir "$systemd_dir/frank.service.d" 2>/dev/null || true
   if ! systemctl daemon-reload 2>/dev/null; then
     echo "Error: failed to reload systemd before NATS firmware cleanup" >&2
-    restore_biometrics_runtime || true
+    abort_before_nats_boundary
     return 1
   fi
 
@@ -179,7 +231,7 @@ remove_biometrics_archiver_for_nats() {
   if [ "$restart_frank" = true ] || mountpoint -q "$tmpfs_dir"; then
     if ! systemctl restart frank.service 2>/dev/null; then
       echo "Error: failed to restart frank.service; preserving RAW tmpfs and recovery tools" >&2
-      restore_biometrics_runtime || true
+      abort_before_nats_boundary
       return 1
     fi
   fi
@@ -193,7 +245,7 @@ remove_biometrics_archiver_for_nats() {
     if [ -x "$archiver_bin" ] \
        && ! KEEP_RECENT_MIN=-1 "$archiver_bin"; then
       echo "Error: failed to archive all remaining tmpfs RAW frames; preserving mount and recovery tools" >&2
-      restore_biometrics_runtime || true
+      abort_before_nats_boundary
       return 1
     fi
 
@@ -208,7 +260,7 @@ remove_biometrics_archiver_for_nats() {
       [ -f "$raw_file" ] || continue
       if [ "$(basename "$raw_file")" != "SEQNO.RAW" ]; then
         echo "Error: unarchived RAW frame remains at $raw_file; preserving mount and recovery tools" >&2
-        restore_biometrics_runtime || true
+        abort_before_nats_boundary
         return 1
       fi
     done
@@ -228,15 +280,16 @@ remove_biometrics_archiver_for_nats() {
   if ! systemctl stop persistent-biometrics.mount 2>/dev/null \
      && [ "$tmpfs_was_mounted" = true ]; then
     echo "Error: failed to stop persistent-biometrics.mount; preserving recovery tools" >&2
-    restore_biometrics_runtime || true
+    abort_before_nats_boundary
     return 1
   fi
   if mountpoint -q "$tmpfs_dir"; then
     echo "Error: $tmpfs_dir is still mounted; preserving recovery tools" >&2
-    restore_biometrics_runtime || true
+    abort_before_nats_boundary
     return 1
   fi
   systemctl disable persistent-biometrics.mount 2>/dev/null || true
+  rm -f "$frank_routing_backup" "$dropin_routing_backup" 2>/dev/null || true
 
   # The legacy tmpfs is now verified unmounted and firmware no longer depends
   # on its working-directory override. From this point onward callers must not
