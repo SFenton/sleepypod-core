@@ -82,6 +82,7 @@ vi.mock('@/src/hardware/dacMonitor.instance', () => ({
 import {
   __test__,
   getLatestCapSenseSnapshot,
+  onServerFrame,
   shutdownPiezoStreamServer,
   startPiezoStreamServer,
 } from '../piezoStream'
@@ -313,6 +314,59 @@ describe('startPiezoStreamServer — source selection', () => {
       const left = getLatestCapSenseSnapshot()?.left
       return Array.isArray(left) && left[0] === 45
     })
+  })
+
+  it('drains a rotated startup RAW tail before attaching to the new file', async () => {
+    natsMock.reachable = false
+    const firstPath = path.join(tmpRawDir, 'rotation-a.RAW')
+    const secondPath = path.join(tmpRawDir, 'rotation-b.RAW')
+    const now = Math.floor(Date.now() / 1000)
+    const observed: number[] = []
+    const unsubscribe = onServerFrame((frame) => {
+      if (frame.type !== 'capSense') return
+      const left = frame.left as { out?: number }
+      if (typeof left?.out === 'number') observed.push(left.out)
+    })
+
+    try {
+      fs.writeFileSync(
+        firstPath,
+        buildOuterRecord(7, {
+          type: 'capSense',
+          ts: now,
+          left: { out: 1, cen: 2, in: 3 },
+          right: { out: 4, cen: 5, in: 6 },
+        }),
+      )
+
+      startPiezoStreamServer()
+
+      fs.appendFileSync(
+        firstPath,
+        buildOuterRecord(8, {
+          type: 'capSense',
+          ts: now + 1,
+          left: { out: 55, cen: 56, in: 57 },
+          right: { out: 58, cen: 59, in: 60 },
+        }),
+      )
+      fs.writeFileSync(
+        secondPath,
+        buildOuterRecord(9, {
+          type: 'capSense',
+          ts: now + 2,
+          left: { out: 65, cen: 66, in: 67 },
+          right: { out: 68, cen: 69, in: 70 },
+        }),
+      )
+
+      await waitFor(() => observed.includes(55) && observed.includes(65))
+      expect(observed).not.toContain(1)
+      expect(observed.indexOf(55)).toBeLessThan(observed.indexOf(65))
+    }
+    finally {
+      unsubscribe()
+    }
   })
 
   it('continues probing after a reachability probe throws, then selects RAW', async () => {

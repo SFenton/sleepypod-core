@@ -339,6 +339,41 @@ export function findLatestRaw(dir: string): string | null {
   return findLatestRawIn(path.join(dir, RAW_DATA_FALLBACK_SUBDIR))
 }
 
+interface RawFileStartupSnapshot {
+  size: number
+  dev: number
+  ino: number
+}
+
+function snapshotRawFilesAtStartup(dir: string): Map<string, RawFileStartupSnapshot> {
+  for (const candidate of [dir, path.join(dir, RAW_DATA_FALLBACK_SUBDIR)]) {
+    try {
+      const files = fs.readdirSync(candidate)
+        .filter(entry => entry.endsWith('.RAW') && entry !== 'SEQNO.RAW')
+        .flatMap((entry) => {
+          const filePath = path.join(candidate, entry)
+          try {
+            const info = fs.statSync(filePath)
+            if (!info.isFile()) return []
+            return [{ filePath, info }]
+          }
+          catch {
+            return []
+          }
+        })
+        .sort((a, b) => a.info.mtimeMs - b.info.mtimeMs || a.filePath.localeCompare(b.filePath))
+      if (files.length > 0) {
+        return new Map(files.map(({ filePath, info }) => [
+          filePath,
+          { size: info.size, dev: info.dev, ino: info.ino },
+        ]))
+      }
+    }
+    catch { /* Try the older firmware location. */ }
+  }
+  return new Map()
+}
+
 /** Async counterpart for the hot tailing path. Files can rotate while being
  * inspected; one disappearing entry must not hide all the remaining captures. */
 async function findLatestRawAsync(dir: string): Promise<string | null> {
@@ -351,7 +386,9 @@ async function findLatestRawAsync(dir: string): Promise<string | null> {
         const filePath = path.join(candidate, entry)
         try {
           const info = await fs.promises.stat(filePath)
-          if (info.isFile() && (!latest || info.mtimeMs > latest.mtime)) {
+          if (info.isFile() && (!latest
+            || info.mtimeMs > latest.mtime
+            || (info.mtimeMs === latest.mtime && filePath.localeCompare(latest.path) > 0))) {
             latest = { path: filePath, mtime: info.mtimeMs }
           }
         }
@@ -729,19 +766,7 @@ export function startPiezoStreamServer(): WebSocketServer {
 
   streamState.wss = new WebSocketServer({ port: WS_PORT, maxPayload: WS_MAX_PAYLOAD_BYTES })
   console.log(`[sensorStream] WebSocket server listening on port ${WS_PORT}`)
-  const rawFilesAtStartup = new Map<string, { size: number, dev: number, ino: number }>()
-  const startupRawPath = findLatestRaw(RAW_DATA_DIR)
-  if (startupRawPath) {
-    try {
-      const info = fs.statSync(startupRawPath)
-      rawFilesAtStartup.set(startupRawPath, {
-        size: info.size,
-        dev: info.dev,
-        ino: info.ino,
-      })
-    }
-    catch { /* The file may rotate between discovery and the startup snapshot. */ }
-  }
+  const rawFilesAtStartup = snapshotRawFilesAtStartup(RAW_DATA_DIR)
 
   streamState.wss.on('connection', (ws) => {
     console.log('[sensorStream] Client connected')
@@ -779,7 +804,7 @@ export function startPiezoStreamServer(): WebSocketServer {
  * keeps waiting through delayed starts. Sources never ingest concurrently. */
 async function selectAndStartSource(
   expectedServer: WebSocketServer,
-  rawFilesAtStartup: ReadonlyMap<string, { size: number, dev: number, ino: number }>,
+  rawFilesAtStartup: ReadonlyMap<string, RawFileStartupSnapshot>,
 ): Promise<void> {
   const override = process.env.PIEZO_SENSOR_SOURCE
   if (NATS_SOURCE_DISABLED || override === 'raw') {
@@ -926,7 +951,7 @@ function dispatchSensorFrame(frame: Record<string, unknown>): void {
  * fan-out.
  */
 function startRawTailingLoop(
-  rawFilesAtStartup: ReadonlyMap<string, { size: number, dev: number, ino: number }>,
+  rawFilesAtStartup: ReadonlyMap<string, RawFileStartupSnapshot>,
 ): void {
   if (streamState.streamingInterval) return
   const expectedServer = streamState.wss
@@ -942,6 +967,8 @@ function startRawTailingLoop(
   let moreOnDisk = false
   let stopped = false
   let pending: Promise<void> | null = null
+  const startupQueue = [...rawFilesAtStartup.keys()]
+  let drainingStartupFile = false
   const active = () => !stopped && streamState.wss === expectedServer
   const reset = () => {
     fileBuffer = Buffer.alloc(0)
@@ -958,7 +985,11 @@ function startRawTailingLoop(
     catchingUp = false
     try {
       if (performance.now() >= nextScanAt) {
-        const latest = await findLatestRawAsync(RAW_DATA_DIR)
+        const latest = currentPath && drainingStartupFile
+          ? currentPath
+          : currentPath === null && startupQueue.length > 0
+            ? startupQueue[0]
+            : await findLatestRawAsync(RAW_DATA_DIR)
         if (!active()) return
         nextScanAt = performance.now() + RAW_SCAN_INTERVAL_MS
         let replaced = false
@@ -968,6 +999,7 @@ function startRawTailingLoop(
           replaced = openInfo.ino !== pathInfo.ino || openInfo.dev !== pathInfo.dev
         }
         if (latest && (latest !== currentPath || replaced)) {
+          drainingStartupFile = currentPath === null && startupQueue[0] === latest
           const startupFile = currentPath === null ? rawFilesAtStartup.get(latest) : undefined
           let startOffset = 0
           if (startupFile) {
@@ -996,7 +1028,22 @@ function startRawTailingLoop(
         if (!active()) return
         if (info.size < readOffset) reset() // in-place truncation
         const length = Math.min(RAW_READ_BYTES, info.size - readOffset)
-        if (length <= 0) return
+        if (length <= 0) {
+          if (drainingStartupFile && fileBuffer.length === 0) {
+            const latest = await findLatestRawAsync(RAW_DATA_DIR)
+            if (!active()) return
+            if (latest !== currentPath) {
+              await handle.close()
+              handle = null
+              if (startupQueue[0] === currentPath) startupQueue.shift()
+              currentPath = null
+              drainingStartupFile = false
+              nextScanAt = 0
+              catchingUp = true
+            }
+          }
+          return
+        }
         const bytes = Buffer.allocUnsafe(length)
         const { bytesRead } = await handle.read(bytes, 0, length, readOffset)
         if (!active()) return
@@ -1040,6 +1087,16 @@ function startRawTailingLoop(
     catch {
       await handle?.close().catch(() => {})
       handle = null
+      if (drainingStartupFile && currentPath) {
+        try {
+          await fs.promises.stat(currentPath)
+        }
+        catch {
+          if (startupQueue[0] === currentPath) startupQueue.shift()
+          currentPath = null
+          drainingStartupFile = false
+        }
+      }
       nextScanAt = 0
     }
   }
