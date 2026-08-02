@@ -299,7 +299,7 @@ class CapCalibrator:
 
         # Compute baselines from best window
         window_end = min(best_start + window_samples, len(timestamps))
-        baseline = {"channels": {}, "threshold": 6.0}
+        baseline = {"channels": {}, "threshold": 6.0, "format": "capSense"}
 
         for ch in self.CHANNELS:
             segment = channels[ch][best_start:window_end]

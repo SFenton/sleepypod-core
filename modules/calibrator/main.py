@@ -19,11 +19,13 @@ import os
 import sys
 import time
 import math
+import json
 import signal
 import logging
 import sqlite3
 import threading
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -236,16 +238,42 @@ def run_calibration(store: CalibrationStore, side: str, sensor_type: str,
         return False
 
 
-def compute_pending(store: CalibrationStore, now: float) -> set:
+def live_capacitance_format(buffer) -> Optional[str]:
+    """Return the newest buffered capacitance dialect, if one is available."""
+    if buffer is None:
+        return None
+    snapshot = buffer.snapshot()
+    newest = None
+    for rtype, profile_format in (("capSense", "capSense"),
+                                  ("capSense2", "capSense2")):
+        for record in snapshot.get(rtype, []):
+            try:
+                ts = float(record.get("ts"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if math.isfinite(ts) and (newest is None or ts > newest[0]):
+                newest = (ts, profile_format)
+    return newest[1] if newest else None
+
+
+def compute_pending(store: CalibrationStore, now: float, buffer=None) -> set:
     """Return the set of (side, sensor_type) whose profile is missing or
     expired and therefore still needs (re)calibration."""
     pending = set()
+    live_format = live_capacitance_format(buffer)
     for side in CAL_SIDES:
         for sensor_type in CAL_SENSOR_TYPES:
             profile = store.get_active(side, sensor_type)
             needs = profile is None
             if profile and profile.get("expires_at"):
                 needs = profile["expires_at"] < now
+            if profile and sensor_type == "capacitance" and live_format:
+                try:
+                    params = json.loads(profile.get("parameters") or "{}")
+                except (TypeError, ValueError):
+                    params = {}
+                profile_format = params.get("format", "capSense")
+                needs = needs or profile_format != live_format
             if needs:
                 pending.add((side, sensor_type))
     return pending
@@ -260,10 +288,10 @@ def run_pending_calibrations(store: CalibrationStore, now: float,
     on the next tick — the one-shot startup failure never persists until the
     next process restart.
     """
-    pending = compute_pending(store, now)
+    pending = compute_pending(store, now, buffer=buffer)
     for side, sensor_type in sorted(pending):
         run_calibration(store, side, sensor_type, triggered_by, buffer=buffer)
-    return compute_pending(store, time.time())
+    return compute_pending(store, time.time(), buffer=buffer)
 
 
 def next_retry_interval(current: float, remaining: set) -> float:
@@ -359,7 +387,8 @@ def main() -> None:
                                         buffer=nats_buffer)
 
                 watcher.clear_trigger()
-                remaining = compute_pending(store, time.time())
+                remaining = compute_pending(
+                    store, time.time(), buffer=nats_buffer)
                 retry_interval = CAL_RETRY_INITIAL_S
                 last_retry = time.time()
 
@@ -372,7 +401,8 @@ def main() -> None:
                         run_calibration(store, side, st, triggered_by="daily",
                                         buffer=nats_buffer)
                 daily_last_run = now
-                remaining = compute_pending(store, time.time())
+                remaining = compute_pending(
+                    store, time.time(), buffer=nats_buffer)
                 retry_interval = CAL_RETRY_INITIAL_S
                 last_retry = time.time()
 
@@ -384,6 +414,9 @@ def main() -> None:
 
             # Retry any still-missing/failed profiles as samples accrue.
             now = time.time()
+            if nats_buffer is not None:
+                remaining |= compute_pending(
+                    store, now, buffer=nats_buffer)
             if remaining and now - last_retry >= retry_interval:
                 last_retry = now
                 remaining = run_pending_calibrations(store, now, "retry",
