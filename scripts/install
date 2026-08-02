@@ -179,9 +179,19 @@ fi
 # Cleanup handler — re-blocks WAN if we unblocked it
 WAN_WAS_BLOCKED=false
 DOWNLOAD_DIR=""
+INSTALL_MODULE_SWAP_ACTIVE=false
 
 cleanup() {
   local exit_code=$?
+
+  if [ "$exit_code" -ne 0 ] && [ "$INSTALL_MODULE_SWAP_ACTIVE" = true ] \
+     && declare -F rollback_install_modules >/dev/null; then
+    echo "Rolling back biometrics module installation..." >&2
+    rollback_install_modules || true
+    [ -n "${INSTALL_MODULE_STAGE:-}" ] && rm -rf "$INSTALL_MODULE_STAGE"
+    [ -n "${INSTALL_MODULE_BACKUP:-}" ] && rm -rf "$INSTALL_MODULE_BACKUP"
+    INSTALL_MODULE_SWAP_ACTIVE=false
+  fi
 
   # Clean up temp download directory
   [ -n "$DOWNLOAD_DIR" ] && rm -rf "$DOWNLOAD_DIR"
@@ -1653,89 +1663,106 @@ if ! command -v uv &>/dev/null; then
   echo "Error: uv installation failed — refusing to continue without biometrics modules" >&2
   exit 1
 else
-  install_module() {
-    local name="$1"
-    local src="$MODULES_SRC/$name"
-    local dest="$MODULES_DEST/$name"
-    local service="sleepypod-$name.service"
+  INSTALL_MODULE_STAGE=$(mktemp -d "$MODULES_DEST/.install-stage.XXXXXX")
+  INSTALL_MODULE_BACKUP=$(mktemp -d "$MODULES_DEST/.install-backup.XXXXXX")
+  INSTALL_MODULE_NAMES=()
+  INSTALL_SWAPPED_MODULES=()
+  INSTALL_ACTIVE_MODULES=()
+  INSTALL_COMMON_SWAPPED=false
+  mkdir -p "$INSTALL_MODULE_BACKUP/units"
 
-    if [ ! -d "$src" ]; then
-      echo "Warning: module source not found at $src, skipping"
-      return
+  rollback_install_modules() {
+    local i
+    local rollback_mod
+    local rollback_svc
+
+    for ((i=${#INSTALL_SWAPPED_MODULES[@]} - 1; i >= 0; i--)); do
+      rollback_mod="${INSTALL_SWAPPED_MODULES[$i]}"
+      rollback_svc="sleepypod-$rollback_mod.service"
+      systemctl stop "$rollback_svc" 2>/dev/null || true
+      rm -rf "$MODULES_DEST/$rollback_mod"
+      if [ -d "$INSTALL_MODULE_BACKUP/$rollback_mod" ]; then
+        mv "$INSTALL_MODULE_BACKUP/$rollback_mod" "$MODULES_DEST/$rollback_mod"
+      fi
+      if [ -f "$INSTALL_MODULE_BACKUP/units/$rollback_svc" ]; then
+        cp -f "$INSTALL_MODULE_BACKUP/units/$rollback_svc" "/etc/systemd/system/$rollback_svc"
+      else
+        rm -f "/etc/systemd/system/$rollback_svc"
+      fi
+    done
+
+    if [ "$INSTALL_COMMON_SWAPPED" = true ]; then
+      rm -rf "$MODULES_DEST/common"
+      if [ -d "$INSTALL_MODULE_BACKUP/common" ]; then
+        mv "$INSTALL_MODULE_BACKUP/common" "$MODULES_DEST/common"
+      fi
     fi
 
-    echo "Installing module: $name..."
+    systemctl daemon-reload 2>/dev/null || true
+    for rollback_mod in "${INSTALL_ACTIVE_MODULES[@]}"; do
+      systemctl restart "sleepypod-$rollback_mod.service" 2>/dev/null || true
+    done
+  }
 
-    # Copy module files
-    mkdir -p "$dest"
-    cp -r "$src/." "$dest/"
-
-    # Remove orphaned venv/ from pre-uv installs
-    rm -rf "$dest/venv"
-
-    # Also wipe any existing .venv. An upgraded install from pre-v1.7.3
-    # would otherwise retain a .venv whose bin/python symlink points at
-    # /home/root/.local/share/uv/… (root-only, mode 0700) and User=dac
-    # services (calibrator, environment-monitor) would still fail 203/EXEC
-    # even though we've since set UV_PYTHON_INSTALL_DIR. Fresh recreation
-    # is cheap: uv's content-addressable cache reuses the managed Python
-    # and wheels, only the venv metadata is re-linked.
-    rm -rf "$dest/.venv"
-
-    # Create Python environment with uv (no ensurepip/pyexpat needed).
-    # No --python flag: let uv pick from requires-python in pyproject.toml.
-    # If system python3 is in range it's used; otherwise uv downloads a
-    # compatible managed interpreter into UV_PYTHON_INSTALL_DIR (set above
-    # to /opt/sleepypod/python so User=dac modules can execute it).
-    #
-    # Exception: Pod 3 firmware (debian variant) ships /usr/bin/python3
-    # = 3.9.9 with `unittest`, `dataclasses`, and `pyexpat` stripped from
-    # the stdlib. The version range check passes so uv would happily
-    # bind to it, then the module crashes at startup with
-    # `ModuleNotFoundError: No module named 'unittest'` once numpy lazy-
-    # imports numpy.testing. Force uv onto a managed interpreter when
-    # the stdlib probe (scripts/pod/capabilities) says it's not intact.
+  # Build every venv before touching the live module tree.
+  for name in piezo-processor sleep-detector environment-monitor calibrator cover-buttons; do
+    src="$MODULES_SRC/$name"
+    if [ ! -d "$src" ]; then
+      echo "Warning: module source not found at $src, skipping"
+      continue
+    fi
+    echo "Staging module: $name..."
+    INSTALL_MODULE_NAMES+=("$name")
+    stage="$INSTALL_MODULE_STAGE/$name"
+    mkdir -p "$stage"
+    cp -r "$src/." "$stage/"
+    rm -rf "$stage/venv" "$stage/.venv"
     _uv_sync_args=(--frozen)
     if [ "${SYSTEM_PYTHON_STDLIB_INTACT:-true}" = "false" ]; then
       _uv_sync_args+=(--python-preference only-managed)
     fi
-    (cd "$dest" && uv sync "${_uv_sync_args[@]}") || {
-      echo "Error: uv sync failed for module $name" >&2
-      unset _uv_sync_args
-      return 1
-    }
+    if ! (cd "$stage" && uv sync "${_uv_sync_args[@]}"); then
+      echo "Error: uv sync failed for module $name — live modules were not replaced" >&2
+      rm -rf "$INSTALL_MODULE_STAGE" "$INSTALL_MODULE_BACKUP"
+      exit 1
+    fi
     unset _uv_sync_args
+    chmod -R o+rX "$stage/.venv" 2>/dev/null || true
+  done
 
-    # Ensure non-root service users (User=dac on calibrator + env-monitor)
-    # can read the venv dir + traverse the managed-Python symlink target.
-    chmod -R o+rX "$dest/.venv" 2>/dev/null || true
+  INSTALL_MODULE_SWAP_ACTIVE=true
+  if [ -d "$MODULES_SRC/common" ]; then
+    mkdir -p "$INSTALL_MODULE_STAGE/common"
+    cp -r "$MODULES_SRC/common/." "$INSTALL_MODULE_STAGE/common/"
+    if [ -d "$MODULES_DEST/common" ]; then
+      mv "$MODULES_DEST/common" "$INSTALL_MODULE_BACKUP/common"
+    fi
+    INSTALL_COMMON_SWAPPED=true
+    mv "$INSTALL_MODULE_STAGE/common" "$MODULES_DEST/common"
+  fi
 
-    # Install systemd service. Substitute the chosen $DATA_DIR for the
-    # baked-in /persistent/sleepypod-data — ReadWritePaths= and the
-    # DATABASE_URL= envs in the unit reference that path, and on installs
-    # where the picker chose /sleepypod-data (rootfs larger than
-    # /persistent — e.g. Pod 3 + SD card) the hardcoded path doesn't
-    # exist, so systemd fails the namespace bind-mount with "Failed to
-    # set up mount namespacing: .../persistent/sleepypod-data: No such
-    # file or directory". ReadWritePaths= is a unit directive so an
-    # EnvironmentFile drop-in can't fix it — substitution at install
-    # time is the only path.
-    #
-    # The match requires /persistent/sleepypod-data to be followed by
-    # one of [/" \t] (path separator, env-value quote closer, or
-    # whitespace) OR end-of-line, so any future hardcoded path that
-    # legitimately starts with the same stem (e.g.
-    # /persistent/sleepypod-data-old/foo) is NOT partially rewritten.
-    # The replacement is sed-escaped for `\` and `&` so an exotic
-    # --data-dir override can't trigger sed's whole-match (&) or
-    # escape (\) substitution syntax. sp-update has the same block —
-    # keep them in sync.
-    if [ -f "$dest/$service" ]; then
+  for name in "${INSTALL_MODULE_NAMES[@]}"; do
+    service="sleepypod-$name.service"
+    unit_backup="$INSTALL_MODULE_BACKUP/units/$service"
+    if [ -f "/etc/systemd/system/$service" ]; then
+      cp -f "/etc/systemd/system/$service" "$unit_backup"
+    fi
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+      INSTALL_ACTIVE_MODULES+=("$name")
+      systemctl stop "$service"
+    fi
+    if [ -d "$MODULES_DEST/$name" ]; then
+      mv "$MODULES_DEST/$name" "$INSTALL_MODULE_BACKUP/$name"
+    fi
+    INSTALL_SWAPPED_MODULES+=("$name")
+    mv "$INSTALL_MODULE_STAGE/$name" "$MODULES_DEST/$name"
+
+    if [ -f "$MODULES_DEST/$name/$service" ]; then
       _data_dir_sed=${DATA_DIR//\\/\\\\}
       _data_dir_sed=${_data_dir_sed//&/\\&}
       _data_dir_sed=${_data_dir_sed//|/\\|}
       sed -E "s|/persistent/sleepypod-data([/\"[:space:]])|${_data_dir_sed}\\1|g; s|/persistent/sleepypod-data\$|${_data_dir_sed}|g" \
-        "$dest/$service" > "/etc/systemd/system/$service"
+        "$MODULES_DEST/$name/$service" > "/etc/systemd/system/$service"
       chmod 0644 "/etc/systemd/system/$service"
       unset _data_dir_sed
       systemctl daemon-reload
@@ -1745,19 +1772,9 @@ else
     else
       echo "Warning: no service file found for $name"
     fi
-  }
+  done
 
-  # Copy shared common package (used by all modules via sys.path)
-  if [ -d "$MODULES_SRC/common" ]; then
-    mkdir -p "$MODULES_DEST/common"
-    cp -r "$MODULES_SRC/common/." "$MODULES_DEST/common/"
-  fi
-
-  install_module "piezo-processor"
-  install_module "sleep-detector"
-  install_module "environment-monitor"
-  install_module "calibrator"
-  install_module "cover-buttons"
+  rm -rf "$INSTALL_MODULE_STAGE"
 
   # Drop the uv download cache once all .venvs are populated. uv hardlinks
   # site-packages from the cache into each module's .venv (same FS = rootfs),
@@ -1780,6 +1797,10 @@ fi
 if [ -f "$INSTALL_DIR/scripts/lib/biometrics-archiver-helpers" ]; then
   source "$INSTALL_DIR/scripts/lib/biometrics-archiver-helpers"
   install_biometrics_archiver
+fi
+if [ "$INSTALL_MODULE_SWAP_ACTIVE" = true ]; then
+  rm -rf "$INSTALL_MODULE_BACKUP"
+  INSTALL_MODULE_SWAP_ACTIVE=false
 fi
 
 # ============================================================================
