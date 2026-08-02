@@ -203,6 +203,31 @@ describe('remove_biometrics_archiver_for_nats', () => {
     expect(existsSync(recoveryTool)).toBe(false)
   })
 
+  it('stops active RAW consumers before unmounting and restarts them afterward', () => {
+    const result = runHelper()
+
+    expect(result.status).toBe(0)
+    const lines = calls().trim().split('\n')
+    const consumerStop = lines.indexOf('stop sleepypod-cover-buttons.service')
+    const mountStop = lines.indexOf('stop persistent-biometrics.mount')
+    const consumerRestart = lines.indexOf('restart sleepypod-calibrator.service')
+
+    expect(consumerStop).toBeGreaterThanOrEqual(0)
+    expect(consumerStop).toBeLessThan(mountStop)
+    expect(consumerRestart).toBeGreaterThan(mountStop)
+  })
+
+  it('restarts active RAW consumers when cleanup fails', () => {
+    writeRaw()
+    writeExecutable(archiverBin, ['#!/usr/bin/env bash', 'exit 1'])
+
+    const result = runHelper()
+
+    expect(result.status).toBe(1)
+    expect(calls()).toContain('restart sleepypod-piezo-processor.service')
+    expect(calls()).toContain('restart sleepypod-calibrator.service')
+  })
+
   it('restores a patched frank.sh and restarts frank.service', () => {
     const original = '#!/usr/bin/env bash\ncd /persistent && exec ./frankenfirmware\n'
     writeFileSync(frankSh, '#!/usr/bin/env bash\ncd /persistent/biometrics && exec ./frankenfirmware\n')
