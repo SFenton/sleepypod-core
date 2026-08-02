@@ -1349,7 +1349,7 @@ SUPP_GROUPS_LINE=""
 cat > /etc/systemd/system/sleepypod.service << EOF
 [Unit]
 Description=SleepyPod Core Service
-After=network.target
+After=network.target nats-server.service
 
 [Service]
 Type=simple
