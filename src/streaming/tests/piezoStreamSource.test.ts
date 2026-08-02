@@ -126,6 +126,8 @@ describe('startPiezoStreamServer — source selection', () => {
     natsMock.startCalls = 0
     natsMock.stopCalls = 0
     natsMock.captured = null
+    delete process.env.PIEZO_NATS_REQUIRED
+    delete process.env.PIEZO_NATS_MARKER_DIR
     for (const f of fs.readdirSync(tmpRawDir)) fs.rmSync(path.join(tmpRawDir, f), { force: true })
     vi.clearAllMocks()
   })
@@ -261,10 +263,39 @@ describe('startPiezoStreamServer — source selection', () => {
     })
     expect(startNatsFrameSource).toHaveBeenCalledTimes(1)
     expect(error).toHaveBeenCalledWith(
-      '[sensorStream] NATS connect failed, falling back to .RAW tailing:',
+      '[sensorStream] NATS connect failed:',
       natsMock.startError,
     )
     error.mockRestore()
+  })
+
+  it('keeps retrying NATS instead of selecting RAW when firmware requires it', async () => {
+    process.env.PIEZO_NATS_REQUIRED = '1'
+    natsMock.reachable = false
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    startPiezoStreamServer()
+
+    const now = Math.floor(Date.now() / 1000)
+    fs.writeFileSync(
+      path.join(tmpRawDir, 'required-nats.RAW'),
+      buildOuterRecord(4, {
+        type: 'capSense',
+        ts: now,
+        left: { out: 35, cen: 36, in: 37 },
+        right: { out: 38, cen: 39, in: 40 },
+      }),
+    )
+
+    await waitFor(() => warn.mock.calls.length > 0)
+    expect(getLatestCapSenseSnapshot()).toBeNull()
+    expect(warn).toHaveBeenCalledWith(
+      '[sensorStream] NATS firmware detected but server unavailable — continuing to retry',
+    )
+
+    natsMock.reachable = true
+    await waitFor(() => __test__.natsSourceActive)
+    expect(startNatsFrameSource).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
   })
 
   it('stops source selection when shutdown happens during the retry delay', async () => {
@@ -341,5 +372,16 @@ describe('startPiezoStreamServer — source selection', () => {
     expect(__test__.envMilliseconds('TEST_NATS_TIMING', 123, 1)).toBe(123)
     expect(__test__.envMilliseconds('TEST_NATS_TIMING', 123, 0)).toBe(0)
     delete process.env.TEST_NATS_TIMING
+  })
+
+  it('detects NATS-required firmware from an override or marker directory', () => {
+    process.env.PIEZO_NATS_REQUIRED = '1'
+    expect(__test__.natsSourceRequired()).toBe(true)
+    process.env.PIEZO_NATS_REQUIRED = '0'
+    expect(__test__.natsSourceRequired()).toBe(false)
+
+    delete process.env.PIEZO_NATS_REQUIRED
+    process.env.PIEZO_NATS_MARKER_DIR = tmpRawDir
+    expect(__test__.natsSourceRequired()).toBe(true)
   })
 })

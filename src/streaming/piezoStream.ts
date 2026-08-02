@@ -86,6 +86,13 @@ function envMilliseconds(name: string, fallback: number, minimum: number): numbe
 const NATS_GRACE_MS = envMilliseconds('PIEZO_NATS_GRACE_MS', 60_000, 0)
 const NATS_PROBE_INTERVAL_MS = envMilliseconds('PIEZO_NATS_PROBE_INTERVAL_MS', 5_000, 1)
 
+function natsSourceRequired(): boolean {
+  const override = process.env.PIEZO_NATS_REQUIRED
+  if (override !== undefined) return override === '1'
+  const marker = process.env.PIEZO_NATS_MARKER_DIR ?? '/persistent/jetstream'
+  return fs.existsSync(marker)
+}
+
 // ---------------------------------------------------------------------------
 // In-memory sidecar index: maps timestamps to byte offsets in the current RAW
 // file. Built incrementally as frames are parsed during live streaming.
@@ -697,6 +704,7 @@ function updatePollRate(): void {
 export function startPiezoStreamServer(): WebSocketServer {
   if (wss) return wss
 
+  latestCapSenseSnapshot = null
   wss = new WebSocketServer({ port: WS_PORT, maxPayload: WS_MAX_PAYLOAD_BYTES })
   console.log(`[sensorStream] WebSocket server listening on port ${WS_PORT}`)
   const rawFilesAtStartup = new Set<string>()
@@ -745,8 +753,10 @@ async function selectAndStartSource(
   server: WebSocketServer,
   rawFilesAtStartup: ReadonlySet<string>,
 ): Promise<void> {
+  const natsRequired = natsSourceRequired()
   if (!NATS_SOURCE_DISABLED) {
     const deadline = Date.now() + NATS_GRACE_MS
+    let requiredWaitLogged = false
     for (;;) {
       if (wss !== server) return // shut down or superseded by a restart
       let reachable = false
@@ -758,12 +768,22 @@ async function selectAndStartSource(
       }
       if (wss !== server) return
       if (reachable) {
-        await startNatsSource(server, rawFilesAtStartup)
-        return
+        const started = await startNatsSource(server, rawFilesAtStartup)
+        if (started) return
+        if (!natsRequired) break
       }
       const remaining = deadline - Date.now()
-      if (remaining <= 0) break
-      await new Promise(resolve => setTimeout(resolve, Math.min(NATS_PROBE_INTERVAL_MS, remaining)))
+      if (remaining <= 0) {
+        if (!natsRequired) break
+        if (!requiredWaitLogged) {
+          requiredWaitLogged = true
+          console.warn('[sensorStream] NATS firmware detected but server unavailable — continuing to retry')
+        }
+        await new Promise(resolve => setTimeout(resolve, NATS_PROBE_INTERVAL_MS))
+      }
+      else {
+        await new Promise(resolve => setTimeout(resolve, Math.min(NATS_PROBE_INTERVAL_MS, remaining)))
+      }
     }
     console.log('[sensorStream] no NATS server after %ds — tailing .RAW files',
       Math.round(NATS_GRACE_MS / 1000))
@@ -775,7 +795,7 @@ async function selectAndStartSource(
 async function startNatsSource(
   server: WebSocketServer,
   rawFilesAtStartup: ReadonlySet<string>,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const source = await startNatsFrameSource({
       decode: decodeSensorFrames,
@@ -786,23 +806,25 @@ async function startNatsSource(
         if (wss === server) console.log('[sensorStream] NATS frame source active')
       },
       onClose: (err) => {
-        if (wss === server) console.error('[sensorStream] NATS frame source closed', err ?? '')
+        if (wss === server) {
+          natsSource = null
+          console.error('[sensorStream] NATS frame source closed', err ?? '')
+          void selectAndStartSource(server, rawFilesAtStartup)
+        }
       },
     })
     if (wss !== server) {
       // Server shut down or restarted while connecting — don't leak or attach
       // a stale source to the newer lifecycle.
       await source.stop()
-      return
+      return false
     }
     natsSource = source
+    return true
   }
   catch (err) {
-    // Reachability said yes but the connect raced/failed. Fall back to the file
-    // tailer — on a NATS-only pod it finds nothing, which is the pre-existing
-    // (safe) empty state, not a regression.
-    console.error('[sensorStream] NATS connect failed, falling back to .RAW tailing:', err)
-    if (wss === server) startRawTailingLoop(rawFilesAtStartup)
+    console.error('[sensorStream] NATS connect failed:', err)
+    return false
   }
 }
 
@@ -1083,6 +1105,7 @@ export const __test__ = {
   decodeSensorFrames,
   dispatchSensorFrame,
   envMilliseconds,
+  natsSourceRequired,
   warnedUnknownTypes,
   get frameIndex(): readonly FrameIndexEntry[] { return frameIndex },
   get natsSourceActive(): boolean { return natsSource !== null },

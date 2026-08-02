@@ -32,7 +32,12 @@ from common.calibration import (
 )
 from common.cbor_raw import read_raw_record
 from common.dialect import log_capsense_status_once
-from common.nats_follower import NatsFollowerError, NatsRecordBuffer, wait_for_nats
+from common.nats_follower import (
+    NatsFollowerError,
+    NatsRecordBuffer,
+    nats_firmware_expected,
+    wait_for_nats,
+)
 import cbor2
 
 # ---------------------------------------------------------------------------
@@ -292,6 +297,9 @@ def main() -> None:
         log.info("NATS reachable — collecting live sensor records for calibration")
         nats_buffer = NatsRecordBuffer(_shutdown)
         nats_buffer.start()
+    elif nats_firmware_expected() and not _shutdown.is_set():
+        raise NatsFollowerError(
+            "NATS firmware detected but NATS was unavailable after startup grace")
     else:
         log.info("NATS not reachable — calibrating from .RAW scans (%s)", RAW_DATA_DIR)
 

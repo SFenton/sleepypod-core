@@ -25,6 +25,7 @@ from common.nats_follower import (
     NatsFollowerError,
     NatsRecordBuffer,
     create_follower,
+    nats_firmware_expected,
     nats_reachable,
     wait_for_nats,
 )
@@ -295,8 +296,28 @@ class TestCreateFollower:
         monkeypatch.setattr("common.nats_follower.nats_reachable",
                             lambda *a, **k: False)
         src = create_follower(tmp_path, threading.Event(),
-                              poll_interval=0.01, grace_seconds=0.0)
+                              poll_interval=0.01, grace_seconds=0.0,
+                              nats_required=False)
         assert isinstance(src, RawFileFollower)
+
+    def test_refuses_raw_fallback_when_nats_firmware_is_detected(
+            self, monkeypatch, tmp_path):
+        monkeypatch.setattr("common.nats_follower.nats_reachable",
+                            lambda *a, **k: False)
+        with pytest.raises(NatsFollowerError, match="NATS firmware detected"):
+            create_follower(tmp_path, threading.Event(),
+                            grace_seconds=0.0, nats_required=True)
+
+    def test_firmware_marker_and_override(self, monkeypatch, tmp_path):
+        marker = tmp_path / "jetstream"
+        assert nats_firmware_expected(marker) is False
+        marker.mkdir()
+        assert nats_firmware_expected(marker) is True
+
+        monkeypatch.setenv("SLEEPYPOD_FRAME_SOURCE", "raw")
+        assert nats_firmware_expected(marker) is False
+        monkeypatch.setenv("SLEEPYPOD_FRAME_SOURCE", "nats")
+        assert nats_firmware_expected(tmp_path / "missing") is True
 
 
 # ---------------------------------------------------------------------------
