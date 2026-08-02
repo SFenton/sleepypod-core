@@ -15,6 +15,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 const helperPath = resolve('scripts/lib/biometrics-archiver-helpers')
 const archiverScript = resolve('modules/biometrics-archiver/sleepypod-biometrics-archiver')
+const updateScript = resolve('scripts/bin/sp-update')
+const installScript = resolve('scripts/install')
 
 let root: string
 let tmpfsDir: string
@@ -132,6 +134,37 @@ describe('sleepypod-biometrics-archiver', () => {
     expect(result.status).toBe(1)
     expect(result.stdout).toContain('failed=1')
     expect(existsSync(raw)).toBe(true)
+  })
+})
+
+describe('module deployment guards', () => {
+  it('stages every module venv before replacing the live runtime or cleaning RAW storage', () => {
+    const script = readFileSync(updateScript, 'utf8')
+    const stageSync = script.indexOf('(cd "$stage" && uv sync')
+    const commonSwap = script.indexOf('mv "$MODULES_STAGE/common" "$MODULES_DEST/common"')
+    const completedSwapCleanup = script.lastIndexOf('rm -rf "$MODULES_STAGE" "$MODULES_BACKUP"')
+    const natsCleanup = script.indexOf('  install_biometrics_archiver\n')
+
+    expect(stageSync).toBeGreaterThanOrEqual(0)
+    expect(stageSync).toBeLessThan(commonSwap)
+    expect(commonSwap).toBeLessThan(completedSwapCleanup)
+    expect(completedSwapCleanup).toBeLessThan(natsCleanup)
+  })
+
+  it('fails closed and rolls swapped modules back instead of skipping failed venvs', () => {
+    const update = readFileSync(updateScript, 'utf8')
+    const install = readFileSync(installScript, 'utf8')
+
+    expect(update).toContain('ERROR: uv unavailable — refusing to replace biometrics modules.')
+    expect(update).toContain('if ! (cd "$stage" && uv sync')
+    expect(update).toContain('rollback_module_update')
+    expect(update).toContain('if ! systemctl restart "$svc"; then')
+    expect(update).not.toContain('Warning: uv sync failed for module $mod')
+
+    expect(install).toContain(
+      'Error: uv installation failed — refusing to continue without biometrics modules',
+    )
+    expect(install).toContain('Error: uv sync failed for module $name')
   })
 })
 

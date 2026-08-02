@@ -1566,7 +1566,8 @@ if ! command -v uv &>/dev/null; then
 fi
 
 if ! command -v uv &>/dev/null; then
-  echo "Warning: uv installation failed — skipping biometrics module installation"
+  echo "Error: uv installation failed — refusing to continue without biometrics modules" >&2
+  exit 1
 else
   install_module() {
     local name="$1"
@@ -1615,9 +1616,9 @@ else
       _uv_sync_args+=(--python-preference only-managed)
     fi
     (cd "$dest" && uv sync "${_uv_sync_args[@]}") || {
-      echo "Warning: uv sync failed for module $name"
+      echo "Error: uv sync failed for module $name" >&2
       unset _uv_sync_args
-      return
+      return 1
     }
     unset _uv_sync_args
 
