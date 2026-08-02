@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from common.calibration import CalibrationStore, CapCalibrator
+from common.calibration import CalibrationStore, CapCalibrator, CapSense2Calibrator
 
 
 def cap_records(count, value=lambda i: 1000):
@@ -17,6 +17,19 @@ def cap_records(count, value=lambda i: 1000):
                 "out": value(i),
                 "cen": value(i) + 100,
                 "in": value(i) + 200,
+            },
+        }
+        for i in range(count)
+    ]
+
+
+def capsense2_records(count):
+    return [
+        {
+            "type": "capSense2",
+            "ts": 1_700_000_000 + i / 2,
+            "left": {
+                "values": [10.0, 10.0, 20.0, 20.0, 30.0, 30.0, 1.0, 1.0],
             },
         }
         for i in range(count)
@@ -96,6 +109,18 @@ def test_named_capsense_rejects_a_window_at_the_quality_floor():
 
     with pytest.raises(ValueError, match="No stable capSense calibration window"):
         CapCalibrator().calibrate(records, "left")
+
+
+def test_capsense2_requires_a_complete_calibration_window():
+    with pytest.raises(ValueError, match=r"299 samples.*need >= 300"):
+        CapSense2Calibrator().calibrate(capsense2_records(299), "left")
+
+
+def test_capsense2_uses_exactly_one_complete_window():
+    result = CapSense2Calibrator().calibrate(capsense2_records(300), "left")
+
+    assert result.samples_used == 300
+    assert result.quality_score == 1.0
 
 
 def test_named_capsense_rejects_quality_that_rounds_to_zero():
