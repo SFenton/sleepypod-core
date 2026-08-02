@@ -61,6 +61,7 @@ function runHelper(extraEnv: Partial<NodeJS.ProcessEnv> = {}) {
       UNMOUNTED_FILE: unmountedFile,
       FAIL_RESTART: '0',
       FAIL_CONSUMER_RESTART: '0',
+      FAIL_REMOVE_ASSET: '0',
       STOP_LEAVES_MOUNTED: '0',
       ...extraEnv,
     },
@@ -84,6 +85,13 @@ beforeEach(() => {
     '#!/usr/bin/env bash',
     '[ -f "$UNMOUNTED_FILE" ] && exit 1',
     'exit 0',
+  ])
+  writeExecutable(join(stubBinDir, 'rm'), [
+    '#!/usr/bin/env bash',
+    'if [ "$FAIL_REMOVE_ASSET" = "1" ] && printf "%s\\n" "$*" | grep -q "persistent-biometrics.mount"; then',
+    '  exit 1',
+    'fi',
+    'exec /bin/rm "$@"',
   ])
   writeExecutable(join(stubBinDir, 'systemctl'), [
     '#!/usr/bin/env bash',
@@ -207,13 +215,18 @@ describe('module deployment guards', () => {
 
   it('publishes the irreversible NATS boundary before restarting consumers', () => {
     const helper = readFileSync(helperPath, 'utf8')
+    const unmounted = helper.indexOf('if mountpoint -q "$tmpfs_dir"; then')
     const guard = helper.indexOf('if [ "$migration_changed" = true ]; then')
     const committed = helper.indexOf('SLEEPYPOD_NATS_MIGRATION_COMMITTED=true')
+    const assetRemoval = helper.indexOf('if ! rm -f "$systemd_dir/sleepypod-biometrics-archiver.service"')
     const consumers = helper.lastIndexOf('if ! restart_biometrics_consumers; then')
 
+    expect(unmounted).toBeGreaterThanOrEqual(0)
+    expect(unmounted).toBeLessThan(guard)
     expect(guard).toBeGreaterThanOrEqual(0)
     expect(guard).toBeLessThan(committed)
     expect(committed).toBeGreaterThanOrEqual(0)
+    expect(committed).toBeLessThan(assetRemoval)
     expect(committed).toBeLessThan(consumers)
   })
 })
@@ -320,6 +333,15 @@ describe('remove_biometrics_archiver_for_nats', () => {
       'failed to restart sleepypod-calibrator.service after NATS firmware cleanup',
     )
     expect(calls()).toContain('restart sleepypod-cover-buttons.service')
+  })
+
+  it('fails after the migration boundary when a legacy recovery asset cannot be removed', () => {
+    const result = runHelper({ FAIL_REMOVE_ASSET: '1' })
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(
+      'failed to remove one or more legacy RAW recovery assets',
+    )
   })
 
   it('restores a patched frank.sh and restarts frank.service', () => {

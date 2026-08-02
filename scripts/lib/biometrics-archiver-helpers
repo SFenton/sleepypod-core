@@ -136,16 +136,33 @@ remove_biometrics_archiver_for_nats() {
           newest_backup=$backup
         fi
       done
-      cp -f "$newest_backup" "$frank_sh"
+      if ! cp -f "$newest_backup" "$frank_sh"; then
+        echo "Error: failed to restore $frank_sh from $newest_backup" >&2
+        restore_biometrics_runtime || true
+        return 1
+      fi
     else
-      sed -i 's|cd /persistent/biometrics \&\&|cd /persistent \&\&|' \
-        "$frank_sh"
+      if ! sed -i 's|cd /persistent/biometrics \&\&|cd /persistent \&\&|' \
+        "$frank_sh"; then
+        echo "Error: failed to restore the legacy frank.sh working directory" >&2
+        restore_biometrics_runtime || true
+        return 1
+      fi
+    fi
+    if grep -q 'cd /persistent/biometrics' "$frank_sh"; then
+      echo "Error: frank.sh still points at the biometrics tmpfs after restoration" >&2
+      restore_biometrics_runtime || true
+      return 1
     fi
     restart_frank=true
   fi
 
   if [ -f "$dropin" ]; then
-    rm -f "$dropin"
+    if ! rm -f "$dropin"; then
+      echo "Error: failed to remove $dropin" >&2
+      restore_biometrics_runtime || true
+      return 1
+    fi
     restart_frank=true
   fi
   rmdir "$systemd_dir/frank.service.d" 2>/dev/null || true
@@ -210,12 +227,20 @@ remove_biometrics_archiver_for_nats() {
   fi
   systemctl disable persistent-biometrics.mount 2>/dev/null || true
 
+  # The legacy tmpfs is now verified unmounted and firmware no longer depends
+  # on its working-directory override. From this point onward callers must not
+  # roll back to RAW-only consumers, even if deleting a later recovery asset
+  # fails.
+  if [ "$migration_changed" = true ]; then
+    SLEEPYPOD_NATS_MIGRATION_COMMITTED=true
+  fi
+
   for u in "${timer_units[@]}" sleepypod-biometrics-archiver.service \
            sleepypod-biometrics-pruner.service sleepypod-tmpfs-prep.service; do
     systemctl disable "$u" 2>/dev/null || true
   done
 
-  rm -f "$systemd_dir/sleepypod-biometrics-archiver.service" \
+  if ! rm -f "$systemd_dir/sleepypod-biometrics-archiver.service" \
         "$systemd_dir/sleepypod-biometrics-archiver.timer" \
         "$systemd_dir/sleepypod-biometrics-pruner.service" \
         "$systemd_dir/sleepypod-biometrics-pruner.timer" \
@@ -223,15 +248,15 @@ remove_biometrics_archiver_for_nats() {
         "$systemd_dir/persistent-biometrics.mount" \
         "$local_bin_dir/sleepypod-tmpfs-prep" \
         "$local_bin_dir/sleepypod-biometrics-archiver" \
-        "$local_bin_dir/sleepypod-biometrics-pruner"
-  systemctl daemon-reload 2>/dev/null || true
-
-  # Crossing this point is irreversible for the current update: RAW storage
-  # units and recovery tools are gone. Callers source this helper, so publish a
-  # shared marker before consumer restarts; a late restart failure must retain
-  # NATS-capable code/modules instead of rolling back to RAW-only versions.
-  if [ "$migration_changed" = true ]; then
-    SLEEPYPOD_NATS_MIGRATION_COMMITTED=true
+        "$local_bin_dir/sleepypod-biometrics-pruner"; then
+    echo "Error: failed to remove one or more legacy RAW recovery assets" >&2
+    restore_biometrics_runtime || true
+    return 1
+  fi
+  if ! systemctl daemon-reload 2>/dev/null; then
+    echo "Error: failed to reload systemd after removing legacy RAW assets" >&2
+    restore_biometrics_runtime || true
+    return 1
   fi
 
   if ! restart_biometrics_consumers; then
