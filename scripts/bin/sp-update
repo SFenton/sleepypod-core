@@ -532,6 +532,11 @@ if [ -d "$INSTALL_DIR/modules" ]; then
 
   for mod in "${MODULE_NAMES[@]}"; do
     svc="sleepypod-$mod.service"
+    unit_backup="$MODULES_BACKUP/units/$svc"
+    if [ -f "/etc/systemd/system/$svc" ]; then
+      cp -f "/etc/systemd/system/$svc" "$unit_backup"
+    fi
+
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
       ACTIVE_MODULES+=("$mod")
       systemctl stop "$svc"
@@ -550,11 +555,6 @@ if [ -d "$INSTALL_DIR/modules" ]; then
       exit 1
     fi
     SWAPPED_MODULES+=("$mod")
-
-    unit_backup="$MODULES_BACKUP/units/$svc"
-    if [ -f "/etc/systemd/system/$svc" ]; then
-      cp -f "/etc/systemd/system/$svc" "$unit_backup"
-    fi
 
     if [ -f "$MODULES_DEST/$mod/$svc" ]; then
       # Substitute the chosen $DATA_DIR for the baked-in
