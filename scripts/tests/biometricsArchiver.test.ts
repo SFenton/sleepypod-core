@@ -144,7 +144,9 @@ describe('module deployment guards', () => {
     const commonSwap = script.indexOf('mv "$MODULES_STAGE/common" "$MODULES_DEST/common"')
     const stageCleanup = script.lastIndexOf('rm -rf "$MODULES_STAGE"')
     const natsCleanup = script.indexOf('  install_biometrics_archiver\n')
-    const healthCheck = script.indexOf('if systemctl is-active --quiet sleepypod.service; then')
+    const healthCheck = script.indexOf(
+      'if systemctl is-active --quiet sleepypod.service &&',
+    )
     const backupRelease = script.indexOf('rm -rf "$MODULES_BACKUP"', healthCheck)
 
     expect(stageSync).toBeGreaterThanOrEqual(0)
@@ -165,6 +167,14 @@ describe('module deployment guards', () => {
     expect(update).toContain('if [ "$exit_code" -ne 0 ] && [ "$MODULE_SWAP_ACTIVE" = true ]')
     expect(update).toContain('if ! systemctl restart "$svc"; then')
     expect(update).not.toContain('Warning: uv sync failed for module $mod')
+    expect(update).toContain('NATS_MIGRATION_COMMITTED=true')
+    expect(update).toContain(
+      'Update failed after NATS migration; retaining NATS-capable code and modules.',
+    )
+    expect(update).toContain(
+      'updated module $mod did not remain active before RAW migration.',
+    )
+    expect(update).toContain('MODULES_HEALTHY=true')
 
     expect(install).toContain(
       'Error: uv installation failed — refusing to continue without biometrics modules',
@@ -172,6 +182,10 @@ describe('module deployment guards', () => {
     expect(install).toContain('if ! (cd "$stage" && uv sync')
     expect(install).toContain('rollback_install_modules')
     expect(install).toContain('INSTALL_MODULE_SWAP_ACTIVE=true')
+    expect(install).toContain('did not remain active before RAW migration')
+    expect(install).toContain(
+      'failed after NATS migration; retaining NATS-capable modules',
+    )
     expect(install).toContain('Error: uv sync failed for module $name — live modules were not replaced')
     expect(install).not.toContain('(cd "$dest" && uv sync')
   })

@@ -72,11 +72,20 @@ fi
 # Cleanup — re-block WAN, rollback code, and restart service on failure
 ROLLBACK_READY=false
 MODULE_SWAP_ACTIVE=false
+NATS_MIGRATION_COMMITTED=false
 cleanup() {
   local exit_code=$?
   if [ "$WAN_WAS_BLOCKED" = true ]; then
     restore_wan
     WAN_WAS_BLOCKED=false
+  fi
+  if [ "$exit_code" -ne 0 ] && [ "$NATS_MIGRATION_COMMITTED" = true ]; then
+    echo "Update failed after NATS migration; retaining NATS-capable code and modules." >&2
+    [ -n "${MODULES_STAGE:-}" ] && rm -rf "$MODULES_STAGE"
+    [ -n "${MODULES_BACKUP:-}" ] && rm -rf "$MODULES_BACKUP"
+    MODULE_SWAP_ACTIVE=false
+    systemctl start sleepypod.service 2>/dev/null || true
+    return
   fi
   if [ "$exit_code" -ne 0 ] && [ "$MODULE_SWAP_ACTIVE" = true ] \
      && declare -F rollback_module_update >/dev/null; then
@@ -479,6 +488,19 @@ if [ -d "$INSTALL_DIR/modules" ]; then
   rm -rf "$MODULES_STAGE"
 fi
 
+# A Type=simple restart can return before Python initialization fails. Keep the
+# RAW topology intact until every replacement consumer remains active through
+# a bounded startup grace period.
+if [ "$MODULE_SWAP_ACTIVE" = true ]; then
+  sleep 5
+  for mod in "${MODULE_NAMES[@]}"; do
+    if ! systemctl is-active --quiet "sleepypod-$mod.service"; then
+      echo "ERROR: updated module $mod did not remain active before RAW migration." >&2
+      exit 1
+    fi
+  done
+fi
+
 # Biometrics archiver — tmpfs RAW writes + frank.sh cd patch. Module
 # unit files set RAW_DATA_DIR=/persistent/biometrics, so without this the
 # modules tail a directory that doesn't exist and biometrics silently
@@ -486,7 +508,15 @@ fi
 # pod that upgraded via sp-update past v2.0.0 hit the regression.
 if [ -f "$INSTALL_DIR/scripts/lib/biometrics-archiver-helpers" ]; then
   source "$INSTALL_DIR/scripts/lib/biometrics-archiver-helpers"
+  NATS_FIRMWARE_DETECTED=false
+  if [ -d /persistent/jetstream ] \
+     && systemctl cat nats-server.service >/dev/null 2>&1; then
+    NATS_FIRMWARE_DETECTED=true
+  fi
   install_biometrics_archiver
+  if [ "$NATS_FIRMWARE_DETECTED" = true ]; then
+    NATS_MIGRATION_COMMITTED=true
+  fi
 fi
 
 # Self-heal the xtables lockfile env for pods installed before this fix.
@@ -542,7 +572,17 @@ echo "Starting service..."
 systemctl start sleepypod.service
 
 sleep 5
-if systemctl is-active --quiet sleepypod.service; then
+MODULES_HEALTHY=true
+if [ "$MODULE_SWAP_ACTIVE" = true ]; then
+  for mod in "${MODULE_NAMES[@]}"; do
+    if ! systemctl is-active --quiet "sleepypod-$mod.service"; then
+      echo "Updated module $mod is not active after deployment." >&2
+      MODULES_HEALTHY=false
+    fi
+  done
+fi
+
+if systemctl is-active --quiet sleepypod.service && [ "$MODULES_HEALTHY" = true ]; then
   if [ "$MODULE_SWAP_ACTIVE" = true ]; then
     rm -rf "$MODULES_BACKUP"
     MODULE_SWAP_ACTIVE=false
