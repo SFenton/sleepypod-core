@@ -699,6 +699,9 @@ export function startPiezoStreamServer(): WebSocketServer {
 
   wss = new WebSocketServer({ port: WS_PORT, maxPayload: WS_MAX_PAYLOAD_BYTES })
   console.log(`[sensorStream] WebSocket server listening on port ${WS_PORT}`)
+  const rawFilesAtStartup = new Set<string>()
+  const startupRawPath = findLatestRaw(RAW_DATA_DIR)
+  if (startupRawPath) rawFilesAtStartup.add(startupRawPath)
 
   wss.on('connection', (ws) => {
     console.log('[sensorStream] Client connected')
@@ -726,7 +729,7 @@ export function startPiezoStreamServer(): WebSocketServer {
   // The WS server is already accepting clients; pick and attach the frame source
   // (RAW file tailer vs loopback NATS) asynchronously so a slow NATS probe never
   // blocks client connections.
-  void selectAndStartSource()
+  void selectAndStartSource(wss, rawFilesAtStartup)
 
   return wss
 }
@@ -738,10 +741,10 @@ export function startPiezoStreamServer(): WebSocketServer {
  * probe is retried over a grace window so a module that starts before
  * nats-server still lands on NATS. Never runs both sources (duplicate-row risk).
  */
-async function selectAndStartSource(): Promise<void> {
-  const server = wss
-  if (!server) return
-
+async function selectAndStartSource(
+  server: WebSocketServer,
+  rawFilesAtStartup: ReadonlySet<string>,
+): Promise<void> {
   if (!NATS_SOURCE_DISABLED) {
     const deadline = Date.now() + NATS_GRACE_MS
     for (;;) {
@@ -755,7 +758,7 @@ async function selectAndStartSource(): Promise<void> {
       }
       if (wss !== server) return
       if (reachable) {
-        await startNatsSource(server)
+        await startNatsSource(server, rawFilesAtStartup)
         return
       }
       const remaining = deadline - Date.now()
@@ -765,11 +768,14 @@ async function selectAndStartSource(): Promise<void> {
     console.log('[sensorStream] no NATS server after %ds — tailing .RAW files',
       Math.round(NATS_GRACE_MS / 1000))
   }
-  if (wss === server) startRawTailingLoop()
+  if (wss === server) startRawTailingLoop(rawFilesAtStartup)
 }
 
 /** Connect the loopback-NATS source, feeding decoded frames into the shared dispatch. */
-async function startNatsSource(server: WebSocketServer): Promise<void> {
+async function startNatsSource(
+  server: WebSocketServer,
+  rawFilesAtStartup: ReadonlySet<string>,
+): Promise<void> {
   try {
     const source = await startNatsFrameSource({
       decode: decodeSensorFrames,
@@ -796,7 +802,7 @@ async function startNatsSource(server: WebSocketServer): Promise<void> {
     // tailer — on a NATS-only pod it finds nothing, which is the pre-existing
     // (safe) empty state, not a regression.
     console.error('[sensorStream] NATS connect failed, falling back to .RAW tailing:', err)
-    if (wss === server) startRawTailingLoop()
+    if (wss === server) startRawTailingLoop(rawFilesAtStartup)
   }
 }
 
@@ -877,19 +883,12 @@ function dispatchSensorFrame(frame: Record<string, unknown>): void {
  * can be replayed. Broadcasting is per-client guarded, so an idle loop does no
  * fan-out.
  */
-function startRawTailingLoop(): void {
+function startRawTailingLoop(rawFilesAtStartup: ReadonlySet<string>): void {
   if (streamingInterval) return
 
   let currentPath: string | null = null
   let fileBuffer = Buffer.alloc(0)
   let readOffset = 0 // offset into the actual file (not the buffer)
-  const rawFilesAtStartup = new Set<string>()
-  try {
-    for (const entry of fs.readdirSync(RAW_DATA_DIR)) {
-      if (entry.endsWith('.RAW')) rawFilesAtStartup.add(path.join(RAW_DATA_DIR, entry))
-    }
-  }
-  catch { /* RAW dir may not exist yet */ }
 
   streamingInterval = setInterval(() => {
     if (!wss) return
