@@ -216,6 +216,13 @@ remove_biometrics_archiver_for_nats() {
         "$local_bin_dir/sleepypod-biometrics-archiver" \
         "$local_bin_dir/sleepypod-biometrics-pruner"
   systemctl daemon-reload 2>/dev/null || true
+
+  # Crossing this point is irreversible for the current update: RAW storage
+  # units and recovery tools are gone. Callers source this helper, so publish a
+  # shared marker before consumer restarts; a late restart failure must retain
+  # NATS-capable code/modules instead of rolling back to RAW-only versions.
+  SLEEPYPOD_NATS_MIGRATION_COMMITTED=true
+
   if ! restart_biometrics_consumers; then
     return 1
   fi

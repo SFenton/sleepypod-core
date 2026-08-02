@@ -72,18 +72,23 @@ fi
 # Cleanup — re-block WAN, rollback code, and restart service on failure
 ROLLBACK_READY=false
 MODULE_SWAP_ACTIVE=false
-NATS_MIGRATION_COMMITTED=false
+SLEEPYPOD_NATS_MIGRATION_COMMITTED=false
 cleanup() {
   local exit_code=$?
   if [ "$WAN_WAS_BLOCKED" = true ]; then
     restore_wan
     WAN_WAS_BLOCKED=false
   fi
-  if [ "$exit_code" -ne 0 ] && [ "$NATS_MIGRATION_COMMITTED" = true ]; then
+  if [ "$exit_code" -ne 0 ] && [ "$SLEEPYPOD_NATS_MIGRATION_COMMITTED" = true ]; then
     echo "Update failed after NATS migration; retaining NATS-capable code and modules." >&2
     [ -n "${MODULES_STAGE:-}" ] && rm -rf "$MODULES_STAGE"
     [ -n "${MODULES_BACKUP:-}" ] && rm -rf "$MODULES_BACKUP"
     MODULE_SWAP_ACTIVE=false
+    if declare -p MODULE_NAMES >/dev/null 2>&1; then
+      for mod in "${MODULE_NAMES[@]}"; do
+        systemctl restart "sleepypod-$mod.service" 2>/dev/null || true
+      done
+    fi
     systemctl start sleepypod.service 2>/dev/null || true
     return
   fi
@@ -508,15 +513,7 @@ fi
 # pod that upgraded via sp-update past v2.0.0 hit the regression.
 if [ -f "$INSTALL_DIR/scripts/lib/biometrics-archiver-helpers" ]; then
   source "$INSTALL_DIR/scripts/lib/biometrics-archiver-helpers"
-  NATS_FIRMWARE_DETECTED=false
-  if [ -d /persistent/jetstream ] \
-     && systemctl cat nats-server.service >/dev/null 2>&1; then
-    NATS_FIRMWARE_DETECTED=true
-  fi
   install_biometrics_archiver
-  if [ "$NATS_FIRMWARE_DETECTED" = true ]; then
-    NATS_MIGRATION_COMMITTED=true
-  fi
 fi
 
 # Self-heal the xtables lockfile env for pods installed before this fix.

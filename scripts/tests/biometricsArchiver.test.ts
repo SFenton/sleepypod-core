@@ -167,7 +167,7 @@ describe('module deployment guards', () => {
     expect(update).toContain('if [ "$exit_code" -ne 0 ] && [ "$MODULE_SWAP_ACTIVE" = true ]')
     expect(update).toContain('if ! systemctl restart "$svc"; then')
     expect(update).not.toContain('Warning: uv sync failed for module $mod')
-    expect(update).toContain('NATS_MIGRATION_COMMITTED=true')
+    expect(update).toContain('SLEEPYPOD_NATS_MIGRATION_COMMITTED=false')
     expect(update).toContain(
       'Update failed after NATS migration; retaining NATS-capable code and modules.',
     )
@@ -203,6 +203,15 @@ describe('module deployment guards', () => {
     expect(requiredRestart).toBeLessThan(consumerRestart)
     expect(consumerRestart).toBeLessThan(rootMigration)
     expect(helper).not.toContain('systemctl restart frank.service 2>/dev/null || true')
+  })
+
+  it('publishes the irreversible NATS boundary before restarting consumers', () => {
+    const helper = readFileSync(helperPath, 'utf8')
+    const committed = helper.indexOf('SLEEPYPOD_NATS_MIGRATION_COMMITTED=true')
+    const consumers = helper.lastIndexOf('if ! restart_biometrics_consumers; then')
+
+    expect(committed).toBeGreaterThanOrEqual(0)
+    expect(committed).toBeLessThan(consumers)
   })
 })
 
