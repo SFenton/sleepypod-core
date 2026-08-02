@@ -52,6 +52,7 @@ SLEEPYPOD_DB = Path(os.environ.get(
 
 # Write at most once per 60s per record type
 DOWNSAMPLE_INTERVAL_S = 60
+ENVIRONMENT_NATS_SUBJECTS = ("raw.sens.bedtemp", "raw.frz.temp")
 
 # Timestamp sanity window (mirrors sleep-detector's sanitize_ts)
 MIN_VALID_WALL_CLOCK_TS = 1577836800.0  # 2020-01-01 00:00:00 UTC
@@ -254,7 +255,12 @@ def main() -> None:
     db_conn = open_biometrics_db()
     # Source selected once at startup: NatsFollower on new-firmware pods (NATS
     # reachable), else the unchanged .RAW tailer. Same decoded-record contract.
-    follower = create_follower(RAW_DATA_DIR, _shutdown, poll_interval=0.5)
+    follower = create_follower(
+        RAW_DATA_DIR,
+        _shutdown,
+        poll_interval=0.5,
+        subjects=ENVIRONMENT_NATS_SUBJECTS,
+    )
 
     # Seed cursors from DB so restarts don't replay already-ingested samples.
     # Clamp to now so a DB already poisoned by a far-future timestamp (written
