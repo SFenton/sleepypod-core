@@ -167,6 +167,21 @@ describe('module deployment guards', () => {
     )
     expect(install).toContain('Error: uv sync failed for module $name')
   })
+
+  it('requires frank to adopt the tmpfs before consumers switch or root RAW files migrate', () => {
+    const helper = readFileSync(helperPath, 'utf8')
+    const requiredRestart = helper.indexOf('if ! systemctl restart frank.service')
+    const consumerRestart = helper.indexOf(
+      '# Restart sleepypod modules so they pick up RAW_DATA_DIR=/persistent/biometrics.',
+      requiredRestart,
+    )
+    const rootMigration = helper.indexOf('local stranded=( /persistent/*.RAW )', requiredRestart)
+
+    expect(requiredRestart).toBeGreaterThanOrEqual(0)
+    expect(requiredRestart).toBeLessThan(consumerRestart)
+    expect(consumerRestart).toBeLessThan(rootMigration)
+    expect(helper).not.toContain('systemctl restart frank.service 2>/dev/null || true')
+  })
 })
 
 describe('remove_biometrics_archiver_for_nats', () => {

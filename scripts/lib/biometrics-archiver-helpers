@@ -301,10 +301,6 @@ install_biometrics_archiver() {
       echo "Backed up frank.sh to $backup"
       sed -i 's|cd /persistent &&|cd /persistent/biometrics \&\&|' /opt/eight/bin/frank.sh
       echo "Patched frank.sh: cwd -> /persistent/biometrics"
-      # Guarded — sp-update's rollback trap fires on uncaught failures here
-      # and would leave orphaned systemd units behind while rolling back
-      # only the codebase. Module restarts below use the same guard.
-      systemctl restart frank.service 2>/dev/null || true
     else
       echo "frank.sh already patched — skipping"
     fi
@@ -314,6 +310,14 @@ install_biometrics_archiver() {
     # we installed above sets WorkingDirectory=/persistent/biometrics, so
     # the redirect still applies via systemd instead of a shell cd.
     echo "frank.sh absent (newer firmware variant) — relying on systemd WorkingDirectory= to redirect RAW writes"
+  fi
+
+  # daemon-reload does not change a running process's cwd. Require frank to
+  # restart successfully after the drop-in/patch is installed before readers
+  # switch to tmpfs or root RAW files are migrated and unlinked.
+  if ! systemctl restart frank.service 2>/dev/null; then
+    echo "Error: frank.service did not adopt the biometrics tmpfs; refusing to migrate RAW files" >&2
+    return 1
   fi
 
   # Restart sleepypod modules so they pick up RAW_DATA_DIR=/persistent/biometrics.
