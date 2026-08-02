@@ -1790,15 +1790,43 @@ fi
 # ============================================================================
 # Biometrics archiver — tmpfs RAW writes + gzip cold archive on eMMC.
 # ============================================================================
+# Do not cross the RAW/NATS storage boundary until every replacement consumer
+# survives Python initialization. The installer rollback remains safe here.
+if [ "$INSTALL_MODULE_SWAP_ACTIVE" = true ]; then
+  sleep 5
+  for name in "${INSTALL_MODULE_NAMES[@]}"; do
+    if ! systemctl is-active --quiet "sleepypod-$name.service"; then
+      echo "Error: module $name did not remain active before RAW migration" >&2
+      exit 1
+    fi
+  done
+fi
+
 # Shared helper, also called from sp-update so OTA upgrades land in the
 # same state as fresh installs (issue #576). Guarded with -f to match the
 # pattern used for every other lib source above — without the guard,
 # --local mode against a pre-#576 working tree would abort under set -e.
+INSTALL_NATS_MIGRATION_COMMITTED=false
 if [ -f "$INSTALL_DIR/scripts/lib/biometrics-archiver-helpers" ]; then
   source "$INSTALL_DIR/scripts/lib/biometrics-archiver-helpers"
+  if [ -d /persistent/jetstream ] \
+     && systemctl cat nats-server.service >/dev/null 2>&1; then
+    INSTALL_NATS_MIGRATION_COMMITTED=true
+  fi
   install_biometrics_archiver
 fi
 if [ "$INSTALL_MODULE_SWAP_ACTIVE" = true ]; then
+  sleep 5
+  for name in "${INSTALL_MODULE_NAMES[@]}"; do
+    if ! systemctl is-active --quiet "sleepypod-$name.service"; then
+      if [ "$INSTALL_NATS_MIGRATION_COMMITTED" = true ]; then
+        echo "Error: module $name failed after NATS migration; retaining NATS-capable modules" >&2
+        rm -rf "$INSTALL_MODULE_BACKUP"
+        INSTALL_MODULE_SWAP_ACTIVE=false
+      fi
+      exit 1
+    fi
+  done
   rm -rf "$INSTALL_MODULE_BACKUP"
   INSTALL_MODULE_SWAP_ACTIVE=false
 fi
