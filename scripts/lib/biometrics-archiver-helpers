@@ -41,6 +41,12 @@ remove_biometrics_archiver_for_nats() {
     sleepypod-cover-buttons.service
   )
   local active_consumers=()
+  local timer
+  local timer_units=(
+    sleepypod-biometrics-archiver.timer
+    sleepypod-biometrics-pruner.timer
+  )
+  local active_timers=()
 
   restart_biometrics_consumers() {
     local service
@@ -54,6 +60,25 @@ remove_biometrics_archiver_for_nats() {
     [ "$restart_failed" = false ]
   }
 
+  restore_biometrics_timers() {
+    local service
+    local restore_failed=false
+    for service in "${active_timers[@]}"; do
+      if ! systemctl start "$service" 2>/dev/null; then
+        echo "Error: failed to restore $service after NATS firmware cleanup" >&2
+        restore_failed=true
+      fi
+    done
+    [ "$restore_failed" = false ]
+  }
+
+  restore_biometrics_runtime() {
+    local restore_failed=false
+    restart_biometrics_consumers || restore_failed=true
+    restore_biometrics_timers || restore_failed=true
+    [ "$restore_failed" = false ]
+  }
+
   # Readers can retain an open descriptor into the tmpfs even after frank
   # switches to NATS. Stop only services that were active, then restore that
   # exact set after cleanup (including every failure path).
@@ -62,17 +87,28 @@ remove_biometrics_archiver_for_nats() {
       active_consumers+=("$consumer")
       if ! systemctl stop "$consumer" 2>/dev/null; then
         echo "Error: failed to stop $consumer before NATS firmware cleanup" >&2
-        restart_biometrics_consumers || true
+        restore_biometrics_runtime || true
         return 1
       fi
     fi
   done
 
-  for u in sleepypod-biometrics-archiver.timer sleepypod-biometrics-pruner.timer \
-           sleepypod-biometrics-archiver.service sleepypod-biometrics-pruner.service \
+  # Stop timers to prevent concurrent archive/prune work, but leave them
+  # enabled until cleanup succeeds. Failure paths can then restore durability.
+  for timer in "${timer_units[@]}"; do
+    if systemctl is-active --quiet "$timer" 2>/dev/null; then
+      active_timers+=("$timer")
+      if ! systemctl stop "$timer" 2>/dev/null; then
+        echo "Error: failed to stop $timer before NATS firmware cleanup" >&2
+        restore_biometrics_runtime || true
+        return 1
+      fi
+    fi
+  done
+
+  for u in sleepypod-biometrics-archiver.service sleepypod-biometrics-pruner.service \
            sleepypod-tmpfs-prep.service; do
     systemctl stop "$u" 2>/dev/null || true
-    systemctl disable "$u" 2>/dev/null || true
   done
 
   # Undo the exact firmware shim edit this helper owns. Prefer the preserved
@@ -106,7 +142,7 @@ remove_biometrics_archiver_for_nats() {
   rmdir "$systemd_dir/frank.service.d" 2>/dev/null || true
   if ! systemctl daemon-reload 2>/dev/null; then
     echo "Error: failed to reload systemd before NATS firmware cleanup" >&2
-    restart_biometrics_consumers || true
+    restore_biometrics_runtime || true
     return 1
   fi
 
@@ -117,7 +153,7 @@ remove_biometrics_archiver_for_nats() {
   if [ "$restart_frank" = true ] || mountpoint -q "$tmpfs_dir"; then
     if ! systemctl restart frank.service 2>/dev/null; then
       echo "Error: failed to restart frank.service; preserving RAW tmpfs and recovery tools" >&2
-      restart_biometrics_consumers || true
+      restore_biometrics_runtime || true
       return 1
     fi
   fi
@@ -131,7 +167,7 @@ remove_biometrics_archiver_for_nats() {
     if [ -x "$archiver_bin" ] \
        && ! KEEP_RECENT_MIN=-1 "$archiver_bin"; then
       echo "Error: failed to archive all remaining tmpfs RAW frames; preserving mount and recovery tools" >&2
-      restart_biometrics_consumers || true
+      restore_biometrics_runtime || true
       return 1
     fi
 
@@ -146,7 +182,7 @@ remove_biometrics_archiver_for_nats() {
       [ -f "$raw_file" ] || continue
       if [ "$(basename "$raw_file")" != "SEQNO.RAW" ]; then
         echo "Error: unarchived RAW frame remains at $raw_file; preserving mount and recovery tools" >&2
-        restart_biometrics_consumers || true
+        restore_biometrics_runtime || true
         return 1
       fi
     done
@@ -166,15 +202,20 @@ remove_biometrics_archiver_for_nats() {
   if ! systemctl stop persistent-biometrics.mount 2>/dev/null \
      && [ "$tmpfs_was_mounted" = true ]; then
     echo "Error: failed to stop persistent-biometrics.mount; preserving recovery tools" >&2
-    restart_biometrics_consumers || true
+    restore_biometrics_runtime || true
     return 1
   fi
   if mountpoint -q "$tmpfs_dir"; then
     echo "Error: $tmpfs_dir is still mounted; preserving recovery tools" >&2
-    restart_biometrics_consumers || true
+    restore_biometrics_runtime || true
     return 1
   fi
   systemctl disable persistent-biometrics.mount 2>/dev/null || true
+
+  for u in "${timer_units[@]}" sleepypod-biometrics-archiver.service \
+           sleepypod-biometrics-pruner.service sleepypod-tmpfs-prep.service; do
+    systemctl disable "$u" 2>/dev/null || true
+  done
 
   rm -f "$systemd_dir/sleepypod-biometrics-archiver.service" \
         "$systemd_dir/sleepypod-biometrics-archiver.timer" \

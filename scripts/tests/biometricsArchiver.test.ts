@@ -230,6 +230,8 @@ describe('remove_biometrics_archiver_for_nats', () => {
     expect(result.status).toBe(1)
     expect(calls()).toContain('restart sleepypod-piezo-processor.service')
     expect(calls()).toContain('restart sleepypod-calibrator.service')
+    expect(calls()).toContain('start sleepypod-biometrics-archiver.timer')
+    expect(calls()).toContain('start sleepypod-biometrics-pruner.timer')
   })
 
   it('fails cleanup when an active RAW consumer cannot be restored', () => {
