@@ -90,7 +90,7 @@ const persistenceMock = vi.hoisted(() => ({
 }))
 
 const normalizeMock = vi.hoisted(() => ({
-  capSideChannels: vi.fn((_raw: unknown) => null as number[] | null),
+  capSideChannels: vi.fn<(raw: unknown) => number[] | null>(() => null),
   capSideStatus: vi.fn(() => null),
 }))
 
