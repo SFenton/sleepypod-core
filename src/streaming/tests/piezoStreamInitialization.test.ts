@@ -95,6 +95,14 @@ const persistenceMock = vi.hoisted(() => ({
   resetCapFrameWindows: vi.fn(),
 }))
 
+const normalizeMock = vi.hoisted(() => ({
+  capSideChannels: vi.fn((raw: unknown) => {
+    void raw
+    return null as number[] | null
+  }),
+  capSideStatus: vi.fn(() => null),
+}))
+
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof NodeFs>()
   return {
@@ -111,10 +119,7 @@ vi.mock('ws', () => ({
 }))
 
 vi.mock('../capFramePersistence', () => persistenceMock)
-vi.mock('../normalizeFrame', () => ({
-  capSideChannels: vi.fn(() => null),
-  capSideStatus: vi.fn(() => null),
-}))
+vi.mock('../normalizeFrame', () => normalizeMock)
 vi.mock('@/src/hardware/dacMonitor.instance', () => ({
   getDacMonitorIfRunning: vi.fn(() => null),
 }))
@@ -195,6 +200,8 @@ beforeEach(() => {
   fsMock.stat.mockReset().mockResolvedValue({ mtimeMs: 0, isFile: () => true })
   fsMock.open.mockReset()
   fsMock.statSync.mockReset().mockReturnValue({ mtimeMs: 0 })
+  normalizeMock.capSideChannels.mockReset().mockReturnValue(null)
+  normalizeMock.capSideStatus.mockReset().mockReturnValue(null)
   wsMock.state.connectionHandler = null
   wsMock.state.options.length = 0
   wsMock.state.servers.length = 0
@@ -402,6 +409,29 @@ describe('piezoStream module initialization contracts', () => {
     const encoded = Buffer.from(new Encoder({ useRecords: false }).encode(frame))
 
     expect(piezoStream.__test__.decodeSensorFrames(encoded)).toEqual([frame])
+  })
+
+  it('shares the latest capacitance snapshot across fresh module imports', async () => {
+    normalizeMock.capSideChannels.mockImplementation((raw) => {
+      const side = raw as { out: number, cen: number, in: number }
+      return [side.out, side.out, side.cen, side.cen, side.in, side.in]
+    })
+    const first = await loadFreshModule()
+    first.__test__.dispatchSensorFrame({
+      type: 'capSense',
+      ts: 1_700_000_000,
+      left: { out: 10, cen: 20, in: 30 },
+      right: { out: 11, cen: 21, in: 31 },
+    })
+    expect(first.getLatestCapSenseSnapshot()).not.toBeNull()
+
+    const second = await loadFreshModule()
+
+    expect(second.getLatestCapSenseSnapshot()).toMatchObject({
+      type: 'capSense',
+      left: [10, 10, 20, 20, 30, 30],
+      right: [11, 11, 21, 21, 31, 31],
+    })
   })
 
   it('rejects a seek before any RAW file is indexed and still completes it', async () => {
