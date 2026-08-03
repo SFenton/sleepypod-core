@@ -132,7 +132,14 @@ export interface LatestCapSenseSnapshot {
   right: number | number[]
 }
 
-let latestCapSenseSnapshot: LatestCapSenseSnapshot | null = null
+const CAP_SNAPSHOT_KEY = '__sleepypod_latest_cap_sense_snapshot__'
+const globalState = globalThis as typeof globalThis & {
+  [CAP_SNAPSHOT_KEY]?: LatestCapSenseSnapshot | null
+}
+
+function setLatestCapSenseSnapshot(snapshot: LatestCapSenseSnapshot | null): void {
+  globalState[CAP_SNAPSHOT_KEY] = snapshot
+}
 
 /**
  * Read the most recent capSense / capSense2 frame seen on the live RAW stream.
@@ -143,7 +150,7 @@ let latestCapSenseSnapshot: LatestCapSenseSnapshot | null = null
  * down.
  */
 export function getLatestCapSenseSnapshot(): LatestCapSenseSnapshot | null {
-  return latestCapSenseSnapshot
+  return globalState[CAP_SNAPSHOT_KEY] ?? null
 }
 
 /**
@@ -721,7 +728,7 @@ function updatePollRate(): void {
 export function startPiezoStreamServer(): WebSocketServer {
   if (wss) return wss
 
-  latestCapSenseSnapshot = null
+  setLatestCapSenseSnapshot(null)
   wss = new WebSocketServer({ port: WS_PORT, maxPayload: WS_MAX_PAYLOAD_BYTES })
   console.log(`[sensorStream] WebSocket server listening on port ${WS_PORT}`)
   const rawFilesAtStartup = snapshotRawFilesAtStartup(RAW_DATA_DIR)
@@ -900,13 +907,13 @@ function dispatchSensorFrame(frame: Record<string, unknown>): void {
     const left = capSideChannels(rawLeft)
     const right = capSideChannels(rawRight)
     if (typeof ts === 'number' && left && right) {
-      latestCapSenseSnapshot = {
+      setLatestCapSenseSnapshot({
         type: frameType,
         ts,
         receivedAtMs: Date.now(),
         left,
         right,
-      }
+      })
       recordCapFrame('left', left, ts, capSideStatus(rawLeft))
       recordCapFrame('right', right, ts, capSideStatus(rawRight))
     }
@@ -959,7 +966,7 @@ function startRawTailingLoop(rawFilesAtStartup: ReadonlyMap<string, number>): vo
       indexedFilePath = latest
       // Drop the cached capSense snapshot — old file's last frame doesn't
       // describe the current sensor state.
-      latestCapSenseSnapshot = null
+      setLatestCapSenseSnapshot(null)
       // Persist the previous file's tail windows, then restart the stream.
       flushCapFrameWindows()
       resetCapFrameWindows()
