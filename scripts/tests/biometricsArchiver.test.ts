@@ -200,7 +200,11 @@ describe('module deployment guards', () => {
 
   it('requires frank to adopt the tmpfs before consumers switch or root RAW files migrate', () => {
     const helper = readFileSync(helperPath, 'utf8')
-    const requiredRestart = helper.indexOf('if ! systemctl restart frank.service')
+    const installStart = helper.indexOf('install_biometrics_archiver()')
+    const requiredRestart = helper.indexOf(
+      'if ! systemctl restart frank.service',
+      installStart,
+    )
     const consumerRestart = helper.indexOf(
       '# Restart sleepypod modules so they pick up RAW_DATA_DIR=/persistent/biometrics.',
       requiredRestart,
@@ -210,7 +214,23 @@ describe('module deployment guards', () => {
     expect(requiredRestart).toBeGreaterThanOrEqual(0)
     expect(requiredRestart).toBeLessThan(consumerRestart)
     expect(consumerRestart).toBeLessThan(rootMigration)
-    expect(helper).not.toContain('systemctl restart frank.service 2>/dev/null || true')
+    expect(helper.slice(requiredRestart, consumerRestart)).not.toContain('|| true')
+  })
+
+  it('rolls a fresh RAW tmpfs setup back when mandatory firmware restart fails', () => {
+    const helper = readFileSync(helperPath, 'utf8')
+    const rollback = helper.indexOf('rollback_biometrics_archiver_install()')
+    const restartFailure = helper.indexOf(
+      'frank.service did not adopt the biometrics tmpfs',
+    )
+    const rollbackCall = helper.indexOf(
+      'rollback_biometrics_archiver_install',
+      restartFailure,
+    )
+
+    expect(rollback).toBeGreaterThanOrEqual(0)
+    expect(restartFailure).toBeGreaterThan(rollback)
+    expect(rollbackCall).toBeGreaterThan(restartFailure)
   })
 
   it('publishes the irreversible NATS boundary before restarting consumers', () => {

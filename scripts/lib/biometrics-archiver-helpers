@@ -370,43 +370,107 @@ install_biometrics_archiver() {
   # restart below avoids a redundant ~1s biometrics gap on every upgrade.
   local was_mounted=false
   mountpoint -q /persistent/biometrics && was_mounted=true
+  local setup_was_present=false
+  local frank_backup=""
+  if [ "$was_mounted" = true ] \
+     || [ -f /etc/systemd/system/persistent-biometrics.mount ] \
+     || [ -f /etc/systemd/system/frank.service.d/sleepypod-biometrics-tmpfs.conf ]; then
+    setup_was_present=true
+  fi
+
+  rollback_biometrics_archiver_install() {
+    if [ "$setup_was_present" = true ]; then
+      return 0
+    fi
+
+    systemctl stop sleepypod-biometrics-archiver.timer \
+      sleepypod-biometrics-pruner.timer \
+      sleepypod-tmpfs-prep.service 2>/dev/null || true
+    systemctl disable sleepypod-biometrics-archiver.timer \
+      sleepypod-biometrics-pruner.timer 2>/dev/null || true
+
+    if [ -n "$frank_backup" ] && [ -f "$frank_backup" ]; then
+      cp -pf "$frank_backup" /opt/eight/bin/frank.sh 2>/dev/null || true
+    elif [ -f /opt/eight/bin/frank.sh ]; then
+      sed -i 's|cd /persistent/biometrics \&\&|cd /persistent \&\&|' \
+        /opt/eight/bin/frank.sh 2>/dev/null || true
+    fi
+
+    rm -f /etc/systemd/system/frank.service.d/sleepypod-biometrics-tmpfs.conf
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl restart frank.service 2>/dev/null || true
+
+    systemctl stop persistent-biometrics.mount 2>/dev/null || true
+    systemctl disable persistent-biometrics.mount 2>/dev/null || true
+
+    rm -f \
+      /etc/systemd/system/persistent-biometrics.mount \
+      /etc/systemd/system/sleepypod-tmpfs-prep.service \
+      /etc/systemd/system/sleepypod-biometrics-archiver.service \
+      /etc/systemd/system/sleepypod-biometrics-archiver.timer \
+      /etc/systemd/system/sleepypod-biometrics-pruner.service \
+      /etc/systemd/system/sleepypod-biometrics-pruner.timer \
+      /usr/local/bin/sleepypod-tmpfs-prep \
+      /usr/local/bin/sleepypod-biometrics-archiver \
+      /usr/local/bin/sleepypod-biometrics-pruner
+    rmdir /etc/systemd/system/frank.service.d 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+  }
 
   # Scripts
   local s
   for s in sleepypod-tmpfs-prep sleepypod-biometrics-archiver sleepypod-biometrics-pruner; do
-    install -m 0755 "$archiver_src/$s" "/usr/local/bin/$s"
+    if ! install -m 0755 "$archiver_src/$s" "/usr/local/bin/$s"; then
+      rollback_biometrics_archiver_install
+      return 1
+    fi
   done
 
   # Systemd units
-  install -m 0644 "$archiver_src/persistent-biometrics.mount"      /etc/systemd/system/
-  install -m 0644 "$archiver_src/sleepypod-tmpfs-prep.service"     /etc/systemd/system/
-  install -m 0644 "$archiver_src/sleepypod-biometrics-archiver.service" /etc/systemd/system/
-  install -m 0644 "$archiver_src/sleepypod-biometrics-archiver.timer"   /etc/systemd/system/
-  install -m 0644 "$archiver_src/sleepypod-biometrics-pruner.service"   /etc/systemd/system/
-  install -m 0644 "$archiver_src/sleepypod-biometrics-pruner.timer"     /etc/systemd/system/
+  if ! install -m 0644 "$archiver_src/persistent-biometrics.mount" \
+        "$archiver_src/sleepypod-tmpfs-prep.service" \
+        "$archiver_src/sleepypod-biometrics-archiver.service" \
+        "$archiver_src/sleepypod-biometrics-archiver.timer" \
+        "$archiver_src/sleepypod-biometrics-pruner.service" \
+        "$archiver_src/sleepypod-biometrics-pruner.timer" \
+        /etc/systemd/system/; then
+    rollback_biometrics_archiver_install
+    return 1
+  fi
 
   # frank.service drop-in: pull in mount + prep before frankenfirmware execs
   mkdir -p /etc/systemd/system/frank.service.d
-  install -m 0644 "$archiver_src/frank.service.d/sleepypod-biometrics-tmpfs.conf" \
-    /etc/systemd/system/frank.service.d/sleepypod-biometrics-tmpfs.conf
+  if ! install -m 0644 "$archiver_src/frank.service.d/sleepypod-biometrics-tmpfs.conf" \
+    /etc/systemd/system/frank.service.d/sleepypod-biometrics-tmpfs.conf; then
+    rollback_biometrics_archiver_install
+    return 1
+  fi
 
-  systemctl daemon-reload
+  if ! systemctl daemon-reload; then
+    rollback_biometrics_archiver_install
+    return 1
+  fi
 
   # Bring up the mount + symlinks BEFORE patching frank.sh so the cd
   # target exists when frank restarts.
-  systemctl enable --now persistent-biometrics.mount
-  systemctl enable --now sleepypod-tmpfs-prep.service
+  if ! systemctl enable --now persistent-biometrics.mount \
+    || ! systemctl enable --now sleepypod-tmpfs-prep.service; then
+    rollback_biometrics_archiver_install
+    return 1
+  fi
 
   # Patch /opt/eight/bin/frank.sh idempotently. The original is a 12-line
   # firmware shim that does `cd /persistent && exec frankenfirmware`. We
   # need cwd=/persistent/biometrics so RAW frames land in tmpfs.
   if [ -f /opt/eight/bin/frank.sh ]; then
     if ! grep -q 'cd /persistent/biometrics' /opt/eight/bin/frank.sh; then
-      local backup
-      backup="/opt/eight/bin/frank.sh.bak-pre-tmpfs-$(date -u +%Y%m%dT%H%M%SZ)"
-      cp -p /opt/eight/bin/frank.sh "$backup"
-      echo "Backed up frank.sh to $backup"
-      sed -i 's|cd /persistent &&|cd /persistent/biometrics \&\&|' /opt/eight/bin/frank.sh
+      frank_backup="/opt/eight/bin/frank.sh.bak-pre-tmpfs-$(date -u +%Y%m%dT%H%M%SZ)"
+      if ! cp -p /opt/eight/bin/frank.sh "$frank_backup" \
+        || ! sed -i 's|cd /persistent &&|cd /persistent/biometrics \&\&|' /opt/eight/bin/frank.sh; then
+        rollback_biometrics_archiver_install
+        return 1
+      fi
+      echo "Backed up frank.sh to $frank_backup"
       echo "Patched frank.sh: cwd -> /persistent/biometrics"
     else
       echo "frank.sh already patched — skipping"
@@ -424,6 +488,7 @@ install_biometrics_archiver() {
   # switch to tmpfs or root RAW files are migrated and unlinked.
   if ! systemctl restart frank.service 2>/dev/null; then
     echo "Error: frank.service did not adopt the biometrics tmpfs; refusing to migrate RAW files" >&2
+    rollback_biometrics_archiver_install
     return 1
   fi
 
@@ -434,12 +499,18 @@ install_biometrics_archiver() {
     local u
     for u in sleepypod-piezo-processor sleepypod-sleep-detector \
              sleepypod-environment-monitor sleepypod-cover-buttons; do
-      systemctl restart "$u.service" 2>/dev/null || true
+      if ! systemctl restart "$u.service" 2>/dev/null; then
+        rollback_biometrics_archiver_install
+        return 1
+      fi
     done
   fi
 
-  systemctl enable --now sleepypod-biometrics-archiver.timer
-  systemctl enable --now sleepypod-biometrics-pruner.timer
+  if ! systemctl enable --now sleepypod-biometrics-archiver.timer \
+    || ! systemctl enable --now sleepypod-biometrics-pruner.timer; then
+    rollback_biometrics_archiver_install
+    return 1
+  fi
 
   # One-time migration: gzip + relocate any pre-tmpfs RAW files at
   # /persistent root (firmware now writes to /persistent/biometrics, so
