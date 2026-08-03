@@ -168,7 +168,7 @@ def write_bed_temp(conn: sqlite3.Connection, ts: float, record: dict) -> bool:
     Returns True on a successful insert, False if the record didn't match
     a known dialect (caller should not advance the downsample cursor).
     """
-    canonical = normalize_bed_temp(record)
+    canonical = normalize_bed_temp({**record, "ts": ts})
     if canonical is None:
         return False
 
