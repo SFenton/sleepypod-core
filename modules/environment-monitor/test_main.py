@@ -199,6 +199,29 @@ class TestSanitizeTs:
         assert sanitize_ts(bad) is None
 
 
+def test_bed_writer_normalizes_with_the_sanitized_timestamp():
+    conn = _make_db()
+    try:
+        record = {
+            "type": "bedTemp",
+            "ts": "not-a-timestamp",
+            "ambient_temp": 2200,
+            "mcu_temp": 2300,
+            "humidity": 45,
+            "left_outer_temp": 2500,
+            "left_center_temp": 2500,
+            "left_inner_temp": 2500,
+            "right_outer_temp": 2500,
+            "right_center_temp": 2500,
+            "right_inner_temp": 2500,
+        }
+        assert write_bed_temp(conn, 1_700_000_000, record) is True
+        row = conn.execute("SELECT timestamp FROM bed_temp").fetchone()
+        assert row[0] == 1_700_000_000
+    finally:
+        conn.close()
+
+
 # NOTE: bed_temp sentinel filtering moved into common.dialect.normalize_bed_temp
 # (PR #486) — write_bed_temp now expects canonical centidegrees, not raw
 # firmware records. The pre-normalization sentinel test that lived here is no
