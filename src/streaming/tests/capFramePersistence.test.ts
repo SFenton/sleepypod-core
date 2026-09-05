@@ -40,6 +40,14 @@ describe('capFramePersistence', () => {
     vi.restoreAllMocks()
   })
 
+  it.each(['', '__proto__', 'constructor'])('records explicit status %j safely', (status) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    recordCapFrame('left', A, TS, status)
+    recordCapFrame('left', A, TS + 1, status)
+    expect(summarizeWindow(window('left')).statusCounts).toEqual({ [status]: 2 })
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
   it('accumulates frames inside a single window without flushing', () => {
     recordCapFrame('left', A, TS)
     recordCapFrame('left', B, TS + 2) // +2s, still inside the 5s window
@@ -167,6 +175,56 @@ describe('capFramePersistence', () => {
     recordCapFrame('left', B, TS + 2)
 
     expect(summarizeWindow(window('left')).peakZone).toBe(2)
+  })
+
+  describe('capSense status histogram (statusCounts)', () => {
+    afterEach(() => vi.restoreAllMocks())
+
+    it('leaves statusCounts null when every sample is "good"', () => {
+      recordCapFrame('left', A, TS, 'good')
+      recordCapFrame('left', B, TS + 1, 'good')
+      expect(summarizeWindow(window('left')).statusCounts).toBeNull()
+    })
+
+    it('leaves statusCounts null when frames carry no status (legacy .RAW)', () => {
+      recordCapFrame('left', A, TS)
+      recordCapFrame('left', B, TS + 1, null)
+      expect(summarizeWindow(window('left')).statusCounts).toBeNull()
+    })
+
+    it('persists a full histogram (including "good") once any sample is non-good', () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {})
+      recordCapFrame('left', A, TS, 'good')
+      recordCapFrame('left', A, TS + 1, 'good')
+      recordCapFrame('left', A, TS + 2, 'warmup') // still inside the 5s window
+      expect(summarizeWindow(window('left')).statusCounts).toEqual({ good: 2, warmup: 1 })
+    })
+
+    it('tracks status histograms per side independently', () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {})
+      recordCapFrame('left', A, TS, 'warmup')
+      recordCapFrame('right', A, TS, 'good')
+      expect(summarizeWindow(window('left')).statusCounts).toEqual({ warmup: 1 })
+      expect(summarizeWindow(window('right')).statusCounts).toBeNull()
+    })
+
+    it('logs each distinct non-good status once, with side and channel values', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      recordCapFrame('left', A, TS, 'warmup')
+      recordCapFrame('left', B, TS + 1, 'warmup') // same value → not re-logged
+      recordCapFrame('right', A, TS + 2, 'fault') // new value → logged
+      const statusLogs = warn.mock.calls.filter(c => String(c[0]).includes('status='))
+      expect(statusLogs).toHaveLength(2)
+      // The first sight of each value carries the side + channel values.
+      expect(warn).toHaveBeenCalledWith('[capFrames] capSense %s status=%s channels=%j', 'left', 'warmup', A)
+      expect(warn).toHaveBeenCalledWith('[capFrames] capSense %s status=%s channels=%j', 'right', 'fault', A)
+    })
+
+    it('never logs a "good" status', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      recordCapFrame('left', A, TS, 'good')
+      expect(warn).not.toHaveBeenCalled()
+    })
   })
 
   describe('best-effort persistence', () => {

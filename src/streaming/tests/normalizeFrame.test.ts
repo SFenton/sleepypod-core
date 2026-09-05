@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest'
-import { capSideChannels, normalizeFrame } from '../normalizeFrame'
+import { capSideStatus, capSideChannels, normalizeFrame } from '../normalizeFrame'
 
 describe('capSideChannels', () => {
   it('unwraps the Pod 4/5 {values,status} object', () => {
@@ -843,5 +843,14 @@ describe('normalizeFrame', () => {
       expect(result.left).toEqual([])
       expect(result.right).toEqual([])
     })
+  })
+})
+
+describe('capSideStatus', () => {
+  it.each(['good', '', 'degraded'])('preserves string status %j', (status) => {
+    expect(capSideStatus({ status })).toBe(status)
+  })
+  it.each([null, undefined, [], {}, { status: 1 }, { status: [] }, 'good'])('rejects invalid input %j', (input) => {
+    expect(capSideStatus(input)).toBeNull()
   })
 })

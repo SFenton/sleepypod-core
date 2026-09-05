@@ -39,7 +39,9 @@ import type { FileHandle } from 'node:fs/promises'
 import * as path from 'node:path'
 import { Decoder } from 'cbor-x'
 import { flushCapFrameWindows, recordCapFrame, resetCapFrameWindows } from './capFramePersistence'
-import { capSideChannels } from './normalizeFrame'
+import { capSideChannels, capSideStatus } from './normalizeFrame'
+import { natsReachable, startNatsFrameSource } from './natsFrameSource'
+import type { NatsFrameSourceHandle } from './natsFrameSource'
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -62,6 +64,42 @@ const MAX_BUFFERED_BYTES = 1024 * 1024 // 1 MB
 // (subscribe / get_time_range / seek) — 1 KiB is well above the largest.
 const WS_MAX_PAYLOAD_BYTES = 1024
 
+// ── Source selection (RAW file tailer vs loopback NATS) ──
+// New Pod 5 firmware publishes frames to a local NATS server instead of writing
+// `.RAW` files. We probe reachability at startup and pick ONE source for the
+// process lifetime — never both (duplicate-row risk). See docs/nats-frame-readers.md.
+//
+// `PIEZO_NATS_DISABLED=1` forces the legacy `.RAW` tailer (escape hatch + test
+// default). The grace window keeps retrying the probe so a module that comes up
+// before nats-server still selects NATS; worst case on a `.RAW`-only pod is
+// GRACE_MS of retries before file tailing starts (accepted per review).
+const streamGlobal = globalThis as typeof globalThis & { __sleepypodSensorStream?: ReturnType<typeof createStreamState> }
+function createStreamState() {
+  return {
+    frameIndex: [] as FrameIndexEntry[],
+    // RAW file associated with the seek index.
+    indexedFilePath: null as string | null,
+    latestCapSenseSnapshot: null as LatestCapSenseSnapshot | null,
+    wss: null as WebSocketServer | null,
+    streamingInterval: null as ReturnType<typeof setInterval> | null,
+    // Exactly one live source is owned by this server.
+    natsSource: null as NatsFrameSourceHandle | null,
+    warnedUnknownTypes: new Set<string>(),
+    // undefined subscribes the client to every sensor type.
+    clientSubscriptions: new Map<WebSocket, Set<SensorType> | undefined>(),
+    clientDroppedFrames: new Map<WebSocket, number>(),
+  }
+}
+const streamState = streamGlobal.__sleepypodSensorStream ??= createStreamState()
+
+const NATS_SOURCE_DISABLED = process.env.PIEZO_NATS_DISABLED === '1'
+function natsTiming(value: string | undefined, fallback: number, allowZero: boolean): number {
+  const parsed = Number(value ?? fallback)
+  return Number.isFinite(parsed) && (allowZero ? parsed >= 0 : parsed > 0) ? parsed : fallback
+}
+const NATS_GRACE_MS = natsTiming(process.env.PIEZO_NATS_GRACE_MS, 60_000, true)
+const NATS_PROBE_INTERVAL_MS = natsTiming(process.env.PIEZO_NATS_PROBE_INTERVAL_MS, 5_000, false)
+
 // ---------------------------------------------------------------------------
 // In-memory sidecar index: maps timestamps to byte offsets in the current RAW
 // file. Built incrementally as frames are parsed during live streaming.
@@ -74,10 +112,6 @@ interface FrameIndexEntry {
   /** Byte offset in the RAW file where the outer CBOR record starts. */
   offset: number
 }
-
-const frameIndex: FrameIndexEntry[] = []
-/** Path of the RAW file that `frameIndex` corresponds to. */
-let indexedFilePath: string | null = null
 
 /**
  * Last seen capSense / capSense2 frame, kept as a cheap snapshot so
@@ -100,8 +134,6 @@ export interface LatestCapSenseSnapshot {
   right: number | number[]
 }
 
-let latestCapSenseSnapshot: LatestCapSenseSnapshot | null = null
-
 /**
  * Read the most recent capSense / capSense2 frame seen on the live RAW stream.
  * Returns null until the first frame arrives or after the RAW file switches.
@@ -110,7 +142,7 @@ let latestCapSenseSnapshot: LatestCapSenseSnapshot | null = null
  * frames arrive at ~2 Hz; long gaps mean the sensor or the streamer is down.
  */
 export function getLatestCapSenseSnapshot(): LatestCapSenseSnapshot | null {
-  return latestCapSenseSnapshot
+  return streamState.latestCapSenseSnapshot
 }
 
 /**
@@ -119,15 +151,15 @@ export function getLatestCapSenseSnapshot(): LatestCapSenseSnapshot | null {
  * Called on every decoded frame — keep the hot path cheap (amortized O(1)).
  */
 function appendFrameIndex(entry: FrameIndexEntry): void {
-  frameIndex.push(entry)
+  streamState.frameIndex.push(entry)
   const cutoff = entry.ts - FRAME_INDEX_RETENTION_S
   // Drop the prefix of entries older than the cutoff. Entries are monotonic
   // in `ts` because frames are parsed in file order, so a single leading
   // slice is correct. Batch the splice to avoid O(n) shift per push.
-  if (frameIndex.length > 0 && frameIndex[0].ts < cutoff) {
+  if (streamState.frameIndex.length > 0 && streamState.frameIndex[0].ts < cutoff) {
     let drop = 0
-    while (drop < frameIndex.length && frameIndex[drop].ts < cutoff) drop += 1
-    if (drop > 0) frameIndex.splice(0, drop)
+    while (drop < streamState.frameIndex.length && streamState.frameIndex[drop].ts < cutoff) drop += 1
+    if (drop > 0) streamState.frameIndex.splice(0, drop)
   }
 }
 
@@ -378,21 +410,13 @@ function decodeSensorFrames(innerBytes: Buffer): Record<string, unknown>[] {
 // WebSocket server
 // ---------------------------------------------------------------------------
 
-let wss: WebSocketServer | null = null
-let streamingInterval: ReturnType<typeof setInterval> | null = null
-
-/** Per-client sensor subscriptions. undefined = all types (default). */
-const clientSubscriptions = new Map<WebSocket, Set<SensorType> | undefined>()
-/** Per-client count of frames dropped due to send-buffer backpressure. */
-const clientDroppedFrames = new Map<WebSocket, number>()
-
 /**
  * Forget all per-client state. Must be called from the `close` handler so
  * disconnected clients do not pin memory until the next GC cycle.
  */
 function cleanupClient(ws: WebSocket): void {
-  clientSubscriptions.delete(ws)
-  clientDroppedFrames.delete(ws)
+  streamState.clientSubscriptions.delete(ws)
+  streamState.clientDroppedFrames.delete(ws)
 }
 
 /**
@@ -407,7 +431,7 @@ function sendWithBackpressure(client: WebSocket, payload: string): boolean {
   // send push the buffer past MAX_BUFFERED_BYTES before the next call notices.
   const payloadByteSize = Buffer.byteLength(payload)
   if (client.bufferedAmount + payloadByteSize > MAX_BUFFERED_BYTES) {
-    clientDroppedFrames.set(client, (clientDroppedFrames.get(client) ?? 0) + 1)
+    streamState.clientDroppedFrames.set(client, (streamState.clientDroppedFrames.get(client) ?? 0) + 1)
     return false
   }
   try {
@@ -428,7 +452,7 @@ function handleClientMessage(ws: WebSocket, raw: Buffer | string): void {
       const requested = msg.sensors as string[] | undefined
       if (!Array.isArray(requested) || requested.length === 0) {
         // Empty or missing → subscribe to all (undefined = no filter)
-        clientSubscriptions.set(ws, undefined)
+        streamState.clientSubscriptions.set(ws, undefined)
         ws.send(JSON.stringify({ type: 'subscribed', sensors: [...ALL_SENSOR_TYPES] }))
         console.log('[sensorStream] Client subscribed to: all')
       }
@@ -442,22 +466,22 @@ function handleClientMessage(ws: WebSocket, raw: Buffer | string): void {
           }))
         }
         else {
-          clientSubscriptions.set(ws, new Set(valid))
+          streamState.clientSubscriptions.set(ws, new Set(valid))
           ws.send(JSON.stringify({ type: 'subscribed', sensors: valid }))
           console.log('[sensorStream] Client subscribed to: %s', valid.join(', '))
         }
       }
     }
     else if (msg.type === 'get_time_range') {
-      if (frameIndex.length === 0) {
+      if (streamState.frameIndex.length === 0) {
         ws.send(JSON.stringify({ type: 'time_range', min: 0, max: 0, file: null }))
       }
       else {
         ws.send(JSON.stringify({
           type: 'time_range',
-          min: frameIndex[0].ts,
-          max: frameIndex[frameIndex.length - 1].ts,
-          file: indexedFilePath ? path.basename(indexedFilePath) : null,
+          min: streamState.frameIndex[0].ts,
+          max: streamState.frameIndex[streamState.frameIndex.length - 1].ts,
+          file: streamState.indexedFilePath ? path.basename(streamState.indexedFilePath) : null,
         }))
       }
     }
@@ -485,21 +509,21 @@ function handleClientMessage(ws: WebSocket, raw: Buffer | string): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Binary search `frameIndex` for the entry at or just before `targetTs`.
- * Returns the index into `frameIndex`, or -1 if the index is empty.
+ * Binary search `streamState.frameIndex` for the entry at or just before `targetTs`.
+ * Returns the index into `streamState.frameIndex`, or -1 if the index is empty.
  * If the target is before the earliest entry, returns 0 (the first index).
  */
 function findIndexEntry(targetTs: number): number {
-  if (frameIndex.length === 0) return -1
+  if (streamState.frameIndex.length === 0) return -1
   let lo = 0
-  let hi = frameIndex.length - 1
+  let hi = streamState.frameIndex.length - 1
 
   // Target is before all indexed frames
-  if (targetTs < frameIndex[0].ts) return 0
+  if (targetTs < streamState.frameIndex[0].ts) return 0
 
   while (lo <= hi) {
     const mid = (lo + hi) >>> 1
-    if (frameIndex[mid].ts <= targetTs) {
+    if (streamState.frameIndex[mid].ts <= targetTs) {
       lo = mid + 1
     }
     else {
@@ -519,7 +543,7 @@ function findIndexEntry(targetTs: number): number {
  * not affected.
  */
 async function handleSeek(ws: WebSocket, targetTs: number): Promise<void> {
-  if (!indexedFilePath) {
+  if (!streamState.indexedFilePath) {
     ws.send(JSON.stringify({ type: 'error', message: 'No RAW file indexed yet' }))
     ws.send(JSON.stringify({ type: 'seek_complete' }))
     return
@@ -532,11 +556,11 @@ async function handleSeek(ws: WebSocket, targetTs: number): Promise<void> {
     return
   }
 
-  const startOffset = frameIndex[idx].offset
-  const filePath = indexedFilePath
+  const startOffset = streamState.frameIndex[idx].offset
+  const filePath = streamState.indexedFilePath
 
   // Check subscription filter for this client
-  const subs = clientSubscriptions.get(ws)
+  const subs = streamState.clientSubscriptions.get(ws)
 
   let fh: FileHandle | null = null
   try {
@@ -649,7 +673,7 @@ function updatePollRate(): void {
     .then(({ getDacMonitorIfRunning }) => {
       const monitor = getDacMonitorIfRunning()
       if (!monitor) return
-      const clientCount = wss?.clients.size ?? 0
+      const clientCount = streamState.wss?.clients.size ?? 0
       if (clientCount > 0) {
         monitor.setActive()
       }
@@ -665,24 +689,19 @@ function updatePollRate(): void {
  * Called from instrumentation.ts during server startup.
  */
 export function startPiezoStreamServer(): WebSocketServer {
-  if (wss) return wss
+  if (streamState.wss) return streamState.wss
 
-  wss = new WebSocketServer({ port: WS_PORT, maxPayload: WS_MAX_PAYLOAD_BYTES })
+  streamState.wss = new WebSocketServer({ port: WS_PORT, maxPayload: WS_MAX_PAYLOAD_BYTES })
   console.log(`[sensorStream] WebSocket server listening on port ${WS_PORT}`)
 
-  // State for file tailing
-  let currentPath: string | null = null
-  let fileBuffer = Buffer.alloc(0)
-  let readOffset = 0 // offset into the actual file (not the buffer)
-
-  wss.on('connection', (ws) => {
+  streamState.wss.on('connection', (ws) => {
     console.log('[sensorStream] Client connected')
     updatePollRate()
 
     ws.on('message', data => handleClientMessage(ws, data as Buffer | string))
 
     ws.on('close', () => {
-      const dropped = clientDroppedFrames.get(ws) ?? 0
+      const dropped = streamState.clientDroppedFrames.get(ws) ?? 0
       cleanupClient(ws)
       if (dropped > 0) {
         console.log(`[sensorStream] Client disconnected (dropped ${dropped} frames due to backpressure)`)
@@ -698,12 +717,159 @@ export function startPiezoStreamServer(): WebSocketServer {
     })
   })
 
-  // Periodic file-tailing loop: read new data from the RAW file and broadcast.
-  // Runs even with no clients connected — the cap-frame downsampler must keep
-  // persisting through unattended nights so the next morning can be replayed.
-  // Broadcasting is already per-client guarded, so an idle loop does no fan-out.
-  streamingInterval = setInterval(() => {
-    if (!wss) return
+  // The WS server is already accepting clients; pick and attach the frame source
+  // (RAW file tailer vs loopback NATS) asynchronously so a slow NATS probe never
+  // blocks client connections.
+  void selectAndStartSource(streamState.wss)
+
+  return streamState.wss
+}
+
+/**
+ * Choose exactly one frame source for the process lifetime. Reachability
+ * decides — a NATS server on loopback means new firmware, so we select NATS and
+ * let it wait for frames; otherwise (or when disabled) we tail `.RAW` files. The
+ * probe is retried over a grace window so a module that starts before
+ * nats-server still lands on NATS. Never runs both sources (duplicate-row risk).
+ */
+async function selectAndStartSource(expectedServer: WebSocketServer): Promise<void> {
+  if (!NATS_SOURCE_DISABLED) {
+    const deadline = Date.now() + NATS_GRACE_MS
+    for (;;) {
+      if (streamState.wss !== expectedServer) return // shut down mid-selection
+      let reachable = false
+      try {
+        reachable = await natsReachable()
+      }
+      catch {
+        reachable = false
+      }
+      if (streamState.wss !== expectedServer) return
+      if (reachable) {
+        await startNatsSource(expectedServer)
+        return
+      }
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) break
+      await new Promise(resolve => setTimeout(resolve, Math.min(NATS_PROBE_INTERVAL_MS, remaining)))
+    }
+    console.log('[sensorStream] no NATS server after %ds — tailing .RAW files',
+      Math.round(NATS_GRACE_MS / 1000))
+  }
+  startRawTailingLoop()
+}
+
+/** Connect the loopback-NATS source, feeding decoded frames into the shared dispatch. */
+async function startNatsSource(expectedServer: WebSocketServer): Promise<void> {
+  try {
+    const source = await startNatsFrameSource({
+      decode: decodeSensorFrames,
+      onFrame: (frame) => { if (streamState.wss === expectedServer) dispatchSensorFrame(frame) },
+      onReady: () => console.log('[sensorStream] NATS frame source active'),
+      onClose: err => console.error('[sensorStream] NATS frame source closed', err ?? ''),
+    })
+    if (streamState.wss !== expectedServer) {
+      // Server shut down while we were connecting — don't leak the connection.
+      await source.stop()
+      return
+    }
+    streamState.natsSource = source
+  }
+  catch (err) {
+    // Reachability said yes but the connect raced/failed. Fall back to the file
+    // tailer — on a NATS-only pod it finds nothing, which is the pre-existing
+    // (safe) empty state, not a regression.
+    console.error('[sensorStream] NATS connect failed, falling back to .RAW tailing:', err)
+    if (streamState.wss === expectedServer) startRawTailingLoop()
+  }
+}
+
+/**
+ * Fan one decoded sensor frame out to every downstream consumer: subscribed WS
+ * clients, in-process server-side listeners (frzHealth), the live capSense
+ * snapshot, and the cap-frame downsampler. Shared by both sources — the `.RAW`
+ * tailer and the NATS subscription — so a NATS-only pod feeds the web stream,
+ * `cap_sense_frames`, and `cap.*` signals exactly as a `.RAW` pod does. (The
+ * tailer additionally maintains the seek index, which is file-offset-specific
+ * and stays in its loop.)
+ */
+function dispatchSensorFrame(frame: Record<string, unknown>): void {
+  const frameType = frame.type as string
+
+  // New / out-of-scope firmware types (blanketReadings, …) pass through to
+  // subscribers but are not ingested — log the first sight of each, once.
+  if (!(ALL_SENSOR_TYPES as readonly string[]).includes(frameType)
+    && !streamState.warnedUnknownTypes.has(frameType)) {
+    streamState.warnedUnknownTypes.add(frameType)
+    console.warn('[sensorStream] unknown sensor frame type "%s" — broadcasting but not ingesting', frameType)
+  }
+
+  // Broadcast to subscribed clients only. Pre-serialize once (avoid per-client
+  // JSON.stringify), and only if at least one client needs it.
+  const server = streamState.wss
+  if (server) {
+    let payload: string | null = null
+    for (const client of server.clients) {
+      if (client.readyState !== WebSocket.OPEN) continue
+      const subs = streamState.clientSubscriptions.get(client)
+      if (subs && !subs.has(frameType as SensorType)) continue
+      if (payload === null) payload = JSON.stringify(frame)
+      sendWithBackpressure(client, payload)
+    }
+  }
+
+  // Notify server-side listeners (only frzHealth currently has consumers).
+  if (frameType === 'frzHealth' && serverFrameListeners.size > 0) {
+    for (const cb of serverFrameListeners) {
+      try {
+        cb(frame)
+      }
+      catch { /* consumer error */ }
+    }
+  }
+
+  // Update the live capSense snapshot for in-process readers (virtual occupancy
+  // sensor) and downsample into biometrics.db for replay. Firmware sends per-side
+  // channels as {values:[...]} on Pod 4/5 and {out,cen,in} on Pod 3 — unwrap to a
+  // flat array so both paths see real readings regardless of pod variant. The
+  // NATS capSense dialect also tags each side with a `status`; feed it to the
+  // downsampler for the statusCounts histogram (legacy .RAW frames carry none).
+  if (frameType === 'capSense' || frameType === 'capSense2') {
+    const ts = (frame as { ts: unknown }).ts
+    const rawLeft = (frame as { left: unknown }).left
+    const rawRight = (frame as { right: unknown }).right
+    const left = capSideChannels(rawLeft)
+    const right = capSideChannels(rawRight)
+    if (typeof ts === 'number' && left && right) {
+      streamState.latestCapSenseSnapshot = {
+        type: frameType,
+        ts,
+        receivedAtMs: Date.now(),
+        left,
+        right,
+      }
+      recordCapFrame('left', left, ts, capSideStatus(rawLeft))
+      recordCapFrame('right', right, ts, capSideStatus(rawRight))
+    }
+  }
+}
+
+/**
+ * Periodic `.RAW` file-tailing loop: read new data from the newest RAW file and
+ * dispatch decoded frames. Runs even with no clients connected — the cap-frame
+ * downsampler must keep persisting through unattended nights so the next morning
+ * can be replayed. Broadcasting is per-client guarded, so an idle loop does no
+ * fan-out.
+ */
+function startRawTailingLoop(): void {
+  if (streamState.streamingInterval) return
+
+  let currentPath: string | null = null
+  let fileBuffer = Buffer.alloc(0)
+  let readOffset = 0 // offset into the actual file (not the buffer)
+
+  streamState.streamingInterval = setInterval(() => {
+    if (!streamState.wss) return
 
     // Find the latest RAW file
     const latest = findLatestRaw(RAW_DATA_DIR)
@@ -716,11 +882,11 @@ export function startPiezoStreamServer(): WebSocketServer {
       fileBuffer = Buffer.alloc(0)
       readOffset = 0
       // Reset the sidecar frame index for the new file
-      frameIndex.length = 0
-      indexedFilePath = latest
+      streamState.frameIndex.length = 0
+      streamState.indexedFilePath = latest
       // Drop the cached capSense snapshot — old file's last frame doesn't
       // describe the current sensor state.
-      latestCapSenseSnapshot = null
+      streamState.latestCapSenseSnapshot = null
       // Persist the previous file's tail windows, then restart the stream.
       flushCapFrameWindows()
       resetCapFrameWindows()
@@ -764,64 +930,14 @@ export function startPiezoStreamServer(): WebSocketServer {
           const frames = decodeSensorFrames(data)
 
           for (const frame of frames) {
-            const frameType = frame.type as string
-
-            // Record timestamp→offset mapping in the sidecar index
+            // Record timestamp→offset mapping in the sidecar index (file-specific,
+            // so it stays here rather than in the shared dispatch).
             const ts = frame.ts as number | undefined
             if (ts !== undefined) {
               appendFrameIndex({ ts, offset: recordFileOffset })
             }
 
-            // Broadcast to subscribed clients only
-            const server = wss
-            if (server) {
-              // Pre-serialize once (avoid per-client JSON.stringify)
-              let payload: string | null = null
-
-              for (const client of server.clients) {
-                if (client.readyState !== WebSocket.OPEN) continue
-
-                // Check subscription filter (default: all types)
-                const subs = clientSubscriptions.get(client)
-                if (subs && !subs.has(frameType as SensorType)) continue
-
-                // Lazy serialize — only if at least one client needs it
-                if (payload === null) payload = JSON.stringify(frame)
-                sendWithBackpressure(client, payload)
-              }
-            }
-
-            // Notify server-side listeners (only frzHealth currently has consumers)
-            if (frameType === 'frzHealth' && serverFrameListeners.size > 0) {
-              for (const cb of serverFrameListeners) {
-                try {
-                  cb(frame as Record<string, unknown>)
-                }
-                catch { /* consumer error */ }
-              }
-            }
-
-            // Update the live capSense snapshot for in-process readers (virtual
-            // occupancy sensor) and downsample into biometrics.db for replay.
-            // Firmware sends per-side channels as {values:[...]} on Pod 4/5 and
-            // {out,cen,in} on Pod 3 — unwrap to a flat array so both paths see
-            // real readings regardless of pod variant.
-            if (frameType === 'capSense' || frameType === 'capSense2') {
-              const ts = (frame as { ts: unknown }).ts
-              const left = capSideChannels((frame as { left: unknown }).left)
-              const right = capSideChannels((frame as { right: unknown }).right)
-              if (typeof ts === 'number' && left && right) {
-                latestCapSenseSnapshot = {
-                  type: frameType,
-                  ts,
-                  receivedAtMs: Date.now(),
-                  left,
-                  right,
-                }
-                recordCapFrame('left', left, ts)
-                recordCapFrame('right', right, ts)
-              }
-            }
+            dispatchSensorFrame(frame)
           }
         }
         catch (e) {
@@ -861,8 +977,6 @@ export function startPiezoStreamServer(): WebSocketServer {
       // Non-fatal — file may be temporarily unavailable
     }
   }, FILE_POLL_INTERVAL_MS)
-
-  return wss
 }
 
 // Server-side frame listeners — called for every decoded sensor frame.
@@ -898,7 +1012,7 @@ export function broadcastFrame(frame: Record<string, unknown>): void {
     }
   }
 
-  const server = wss
+  const server = streamState.wss
   if (!server || server.clients.size === 0) return
 
   const frameType = frame.type as string
@@ -907,7 +1021,7 @@ export function broadcastFrame(frame: Record<string, unknown>): void {
   for (const client of server.clients) {
     if (client.readyState !== WebSocket.OPEN) continue
 
-    const subs = clientSubscriptions.get(client)
+    const subs = streamState.clientSubscriptions.get(client)
     if (subs && !subs.has(frameType as SensorType)) continue
 
     if (payload === null) payload = JSON.stringify(frame)
@@ -920,6 +1034,7 @@ export function broadcastFrame(frame: Record<string, unknown>): void {
  * `__test__` prefix keeps them out of autocomplete for production callers.
  */
 export const __test__ = {
+  natsTiming,
   appendFrameIndex,
   cleanupClient,
   sendWithBackpressure,
@@ -927,13 +1042,16 @@ export const __test__ = {
   findIndexEntry,
   int32BufferToArray,
   decodeSensorFrames,
-  get frameIndex(): readonly FrameIndexEntry[] { return frameIndex },
-  clientSubscriptions,
-  clientDroppedFrames,
+  dispatchSensorFrame,
+  warnedUnknownTypes: streamState.warnedUnknownTypes,
+  get frameIndex(): readonly FrameIndexEntry[] { return streamState.frameIndex },
+  get natsSourceActive(): boolean { return streamState.natsSource !== null },
+  clientSubscriptions: streamState.clientSubscriptions,
+  clientDroppedFrames: streamState.clientDroppedFrames,
   FRAME_INDEX_RETENTION_S,
   MAX_BUFFERED_BYTES,
   WS_MAX_PAYLOAD_BYTES,
-  resetFrameIndex(): void { frameIndex.length = 0 },
+  resetFrameIndex(): void { streamState.frameIndex.length = 0 },
 }
 
 /**
@@ -941,15 +1059,26 @@ export const __test__ = {
  * Called during graceful shutdown in instrumentation.ts.
  */
 export async function shutdownPiezoStreamServer(): Promise<void> {
-  if (streamingInterval) {
-    clearInterval(streamingInterval)
-    streamingInterval = null
+  // Null streamState.wss first so any in-flight source selection / NATS connect aborts
+  // instead of attaching to a server that's going away.
+  const server = streamState.wss
+  streamState.wss = null
+
+  if (streamState.streamingInterval) {
+    clearInterval(streamState.streamingInterval)
+    streamState.streamingInterval = null
+  }
+  if (streamState.natsSource) {
+    const source = streamState.natsSource
+    streamState.natsSource = null
+    try {
+      await source.stop()
+    }
+    catch { /* already closing */ }
   }
   flushCapFrameWindows()
 
-  const server = wss
   if (server) {
-    wss = null
     // `server.close()` only fires its callback once every client has
     // disconnected; a still-open socket would hang shutdown forever. Drop
     // them eagerly so close always completes.
@@ -960,8 +1089,8 @@ export async function shutdownPiezoStreamServer(): Promise<void> {
       server.close(() => {
         // Drop per-client state explicitly — relying on per-socket close
         // events leaks if any handler failed to fire.
-        clientSubscriptions.clear()
-        clientDroppedFrames.clear()
+        streamState.clientSubscriptions.clear()
+        streamState.clientDroppedFrames.clear()
         console.log('[sensorStream] WebSocket server closed')
         resolve()
       })
