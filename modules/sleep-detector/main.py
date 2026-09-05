@@ -938,6 +938,8 @@ def main() -> None:
 
             # Surface genuinely-new firmware types once (blanketReadings, log,
             # …) instead of dropping them silently.
+            if not isinstance(rtype, str):
+                continue
             if rtype not in KNOWN_RECORD_TYPES:
                 warn_unknown_type_once(record, "sleep-detector")
                 continue

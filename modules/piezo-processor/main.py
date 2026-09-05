@@ -988,6 +988,8 @@ def main() -> None:
             # Surface genuinely-new firmware types once (blanketReadings, log,
             # …) instead of dropping them silently; known types this module
             # doesn't consume fall through to the checks below.
+            if not isinstance(rtype, str):
+                continue
             if rtype not in KNOWN_RECORD_TYPES:
                 warn_unknown_type_once(record, "piezo-processor")
                 continue

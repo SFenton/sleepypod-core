@@ -175,6 +175,11 @@ describe('remove_biometrics_archiver_for_nats', () => {
     expect(result.status).toBe(0)
     expect(calls()).toContain('stop persistent-biometrics.mount')
     expect(existsSync(seqno)).toBe(true)
+    for (const unit of ['sleepypod', 'sleepypod-cover-buttons', 'sleepypod-sleep-detector', 'sleepypod-piezo-processor', 'sleepypod-calibrator', 'sleepypod-environment-monitor']) {
+      expect(readFileSync(join(systemdDir, `${unit}.service.d/zz-nats-raw-fallback.conf`), 'utf8'))
+        .toContain('Environment="RAW_DATA_DIR=/persistent"')
+    }
+    expect(calls().indexOf('daemon-reload')).toBeLessThan(calls().indexOf('stop persistent-biometrics.mount'))
     expect(existsSync(mountUnit)).toBe(false)
     expect(existsSync(recoveryTool)).toBe(false)
   })

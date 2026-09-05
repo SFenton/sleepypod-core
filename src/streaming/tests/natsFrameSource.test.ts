@@ -134,6 +134,7 @@ describe('natsReachable', () => {
 })
 
 describe('startNatsFrameSource', () => {
+  afterEach(() => vi.restoreAllMocks())
   beforeEach(() => {
     nats.state.subs.length = 0
     nats.state.connectOpts = null
@@ -150,7 +151,7 @@ describe('startNatsFrameSource', () => {
     expect(nats.state.connectOpts).toMatchObject({
       servers: '127.0.0.1:4222',
       maxReconnectAttempts: -1,
-      waitOnFirstConnect: true,
+      waitOnFirstConnect: false,
     })
   })
 
@@ -203,7 +204,6 @@ describe('startNatsFrameSource', () => {
     deliver('raw.sens.capsense', new Uint8Array([0x00, 0x01, 0x02]))
     expect(onFrame).not.toHaveBeenCalled()
     expect(src.stats).toMatchObject({ messages: 1, framesDecoded: 0, decodeFailures: 1 })
-    vi.restoreAllMocks()
   })
 
   it('counts a decoder exception as a decode failure', async () => {

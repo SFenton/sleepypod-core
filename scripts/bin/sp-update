@@ -477,12 +477,14 @@ fi
 # do not ship nats-server.service and must continue starting normally. The
 # streamer's own 60-second probe remains the race-safe runtime selector.
 NATS_ORDERING_DROPIN=/etc/systemd/system/sleepypod.service.d/nats-ordering.conf
-if [ ! -f "$NATS_ORDERING_DROPIN" ]; then
-  mkdir -p "$(dirname "$NATS_ORDERING_DROPIN")"
-  cat > "$NATS_ORDERING_DROPIN" << 'EOF'
+mkdir -p "$(dirname "$NATS_ORDERING_DROPIN")"
+nats_ordering_content=$(cat << 'EOF'
 [Unit]
 After=nats-server.service
 EOF
+)
+if [ "$(cat "$NATS_ORDERING_DROPIN" 2>/dev/null || true)" != "$nats_ordering_content" ]; then
+  printf '%s\n' "$nats_ordering_content" > "$NATS_ORDERING_DROPIN"
   systemctl daemon-reload
 fi
 

@@ -412,12 +412,12 @@ class TestPresenceDebounce:
         t = _tracker()
         base = 1_777_000_000.0
         samples = [(base, True), (base + 31, True)]
-        ts = base + 31
-        while ts < base + main.MAX_SESSION_S + 3600:
-            ts += 600
-            samples.append((ts, True))
-        # Real exit → natural close resets the streak.
-        leave = ts + 60
+        # Close precisely at the cap, then explicitly start a new session.
+        ts = base + 31 + main.MAX_SESSION_S
+        samples.append((ts, True))
+        restart = ts + 600
+        samples += [(restart, True), (restart + 31, True)]
+        leave = restart + 60
         samples += [(leave, False), (leave + 31, False), (leave + 200, False)]
         # Back in bed and past the cap once more.
         back = leave + 400

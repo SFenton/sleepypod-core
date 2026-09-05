@@ -123,6 +123,65 @@ describe('startPiezoStreamServer — source selection', () => {
     natsMock.captured = null
     for (const f of fs.readdirSync(tmpRawDir)) fs.rmSync(path.join(tmpRawDir, f), { force: true })
     vi.clearAllMocks()
+    vi.restoreAllMocks()
+  })
+
+  it('discards a probe from a server that was shut down and restarted', async () => {
+    let resolveProbe!: (value: boolean) => void
+    vi.mocked(natsReachable).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveProbe = resolve
+    }))
+    startPiezoStreamServer()
+    await shutdownPiezoStreamServer()
+    natsMock.reachable = true
+    startPiezoStreamServer()
+    await waitFor(() => __test__.natsSourceActive)
+    resolveProbe(true)
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(startNatsFrameSource).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops a stale connection and ignores its frames after restart', async () => {
+    natsMock.reachable = true
+    let resolveStart!: () => void
+    natsMock.startPromise = new Promise((resolve) => {
+      resolveStart = resolve
+    })
+    startPiezoStreamServer()
+    await waitFor(() => natsMock.startCalls === 1)
+    const staleOptions = natsMock.captured
+    await shutdownPiezoStreamServer()
+    natsMock.startPromise = null
+    startPiezoStreamServer()
+    await waitFor(() => __test__.natsSourceActive)
+    const before = getLatestCapSenseSnapshot()
+    staleOptions.onFrame({ type: 'capSense', ts: Date.now() / 1000, left: 999, right: 999 })
+    expect(getLatestCapSenseSnapshot()).toBe(before)
+    resolveStart()
+    await waitFor(() => natsMock.stopCalls === 1)
+    expect(__test__.natsSourceActive).toBe(true)
+    expect(natsMock.startCalls).toBe(2)
+  })
+
+  it('shares the source and snapshot across duplicate module loads', async () => {
+    natsMock.reachable = true
+    const server = startPiezoStreamServer()
+    await waitFor(() => __test__.natsSourceActive)
+    vi.resetModules()
+    const duplicate = await import('../piezoStream')
+    expect(duplicate.startPiezoStreamServer()).toBe(server)
+    expect(startNatsFrameSource).toHaveBeenCalledTimes(1)
+    expect(duplicate.getLatestCapSenseSnapshot()).toBe(getLatestCapSenseSnapshot())
+  })
+
+  it.each(['NaN', 'Infinity', '-1'])('defaults invalid NATS timing %s', (value) => {
+    expect(__test__.natsTiming(value, 60000, true)).toBe(60000)
+    expect(__test__.natsTiming(value, 5000, false)).toBe(5000)
+  })
+  it('allows zero grace but requires a positive probe interval', () => {
+    expect(__test__.natsTiming('0', 60000, true)).toBe(0)
+    expect(__test__.natsTiming('0', 5000, false)).toBe(5000)
+    expect(__test__.natsTiming('12', 5000, false)).toBe(12)
   })
 
   it('selects NATS when reachable and routes its frames into the shared dispatch', async () => {

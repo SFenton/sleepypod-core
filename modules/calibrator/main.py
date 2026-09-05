@@ -129,7 +129,7 @@ def load_recent_records(hours: int = 6, buffer=None) -> dict:
                         if ts < cutoff:
                             continue
                         rtype = inner.get("type", "")
-                        if rtype in records:
+                        if isinstance(rtype, str) and rtype in records:
                             records[rtype].append(inner)
                     except EOFError:
                         break
@@ -340,7 +340,7 @@ def main() -> None:
 
             # Retry any still-missing/failed profiles as samples accrue.
             now = time.time()
-            if remaining and now - last_retry >= CAL_RETRY_INTERVAL_S:
+            if now - last_retry >= CAL_RETRY_INTERVAL_S:
                 last_retry = now
                 remaining = run_pending_calibrations(store, now, "retry",
                                                      buffer=nats_buffer)

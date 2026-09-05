@@ -276,6 +276,8 @@ def main() -> None:
             rtype = record.get("type")
             # Surface genuinely-new firmware types once (blanketReadings, log,
             # …); known types this module doesn't consume fall through quietly.
+            if not isinstance(rtype, str):
+                continue
             if rtype not in KNOWN_RECORD_TYPES:
                 warn_unknown_type_once(record, "environment-monitor")
                 continue

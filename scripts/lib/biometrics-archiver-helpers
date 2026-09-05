@@ -113,6 +113,17 @@ remove_biometrics_archiver_for_nats() {
     done
   fi
 
+  # Keep RAW fallback on persistent storage after the legacy mount goes away.
+  # NATS consumers still select NATS first; cover-buttons can safely remain idle
+  # when this firmware supplies no RAW button records.
+  for u in sleepypod sleepypod-piezo-processor sleepypod-sleep-detector \
+           sleepypod-environment-monitor sleepypod-calibrator sleepypod-cover-buttons; do
+    mkdir -p "$systemd_dir/$u.service.d"
+    printf '[Service]\nEnvironment="RAW_DATA_DIR=/persistent"\n' \
+      > "$systemd_dir/$u.service.d/zz-nats-raw-fallback.conf"
+  done
+  systemctl daemon-reload
+
   if ! systemctl stop persistent-biometrics.mount 2>/dev/null \
      && [ "$tmpfs_was_mounted" = true ]; then
     echo "Error: failed to stop persistent-biometrics.mount; preserving recovery tools" >&2

@@ -160,9 +160,13 @@ async def main() -> None:
         reason = "duration elapsed"
 
     elapsed = time.monotonic() - started
-    await nc.flush()
-    await nc.close()
-    out.close()
+    try:
+        await nc.flush()
+    finally:
+        try:
+            await nc.close()
+        finally:
+            out.close()
 
     total = sum(subject_count.values())
     print(f"\n{reason}; captured {total} msgs in {elapsed:.1f}s ({bytes_written / 1024:.1f} KB written)")

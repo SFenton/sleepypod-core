@@ -40,6 +40,14 @@ describe('capFramePersistence', () => {
     vi.restoreAllMocks()
   })
 
+  it.each(['', '__proto__', 'constructor'])('records explicit status %j safely', (status) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    recordCapFrame('left', A, TS, status)
+    recordCapFrame('left', A, TS + 1, status)
+    expect(summarizeWindow(window('left')).statusCounts).toEqual({ [status]: 2 })
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
   it('accumulates frames inside a single window without flushing', () => {
     recordCapFrame('left', A, TS)
     recordCapFrame('left', B, TS + 2) // +2s, still inside the 5s window

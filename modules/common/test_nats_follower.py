@@ -134,6 +134,10 @@ class TestWaitForNats:
 # ---------------------------------------------------------------------------
 
 class TestDecodePath:
+    def test_sensor_fixtures_are_present(self):
+        assert SENSOR_SUBJECTS
+        assert {'raw.sens.bedtemp', 'raw.frz.temp'} <= set(SENSOR_SUBJECTS)
+
     def _follower(self):
         return NatsFollower(threading.Event())
 
@@ -272,3 +276,48 @@ class TestNatsRecordBuffer:
             buf._buffers["capSense"].append({"type": "capSense", "i": i})
         snap = buf.snapshot()
         assert [r["i"] for r in snap["capSense"]] == [3, 4]
+
+class TestCollectorFailures:
+    def test_fatal_survives_queue_overwrite(self):
+        from common.nats_follower import _FATAL, NatsFollowerError
+        follower = NatsFollower(threading.Event(), queue_maxsize=1)
+        follower._started = True
+        follower._offer(_FATAL)
+        follower._offer({'type': 'capSense'})
+        gen = follower.read_records()
+        assert next(gen) == {'type': 'capSense'}
+        with pytest.raises(NatsFollowerError):
+            next(gen)
+
+    @pytest.mark.parametrize('failure', [RuntimeError('collector failed'), None])
+    def test_collector_terminal_conditions_are_fatal(self, failure):
+        from common.nats_follower import NatsFollowerError
+        buf = NatsRecordBuffer(threading.Event())
+        def records():
+            if failure:
+                raise failure
+            yield from ()
+        buf._follower.read_records = records
+        buf._drain()
+        with pytest.raises(NatsFollowerError):
+            buf.raise_if_fatal()
+
+    def test_drain_routes_valid_records_and_retains_default_limits(self):
+        shutdown = threading.Event()
+        buf = NatsRecordBuffer(shutdown, maxlen={'capSense': 2})
+        def records():
+            yield None
+            yield {'type': []}
+            yield {'type': {}}
+            yield {'type': 'unknown'}
+            for i in range(4):
+                yield {'type': 'capSense', 'i': i}
+            yield {'type': 'piezo-dual'}
+            shutdown.set()
+        buf._follower.read_records = records
+        buf._drain()
+        buf.raise_if_fatal()
+        snap = buf.snapshot()
+        assert [r['i'] for r in snap['capSense']] == [2, 3]
+        assert snap['piezo-dual'] == [{'type': 'piezo-dual'}]
+        assert buf.total() == 3

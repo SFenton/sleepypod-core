@@ -65,7 +65,7 @@ NATS_QUEUE_MAXSIZE = 256
 NATS_GRACE_SECONDS = 60.0
 NATS_PROBE_INTERVAL = 5.0
 
-# nats-py auto-reconnect: this many consecutive failed reconnects ⇒ the client
+# nats-py auto-reconnect: this many failed reconnects per server ⇒ the client
 # gives up, read_records() raises, the process exits, systemd restarts it, and
 # the whole source selection re-runs (mirrors RawFileFollower on dead files).
 MAX_RECONNECT_FAILURES = 10
@@ -152,7 +152,7 @@ class NatsFollower:
         servers: NATS server URL(s).
         subjects: Core-subscribe subject filters.
         queue_maxsize: Bounded hand-off queue size (drop-oldest when full).
-        max_reconnect_failures: Consecutive reconnect failures before the
+        max_reconnect_failures: Reconnect failures per server before the
             client gives up and read_records() raises NatsFollowerError.
     """
 
@@ -168,6 +168,7 @@ class NatsFollower:
         self._thread: Optional[threading.Thread] = None
         self._started = False
         self._closed_evt = threading.Event()
+        self._fatal_evt = threading.Event()
         # Diagnostics
         self._msg_count = 0
         self._decode_failures = 0
@@ -184,6 +185,8 @@ class NatsFollower:
         Live data beats backlog: the same trade-off the file tailer makes by
         jumping to EOF. A dropped-record counter surfaces sustained overrun.
         """
+        if item is _FATAL:
+            self._fatal_evt.set()
         try:
             self._queue.put_nowait(item)
             return
@@ -246,6 +249,8 @@ class NatsFollower:
             try:
                 item = self._queue.get(timeout=0.5)
             except queue.Empty:
+                if self._fatal_evt.is_set():
+                    raise NatsFollowerError("NATS connection permanently lost")
                 self._maybe_log_silence()
                 continue
             if item is _FATAL:
@@ -383,7 +388,7 @@ class NatsRecordBuffer:
         self._shutdown = shutdown_event
         self._follower = NatsFollower(shutdown_event, servers=servers,
                                       subjects=subjects)
-        limits = maxlen or self.DEFAULT_MAXLEN
+        limits = {**self.DEFAULT_MAXLEN, **(maxlen or {})}
         self._buffers = {t: deque(maxlen=n) for t, n in limits.items()}
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -406,14 +411,20 @@ class NatsRecordBuffer:
             for record in self._follower.read_records():
                 if not isinstance(record, dict):
                     continue
-                buf = self._buffers.get(record.get("type"))
+                rtype = record.get("type")
+                if not isinstance(rtype, str):
+                    continue
+                buf = self._buffers.get(rtype)
                 if buf is None:
                     continue
                 with self._lock:
                     buf.append(record)
-        except NatsFollowerError as e:
-            log.warning("Calibrator NATS collector stopped: %s", e)
+        except Exception as e:
+            log.exception("Calibrator NATS collector stopped: %s", e)
             self._fatal = e
+        else:
+            if not self._shutdown.is_set():
+                self._fatal = NatsFollowerError("NATS collector ended without shutdown")
 
     def raise_if_fatal(self) -> None:
         """Re-raise the collector's fatal error (if any) on the caller's thread.

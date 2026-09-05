@@ -136,7 +136,7 @@ but it does not change the source choice. See selection rationale below.
 Reachability decides; traffic does not. Robustness beats latency here
 (reviewed 2026-07-19: "we don't need data immediately").
 
-```
+```text
 deadline = now + 60s                          # boot-ordering grace window
 while now < deadline:
     if nats_reachable():                      # layer 2, retried every 5 s

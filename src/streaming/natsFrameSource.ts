@@ -22,7 +22,7 @@
 import * as net from 'node:net'
 // Type-only import: the runtime client is loaded lazily in `connectNats` so pods
 // and tests that never select NATS don't pull in the transport.
-import type { NatsConnection, Subscription } from '@nats-io/transport-node'
+import type { NatsConnection } from '@nats-io/transport-node'
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -157,7 +157,7 @@ async function connectNats(host: string, port: number): Promise<NatsConnection> 
     reconnectTimeWait: RECONNECT_TIME_WAIT_MS,
     // Bounds the very first handshake so a wedged server can't hang startup;
     // the reachability probe already gated us here so this rarely bites.
-    waitOnFirstConnect: true,
+    waitOnFirstConnect: false,
   })
 }
 
@@ -213,7 +213,7 @@ export async function startNatsFrameSource(
     }
   }
 
-  const subs: Subscription[] = SUBSCRIBE_SUBJECTS.map(subject =>
+  SUBSCRIBE_SUBJECTS.forEach(subject =>
     nc.subscribe(subject, { callback: (err, msg) => handleMessage(err, msg.data) }))
 
   // Surface a persistently silent subscription once (health signal only).
@@ -259,7 +259,6 @@ export async function startNatsFrameSource(
       stopped = true
       clearTimeout(silenceTimer)
       try {
-        for (const sub of subs) sub.unsubscribe()
         await nc.drain()
       }
       catch { /* already closing */ }

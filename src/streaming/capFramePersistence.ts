@@ -44,13 +44,18 @@ interface WindowAccumulator {
   sawNonGood: boolean
 }
 
-const windows: Record<Side, WindowAccumulator | null> = { left: null, right: null }
-let lastPruneMs = 0
-
-// Distinct non-"good" statuses already logged this process, so the first sight
-// of each new value surfaces its channel values once (journald → sp-bundle-logs)
-// without spamming every subsequent frame.
-const loggedNonGoodStatuses = new Set<string>()
+const capGlobal = globalThis as typeof globalThis & {
+  __sleepypodCapFrames?: {
+    windows: Record<Side, WindowAccumulator | null>
+    lastPruneMs: number
+    loggedNonGoodStatuses: Set<string>
+  }
+}
+const capState = capGlobal.__sleepypodCapFrames ??= {
+  windows: { left: null, right: null },
+  lastPruneMs: 0,
+  loggedNonGoodStatuses: new Set<string>(),
+}
 
 function freshWindow(tsMs: number): WindowAccumulator {
   return {
@@ -62,7 +67,7 @@ function freshWindow(tsMs: number): WindowAccumulator {
     spreadSum: 0,
     zoneSums: null,
     peakCounts: [0, 0, 0],
-    statusCounts: {},
+    statusCounts: Object.create(null) as Record<string, number>,
     sawNonGood: false,
   }
 }
@@ -119,8 +124,8 @@ function flush(side: Side, acc: WindowAccumulator): void {
 }
 
 function maybePrune(nowMs: number): void {
-  if (nowMs - lastPruneMs < PRUNE_INTERVAL_MS) return
-  lastPruneMs = nowMs
+  if (nowMs - capState.lastPruneMs < PRUNE_INTERVAL_MS) return
+  capState.lastPruneMs = nowMs
   try {
     biometricsDb.delete(capSenseFrames)
       .where(lte(capSenseFrames.timestamp, new Date(nowMs - RETENTION_MS)))
@@ -159,16 +164,16 @@ export function recordCapFrame(
   const r = reduceCap(values)
   if (!r) return
 
-  let acc = windows[side]
+  let acc = capState.windows[side]
   if (!acc) {
     acc = freshWindow(tsMs)
-    windows[side] = acc
+    capState.windows[side] = acc
   }
   else if (tsMs - acc.startTsMs >= WINDOW_MS) {
     flush(side, acc)
     maybePrune(Date.now())
     acc = freshWindow(tsMs)
-    windows[side] = acc
+    capState.windows[side] = acc
   }
 
   acc.n += 1
@@ -184,7 +189,7 @@ export function recordCapFrame(
     acc.zoneSums[2] += triple[2]
     if (r.peakZone != null) acc.peakCounts[r.peakZone] += 1
   }
-  if (status) recordStatus(side, acc, status, values)
+  if (status != null) recordStatus(side, acc, status, values)
 }
 
 /**
@@ -199,43 +204,43 @@ function recordStatus(side: Side, acc: WindowAccumulator, status: string, values
   acc.sawNonGood = true
   // Dedup on the status value alone (process-wide): the first sighting of each
   // distinct non-"good" status logs once with whichever side/channels saw it.
-  if (!loggedNonGoodStatuses.has(status)) {
-    loggedNonGoodStatuses.add(status)
+  if (!capState.loggedNonGoodStatuses.has(status)) {
+    capState.loggedNonGoodStatuses.add(status)
     console.warn('[capFrames] capSense %s status=%s channels=%j', side, status, values)
   }
 }
 
-/** Persist any non-empty in-flight windows, then clear them. */
+/** Persist any non-empty in-flight capState.windows, then clear them. */
 export function flushCapFrameWindows(): void {
   let flushed = false
   for (const side of ['left', 'right'] as const) {
-    const acc = windows[side]
+    const acc = capState.windows[side]
     if (!acc || acc.n === 0) {
-      windows[side] = null
+      capState.windows[side] = null
       continue
     }
     flush(side, acc)
     flushed = true
-    windows[side] = null
+    capState.windows[side] = null
   }
   if (flushed) maybePrune(Date.now())
 }
 
 /** Reset accumulators — called when the active RAW file switches. */
 export function resetCapFrameWindows(): void {
-  windows.left = null
-  windows.right = null
+  capState.windows.left = null
+  capState.windows.right = null
 }
 
 /** Test-only accessor for the in-flight per-side window state. */
 export function _getCapFrameWindow(side: Side): WindowAccumulator | null {
-  return windows[side]
+  return capState.windows[side]
 }
 
-/** Test-only reset of all module state (windows + prune throttle clock). */
+/** Test-only reset of all module state (capState.windows + prune throttle clock). */
 export function _resetForTest(): void {
-  windows.left = null
-  windows.right = null
-  lastPruneMs = 0
-  loggedNonGoodStatuses.clear()
+  capState.windows.left = null
+  capState.windows.right = null
+  capState.lastPruneMs = 0
+  capState.loggedNonGoodStatuses.clear()
 }

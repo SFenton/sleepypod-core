@@ -162,7 +162,7 @@ def warn_unknown_type_once(rec: dict, pod_context: str = "") -> None:
     they don't recognize, to surface firmware variance instead of silently
     dropping data."""
     rtype = rec.get("type")
-    if rtype is None or rtype in _unknown_types_seen:
+    if not isinstance(rtype, str) or rtype in _unknown_types_seen:
         return
     _unknown_types_seen.add(rtype)
     suffix = f" ({pod_context})" if pod_context else ""
@@ -187,7 +187,7 @@ def log_capsense_status_once(rec: dict, pod_context: str = "") -> None:
         if not isinstance(data, dict):
             continue
         status = data.get("status")
-        if status is None or status == "good" or status in _capsense_status_seen:
+        if not isinstance(status, str) or status == "good" or status in _capsense_status_seen:
             continue
         _capsense_status_seen.add(status)
         suffix = f" ({pod_context})" if pod_context else ""
