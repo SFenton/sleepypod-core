@@ -43,6 +43,11 @@ const broadcastMock = vi.hoisted(() => ({
   broadcastMutationStatus: vi.fn(),
 }))
 
+const monitorMock = vi.hoisted(() => ({
+  getFreshStatus: vi.fn(),
+  getDacMonitorIfRunning: vi.fn(),
+}))
+
 const transportMock = vi.hoisted(() => ({
   sendCommand: vi.fn(),
   isDacConnected: vi.fn(() => true),
@@ -149,6 +154,7 @@ vi.mock('@/src/hardware/primeNotification', () => primeMock)
 vi.mock('@/src/hardware/snoozeManager', () => snoozeMock)
 vi.mock('@/src/streaming/broadcastMutationStatus', () => broadcastMock)
 vi.mock('@/src/hardware/dacTransport', () => transportMock)
+vi.mock('@/src/hardware/dacMonitor.instance', () => ({ getDacMonitorIfRunning: monitorMock.getDacMonitorIfRunning }))
 vi.mock('@/src/hardware/sharedClient', () => ({ getSharedHardwareClient: sharedClientMock.getSharedHardwareClient }))
 vi.mock('@/src/hardware/deviceStateSync', () => stateSyncMock)
 vi.mock('@/src/hardware/pumpStallGuard', () => pumpStallMock)
@@ -196,6 +202,9 @@ beforeEach(() => {
   snoozeMock.getSnoozeStatus.mockReset().mockReturnValue({ active: false, snoozeUntil: null })
   broadcastMock.broadcastMutationStatus.mockReset()
   transportMock.sendCommand.mockReset()
+  transportMock.isDacConnected.mockReturnValue(true)
+  monitorMock.getFreshStatus.mockReset().mockReturnValue(null)
+  monitorMock.getDacMonitorIfRunning.mockReset().mockReturnValue(monitorMock)
   sharedClientMock.sendRaw.mockReset()
   stateSyncMock.markSideMutated.mockReset()
   pumpStallMock.shouldBlock.mockReset().mockReturnValue(false)
@@ -213,6 +222,40 @@ beforeEach(() => {
 })
 
 describe('device.getStatus', () => {
+  it('serves monitor status without another hardware read or duplicate DB writes', async () => {
+    const cached = await helpersMock.client.getDeviceStatus()
+    helpersMock.client.getDeviceStatus.mockClear()
+    monitorMock.getFreshStatus.mockReturnValue(cached)
+    primeMock.getPrimeCompletedAt.mockReturnValue(1700000000000)
+    const result = await caller.getStatus({ unit: 'C' })
+    expect(result.leftSide.currentTemperature).toBeCloseTo(26.7, 1)
+    expect(result.primeCompletedNotification?.timestamp).toBe(1700000000000)
+    expect(monitorMock.getFreshStatus).toHaveBeenCalledWith(2_000)
+    expect(helpersMock.withHardwareClient).not.toHaveBeenCalled()
+    expect(helpersMock.client.getDeviceStatus).not.toHaveBeenCalled()
+    expect(dbMock.insert).not.toHaveBeenCalled()
+    // Conversion must not mutate the snapshot shared with other readers.
+    expect(cached.leftSide.currentTemperature).toBe(80)
+  })
+
+  it('reads hardware when the monitor has no reusable observation', async () => {
+    monitorMock.getFreshStatus.mockReturnValue(null)
+    await caller.getStatus({})
+    expect(helpersMock.client.getDeviceStatus).toHaveBeenCalledOnce()
+    expect(dbMock.insert).toHaveBeenCalledTimes(2)
+  })
+
+  it('reads hardware and persists status before the monitor is running', async () => {
+    monitorMock.getDacMonitorIfRunning.mockReturnValue(null)
+
+    const result = await caller.getStatus({})
+
+    expect(result.leftSide.currentTemperature).toBe(80)
+    expect(monitorMock.getFreshStatus).not.toHaveBeenCalled()
+    expect(helpersMock.client.getDeviceStatus).toHaveBeenCalledOnce()
+    expect(dbMock.insert).toHaveBeenCalledTimes(2)
+  })
+
   it('returns status with snooze block and converts to F by default', async () => {
     primeMock.getPrimeCompletedAt.mockReturnValue(1700000000000)
     snoozeMock.getSnoozeStatus.mockReturnValueOnce({ active: true, snoozeUntil: 1700001000000 })
