@@ -2,7 +2,13 @@ import { z } from 'zod'
 import { TRPCError } from '@trpc/server'
 import { publicProcedure, router } from '@/src/server/trpc'
 import { biometricsDb, db } from '@/src/db'
-import { sleepRecords, vitals, movement, piezoPresenceDecisions } from '@/src/db/biometrics-schema'
+import {
+  sleepRecords,
+  vitals,
+  movement,
+  piezoPresenceDecisions,
+  piezoTransitionSnapshots,
+} from '@/src/db/biometrics-schema'
 import { deviceSettings } from '@/src/db/schema'
 import { eq, and, gte, lte, desc, asc, avg, min, max, count, sql } from 'drizzle-orm'
 import { sideSchema, idSchema, validateDateRange } from '@/src/server/validation-schemas'
@@ -369,6 +375,72 @@ export const biometricsRouter = router({
         throw new TRPCError({
           code: 'INTERNAL_SERVER_ERROR',
           message: `Failed to fetch piezo presence decisions: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          cause: error,
+        })
+      }
+    }),
+
+  /**
+   * Get bounded 5-second piezo feature snapshots captured before and after
+   * debounced capacitance occupancy transitions.
+   */
+  getPiezoTransitionSnapshots: publicProcedure
+    .meta({ openapi: { method: 'GET', path: '/biometrics/piezo-transitions', protect: false, tags: ['Biometrics'] } })
+    .output(z.array(z.object({
+      id: z.number(),
+      side: sideSchema,
+      transitionTimestamp: z.date(),
+      sampleTimestamp: z.date(),
+      sampleOffsetSeconds: z.number(),
+      capPresent: z.boolean(),
+      piezoPresent: z.boolean(),
+      filteredStd: z.number(),
+      rawPeakToPeak: z.number(),
+      autocorrelationQuality: z.number(),
+      enterThreshold: z.number(),
+      exitThreshold: z.number(),
+      thresholdSource: z.enum(['fixed', 'calibrated']),
+      otherSideFilteredStd: z.number().nullable(),
+      otherSideAutocorrelationQuality: z.number().nullable(),
+      pumpMode: z.enum(['asymmetric', 'symmetric']).nullable(),
+    })))
+    .input(
+      z.object({
+        side: sideSchema.optional(),
+        startDate: z.date().optional(),
+        endDate: z.date().optional(),
+        limit: z.number().int().min(1).max(20000).default(2000),
+      }).strict(),
+    )
+    .query(async ({ input }) => {
+      try {
+        if (input.startDate && input.endDate && !validateDateRange(input.startDate, input.endDate)) {
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message: 'startDate must be before or equal to endDate',
+          })
+        }
+
+        const conditions = []
+        if (input.side) conditions.push(eq(piezoTransitionSnapshots.side, input.side))
+        if (input.startDate) conditions.push(gte(piezoTransitionSnapshots.transitionTimestamp, input.startDate))
+        if (input.endDate) conditions.push(lte(piezoTransitionSnapshots.transitionTimestamp, input.endDate))
+
+        return await biometricsDb
+          .select()
+          .from(piezoTransitionSnapshots)
+          .where(conditions.length > 0 ? and(...conditions) : undefined)
+          .orderBy(
+            desc(piezoTransitionSnapshots.transitionTimestamp),
+            asc(piezoTransitionSnapshots.sampleOffsetSeconds),
+          )
+          .limit(input.limit)
+      }
+      catch (error) {
+        if (error instanceof TRPCError) throw error
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: `Failed to fetch piezo transition snapshots: ${error instanceof Error ? error.message : 'Unknown error'}`,
           cause: error,
         })
       }

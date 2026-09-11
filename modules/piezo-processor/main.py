@@ -37,7 +37,7 @@ import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import deque
-from typing import Optional
+from typing import Callable, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -67,6 +67,11 @@ BREATHING_WINDOW_S = 60    # seconds of data for breathing rate calculation
 HRV_WINDOW_S = 300         # seconds of data for HRV (5-minute RMSSD)
 CAP_PRESENCE_MAX_AGE_S = 10.0
 CALIBRATION_RELOAD_S = 60.0
+CAP_TRANSITION_DEBOUNCE_S = 2.0
+CAP_TRANSITION_WINDOW_S = 5
+CAP_TRANSITION_BUFFER_S = 45
+CAP_TRANSITION_OFFSETS_S = (-20, -10, -5, 0, 5, 10, 20, 30)
+CAP_TRANSITION_MAX_ACTIVE = 4
 
 # Pump gating
 PUMP_ENERGY_MULTIPLIER = 10.0
@@ -254,6 +259,60 @@ def write_presence_decision(holder: "DBHolder", side: str, timestamp: int,
     except sqlite3.Error as e:
         holder.write_failures += 1
         log.warning("write_presence_decision failed (%d consecutive): %s",
+                    holder.write_failures, e)
+        if holder.write_failures >= _DB_RECONNECT_THRESHOLD:
+            _reconnect_db(holder)
+            holder.write_failures = 0
+        return False
+
+
+def write_transition_snapshot(
+        holder: "DBHolder", side: str, transition_timestamp: int,
+        sample_timestamp: int, sample_offset_seconds: int,
+        cap_present: bool, piezo_present: bool, filtered_std: float,
+        raw_peak_to_peak: float, acr_qual: float, enter_threshold: float,
+        exit_threshold: float, other_filtered_std: Optional[float],
+        other_acr_qual: Optional[float], pump_mode: Optional[str]) -> bool:
+    """Persist one bounded feature snapshot around a capacitance transition."""
+    conn = holder.conn
+    try:
+        with conn:
+            conn.execute(
+                """INSERT INTO piezo_transition_snapshots
+                   (side, transition_timestamp, sample_timestamp,
+                    sample_offset_seconds, cap_present, piezo_present,
+                    filtered_std, raw_peak_to_peak, autocorrelation_quality,
+                    enter_threshold, exit_threshold, threshold_source,
+                    other_side_filtered_std,
+                    other_side_autocorrelation_quality, pump_mode)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'fixed', ?, ?, ?)
+                   ON CONFLICT(side, transition_timestamp, sample_offset_seconds)
+                   DO UPDATE SET
+                     sample_timestamp=excluded.sample_timestamp,
+                     cap_present=excluded.cap_present,
+                     piezo_present=excluded.piezo_present,
+                     filtered_std=excluded.filtered_std,
+                     raw_peak_to_peak=excluded.raw_peak_to_peak,
+                     autocorrelation_quality=excluded.autocorrelation_quality,
+                     enter_threshold=excluded.enter_threshold,
+                     exit_threshold=excluded.exit_threshold,
+                     threshold_source=excluded.threshold_source,
+                     other_side_filtered_std=excluded.other_side_filtered_std,
+                     other_side_autocorrelation_quality=excluded.other_side_autocorrelation_quality,
+                     pump_mode=excluded.pump_mode""",
+                (
+                    side, transition_timestamp, sample_timestamp,
+                    sample_offset_seconds, int(cap_present), int(piezo_present),
+                    filtered_std, raw_peak_to_peak, acr_qual, enter_threshold,
+                    exit_threshold, other_filtered_std, other_acr_qual,
+                    pump_mode,
+                ),
+            )
+        holder.write_failures = 0
+        return True
+    except sqlite3.Error as e:
+        holder.write_failures += 1
+        log.warning("write_transition_snapshot failed (%d consecutive): %s",
                     holder.write_failures, e)
         if holder.write_failures >= _DB_RECONNECT_THRESHOLD:
             _reconnect_db(holder)
@@ -523,6 +582,15 @@ class CapacitancePresenceTracker:
         self._last_reload = 0.0
         self._presence = {"left": None, "right": None}
         self._updated_at = {"left": 0.0, "right": 0.0}
+        self._candidate_presence = {"left": None, "right": None}
+        self._candidate_since = {"left": 0.0, "right": 0.0}
+        self._transition_listeners: list[
+            Callable[[str, bool, float, float], None]
+        ] = []
+
+    def add_transition_listener(
+            self, listener: Callable[[str, bool, float, float], None]) -> None:
+        self._transition_listeners.append(listener)
 
     def _reload(self, now: float) -> None:
         if now - self._last_reload < CALIBRATION_RELOAD_S:
@@ -557,8 +625,27 @@ class CapacitancePresenceTracker:
                     record, side, profile, fallback_threshold=60.0)
             else:
                 continue
-            self._presence[side] = present
             self._updated_at[side] = now
+            stable = self._presence[side]
+            if stable is None:
+                self._presence[side] = present
+                self._candidate_presence[side] = None
+                continue
+            if present == stable:
+                self._candidate_presence[side] = None
+                continue
+            if self._candidate_presence[side] != present:
+                self._candidate_presence[side] = present
+                self._candidate_since[side] = now
+                continue
+            if now - self._candidate_since[side] < CAP_TRANSITION_DEBOUNCE_S:
+                continue
+
+            transition_at = self._candidate_since[side]
+            self._presence[side] = present
+            self._candidate_presence[side] = None
+            for listener in self._transition_listeners:
+                listener(side, present, transition_at, now)
 
     def get(self, side: str, now: float) -> tuple:
         updated_at = self._updated_at[side]
@@ -936,6 +1023,10 @@ class SideProcessor:
         self._hr_buf: deque = deque(maxlen=HR_WINDOW_S * SAMPLE_RATE)
         self._hrv_buf: deque = deque(maxlen=HRV_WINDOW_S * SAMPLE_RATE)
         self._br_buf: deque = deque(maxlen=BREATHING_WINDOW_S * SAMPLE_RATE)
+        self._transition_buf: deque = deque(
+            maxlen=CAP_TRANSITION_BUFFER_S * SAMPLE_RATE)
+        self._transition_context: deque = deque(
+            maxlen=CAP_TRANSITION_BUFFER_S * 2)
         self._last_write = 0.0
         self._presence = PresenceDetector()
         self._hr_tracker = HRTracker()
@@ -944,12 +1035,144 @@ class SideProcessor:
         self._last_acr_qual: float = 0.0
         self._pump_state = pump_state
         self._cap_tracker = cap_tracker
+        self._transition_captures: list[dict] = []
+
+    def observe_raw(self, samples: np.ndarray) -> None:
+        """Keep a short ungated ring for bounded capacitance-transition capture."""
+        now = time.time()
+        self._transition_buf.extend(samples)
+        self._transition_context.append((
+            now,
+            self._presence.state == PresenceDetector.PRESENT,
+            self._pump_mode(),
+        ))
+        self._flush_transition_snapshots(now)
 
     def ingest(self, samples: np.ndarray) -> None:
         self._hr_buf.extend(samples)
         self._hrv_buf.extend(samples)
         self._br_buf.extend(samples)
         self._maybe_write()
+
+    def _pump_mode(self) -> Optional[str]:
+        if self._pump_state is None:
+            return None
+        if self._pump_state.is_symmetric_active():
+            return "symmetric"
+        if self._pump_state.is_asymmetric_for(self.side):
+            return "asymmetric"
+        return None
+
+    def _transition_features(
+            self, end_offset_seconds: float = 0.0
+    ) -> Optional[tuple]:
+        samples = np.asarray(self._transition_buf, dtype=np.float64)
+        end = len(samples) + int(round(end_offset_seconds * SAMPLE_RATE))
+        window_samples = CAP_TRANSITION_WINDOW_S * SAMPLE_RATE
+        start = end - window_samples
+        if start < 0 or end > len(samples):
+            return None
+        chunk = samples[start:end]
+        filtered = _bandpass(chunk, 1.0, 10.0, SAMPLE_RATE)
+        return (
+            float(np.std(filtered)),
+            float(np.ptp(chunk)),
+            _autocorr_quality(chunk),
+        )
+
+    def _transition_context_at(self, timestamp: float) -> Optional[tuple]:
+        for context_at, piezo_present, pump_mode in reversed(
+                self._transition_context):
+            if context_at <= timestamp:
+                return piezo_present, pump_mode
+        return None
+
+    def _write_transition_snapshot(
+            self, capture: dict, offset_seconds: int, now: float,
+            buffer_end_offset_seconds: float = 0.0) -> None:
+        features = self._transition_features(buffer_end_offset_seconds)
+        if features is None:
+            log.debug(
+                "%s: insufficient raw history for cap transition offset %+ds",
+                self.side, offset_seconds,
+            )
+            return
+        context = self._transition_context_at(now)
+        if context is None:
+            log.debug(
+                "%s: insufficient state history for cap transition offset %+ds",
+                self.side, offset_seconds,
+            )
+            return
+        other_features = (
+            self._other._transition_features(buffer_end_offset_seconds)
+            if self._other is not None else None
+        )
+        filtered_std, raw_peak_to_peak, acr_qual = features
+        piezo_present, pump_mode = context
+        write_transition_snapshot(
+            self.db_holder,
+            self.side,
+            int(capture["transition_at"]),
+            int(now),
+            offset_seconds,
+            capture["cap_present"],
+            piezo_present,
+            filtered_std,
+            raw_peak_to_peak,
+            acr_qual,
+            self._presence.enter_threshold,
+            self._presence.exit_threshold,
+            other_features[0] if other_features else None,
+            other_features[2] if other_features else None,
+            pump_mode,
+        )
+
+    def capture_cap_transition(
+            self, cap_present: bool, transition_at: float,
+            confirmed_at: float) -> None:
+        """Capture pre/post 5-second features around a debounced cap change."""
+        capture = {
+            "cap_present": cap_present,
+            "transition_at": transition_at,
+            "pending": [offset for offset in CAP_TRANSITION_OFFSETS_S
+                        if offset > 0],
+        }
+        buffer_end_at = (
+            self._transition_context[-1][0]
+            if self._transition_context else confirmed_at
+        )
+        buffer_lag = buffer_end_at - transition_at
+        for offset in CAP_TRANSITION_OFFSETS_S:
+            if offset > 0:
+                continue
+            self._write_transition_snapshot(
+                capture,
+                offset,
+                transition_at + offset,
+                offset - buffer_lag,
+            )
+        if len(self._transition_captures) >= CAP_TRANSITION_MAX_ACTIVE:
+            log.warning(
+                "%s: cap transitions are flapping; post-transition capture "
+                "limit reached", self.side,
+            )
+            return
+        self._transition_captures.append(capture)
+
+    def _flush_transition_snapshots(self, now: float) -> None:
+        active = []
+        for capture in self._transition_captures:
+            elapsed = now - capture["transition_at"]
+            pending = capture["pending"]
+            while pending and elapsed >= pending[0]:
+                offset = pending.pop(0)
+                sample_at = capture["transition_at"] + offset
+                self._write_transition_snapshot(
+                    capture, offset, sample_at, offset - elapsed)
+            if pending:
+                active.append(capture)
+        self._transition_captures = active
 
     def _maybe_write(self) -> None:
         now = time.time()
@@ -1141,6 +1364,12 @@ def main() -> None:
                           cap_tracker=cap_tracker)
     left._other = right
     right._other = left
+    processors = {"left": left, "right": right}
+    cap_tracker.add_transition_listener(
+        lambda side, present, transition_at, confirmed_at:
+        processors[side].capture_cap_transition(
+            present, transition_at, confirmed_at)
+    )
     # Source selected once at startup: NatsFollower on new-firmware pods (NATS
     # reachable), else the unchanged .RAW tailer. Same decoded-record contract.
     follower = create_follower(RAW_DATA_DIR, _shutdown, poll_interval=0.01)
@@ -1178,6 +1407,11 @@ def main() -> None:
 
             if l_samples.size == 0 or r_samples.size == 0:
                 continue
+
+            # Transition telemetry observes the ungated stream so a bed-entry
+            # impulse is retained even when PumpGate rejects it as vibration.
+            left.observe_raw(l_samples)
+            right.observe_raw(r_samples)
 
             # Pump gating — drop entire record if pump detected or guard active
             if pump_gate.check(l_samples, r_samples):

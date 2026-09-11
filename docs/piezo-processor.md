@@ -193,16 +193,27 @@ the median filtered standard deviation, autocorrelation quality, active entry an
 exit thresholds, decision reason, pump/cross-side context, and the latest fresh
 calibrated capacitance-presence label. Raw 500 Hz piezo samples are not retained.
 
-The diagnostic API is:
+Capacitance changes are debounced for two seconds, then trigger a bounded set of
+5-second feature snapshots at -20, -10, -5, 0, +5, +10, +20, and +30 seconds
+relative to the first changed capacitance sample. These snapshots use a 45-second
+in-memory ungated piezo ring so the initial bed-entry impulse is still measured
+if the normal pump gate rejects it as vibration. Each snapshot stores filtered
+standard deviation, raw peak-to-peak range, autocorrelation quality, current
+piezo state, the new capacitance state, pump context, and other-side features in
+`piezo_transition_snapshots`. The ring is never written to disk.
+
+The diagnostic APIs are:
 
 ```text
 GET /biometrics/piezo-presence
+GET /biometrics/piezo-transitions
 ```
 
-It accepts optional `side`, `startDate`, and `endDate` filters plus a bounded
-`limit`. Use this evidence to measure false-present and false-absent windows
-before changing the gate thresholds. The table follows the normal biometrics
-retention window.
+Both accept optional `side`, `startDate`, and `endDate` filters plus a bounded
+`limit`. Use the minute decisions to measure sustained false-present and
+false-absent windows, and use transition snapshots to evaluate whether entry
+impulses and settling signals justify a more sensitive adaptive gate. Both
+tables follow the normal biometrics retention window.
 
 ## 6. Heart Rate Extraction
 
