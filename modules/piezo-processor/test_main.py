@@ -54,6 +54,8 @@ from main import (  # noqa: E402
     PumpGate,
     SideProcessor,
     write_presence_decision,
+    write_transition_snapshot,
+    CAP_TRANSITION_OFFSETS_S,
     SAMPLE_RATE,
     PUMP_GUARD_S,
     VITALS_INTERVAL_S,
@@ -946,6 +948,21 @@ class TestWriteVitalsResilience:
                 UNIQUE(side, timestamp)
             )"""
         )
+        conn.execute(
+            """CREATE TABLE piezo_transition_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                side TEXT, transition_timestamp INTEGER,
+                sample_timestamp INTEGER, sample_offset_seconds INTEGER,
+                cap_present INTEGER, piezo_present INTEGER,
+                filtered_std REAL, raw_peak_to_peak REAL,
+                autocorrelation_quality REAL, enter_threshold REAL,
+                exit_threshold REAL, threshold_source TEXT,
+                other_side_filtered_std REAL,
+                other_side_autocorrelation_quality REAL,
+                pump_mode TEXT,
+                UNIQUE(side, transition_timestamp, sample_offset_seconds)
+            )"""
+        )
         return conn
 
     def test_happy_path_inserts(self):
@@ -979,6 +996,25 @@ class TestWriteVitalsResilience:
                  FROM piezo_presence_decisions"""
         ).fetchone()
         assert row == (1, 1234.0, 0.51, "autocorrelation_enter", 0, "fixed")
+
+    def test_transition_snapshot_upserts_features(self):
+        import main
+        conn = self._make_db()
+        holder = main.DBHolder(conn)
+
+        assert write_transition_snapshot(
+            holder, "right", 100, 105, 5, True, False,
+            4321.0, 987654.0, 0.44, 400_000, 150_000,
+            1200.0, 0.2, "symmetric",
+        ) is True
+
+        row = conn.execute(
+            """SELECT cap_present, piezo_present, filtered_std,
+                      raw_peak_to_peak, sample_offset_seconds,
+                      threshold_source, pump_mode
+                 FROM piezo_transition_snapshots"""
+        ).fetchone()
+        assert row == (1, 0, 4321.0, 987654.0, 5, "fixed", "symmetric")
 
     def test_sqlite_error_does_not_raise(self, monkeypatch):
         """A transient OperationalError must be logged, not raised."""
@@ -1108,6 +1144,102 @@ class TestCapacitancePresenceTracker:
         assert tracker.get(
             "left", time.time() + main.CAP_PRESENCE_MAX_AGE_S + 1
         )[0] is None
+
+    def test_emits_only_debounced_changes(self, monkeypatch):
+        import main
+
+        class Store:
+            def get_active(self, side, sensor_type):
+                return {
+                    "parameters": '{"format":"capSense","channels":{},"threshold":6}',
+                    "expires_at": 1000,
+                }
+
+            def close(self):
+                pass
+
+        now = iter((100.0, 101.0, 102.0, 103.1))
+        monkeypatch.setattr(main, "CalibrationStore", lambda path: Store())
+        monkeypatch.setattr(main.time, "time", lambda: next(now))
+        tracker = CapacitancePresenceTracker(main.BIOMETRICS_DB)
+        transitions = []
+        tracker.add_transition_listener(
+            lambda side, present, transition_at, confirmed_at:
+            transitions.append((side, present, transition_at, confirmed_at))
+        )
+
+        tracker.update({
+            "type": "capSense",
+            "left": {"present": False},
+            "right": {"present": False},
+        })
+        tracker.update({
+            "type": "capSense",
+            "left": {"present": True},
+            "right": {"present": False},
+        })
+        tracker.update({
+            "type": "capSense",
+            "left": {"present": True},
+            "right": {"present": False},
+        })
+        tracker.update({
+            "type": "capSense",
+            "left": {"present": True},
+            "right": {"present": False},
+        })
+
+        assert transitions == [("left", True, 101.0, 103.1)]
+
+
+class TestTransitionSnapshots:
+    def test_captures_pre_and_post_windows_from_ungated_ring(self, monkeypatch):
+        import main
+
+        writes = []
+        monkeypatch.setattr(
+            main,
+            "write_transition_snapshot",
+            lambda *args: writes.append(args) or True,
+        )
+        proc = SideProcessor("left", db_holder=object())
+        proc._transition_buf.extend(
+            make_bcg_signal(72, duration_s=45).astype(np.int32)
+        )
+        proc._transition_context.extend([
+            (70.0, False, None),
+            (90.0, False, None),
+            (100.0, False, None),
+            (102.1, False, None),
+        ])
+
+        proc.capture_cap_transition(
+            cap_present=True,
+            transition_at=100.0,
+            confirmed_at=102.1,
+        )
+        assert [args[4] for args in writes] == [-20, -10, -5, 0]
+        assert [args[6] for args in writes] == [False, False, False, False]
+
+        proc._transition_context.append((105.0, True, "asymmetric"))
+        proc._flush_transition_snapshots(105.1)
+        proc._transition_context.append((110.0, True, "asymmetric"))
+        proc._flush_transition_snapshots(110.1)
+        proc._transition_context.append((120.0, True, None))
+        proc._flush_transition_snapshots(120.1)
+        proc._transition_context.append((130.0, True, None))
+        proc._flush_transition_snapshots(130.1)
+
+        assert [args[4] for args in writes] == list(CAP_TRANSITION_OFFSETS_S)
+        assert [args[3] for args in writes] == [
+            int(100 + offset) for offset in CAP_TRANSITION_OFFSETS_S
+        ]
+        assert [args[6] for args in writes[4:]] == [True, True, True, True]
+        assert [args[14] for args in writes[4:]] == [
+            "asymmetric", "asymmetric", None, None,
+        ]
+        assert all(args[7] > 0 for args in writes)
+        assert all(args[8] > 0 for args in writes)
 
 
 class TestSideProcessorAbsenceThrottle:

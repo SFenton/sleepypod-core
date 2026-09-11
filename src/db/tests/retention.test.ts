@@ -12,6 +12,7 @@ import {
   freezerTemp,
   movement,
   piezoPresenceDecisions,
+  piezoTransitionSnapshots,
   pumpAlerts,
   vitals,
   waterLevelReadings,
@@ -79,6 +80,20 @@ function seedAllTables(db: BiometricsDb, ts: Date): void {
     exitThreshold: 150000,
     thresholdSource: 'fixed',
     decisionReason: 'absent',
+  }).run()
+  db.insert(piezoTransitionSnapshots).values({
+    side: 'left',
+    transitionTimestamp: ts,
+    sampleTimestamp: ts,
+    sampleOffsetSeconds: 0,
+    capPresent: false,
+    piezoPresent: false,
+    filteredStd: 1,
+    rawPeakToPeak: 2,
+    autocorrelationQuality: 0.1,
+    enterThreshold: 400000,
+    exitThreshold: 150000,
+    thresholdSource: 'fixed',
   }).run()
   db.insert(bedTemp).values({ timestamp: ts }).run()
   db.insert(freezerTemp).values({ timestamp: ts }).run()
@@ -154,15 +169,30 @@ describe('pruneOldBiometrics', () => {
         exitThreshold: 150000, thresholdSource: 'fixed', decisionReason: 'autocorrelation_enter',
       },
     ]).run()
+    db.insert(piezoTransitionSnapshots).values([
+      {
+        side: 'left', transitionTimestamp: old, sampleTimestamp: old,
+        sampleOffsetSeconds: 0, capPresent: false, piezoPresent: false,
+        filteredStd: 1, rawPeakToPeak: 2, autocorrelationQuality: 0.1,
+        enterThreshold: 400000, exitThreshold: 150000, thresholdSource: 'fixed',
+      },
+      {
+        side: 'right', transitionTimestamp: fresh, sampleTimestamp: fresh,
+        sampleOffsetSeconds: 0, capPresent: true, piezoPresent: false,
+        filteredStd: 2, rawPeakToPeak: 3, autocorrelationQuality: 0.5,
+        enterThreshold: 400000, exitThreshold: 150000, thresholdSource: 'fixed',
+      },
+    ]).run()
 
     const result = pruneOldBiometrics(cutoff, db)
 
-    expect(result.rowsDeleted).toBe(10)
+    expect(result.rowsDeleted).toBe(11)
     expect(result.perTable).toEqual({
       vitals: 1,
       vitals_quality: 1,
       movement: 1,
       piezo_presence_decisions: 1,
+      piezo_transition_snapshots: 1,
       bed_temp: 1,
       freezer_temp: 1,
       flow_readings: 1,
@@ -175,6 +205,7 @@ describe('pruneOldBiometrics', () => {
     expect(db.select().from(vitals).all()).toHaveLength(1)
     expect(db.select().from(movement).all()).toHaveLength(1)
     expect(db.select().from(piezoPresenceDecisions).all()).toHaveLength(1)
+    expect(db.select().from(piezoTransitionSnapshots).all()).toHaveLength(1)
     expect(db.select().from(bedTemp).all()).toHaveLength(1)
     expect(db.select().from(freezerTemp).all()).toHaveLength(1)
     expect(db.select().from(flowReadings).all()).toHaveLength(1)
@@ -271,6 +302,7 @@ describe('pruneOldBiometrics', () => {
       vitals_quality: 0,
       movement: 0,
       piezo_presence_decisions: 0,
+      piezo_transition_snapshots: 0,
       bed_temp: 0,
       freezer_temp: 0,
       flow_readings: 0,
@@ -291,10 +323,11 @@ describe('pruneOldBiometrics', () => {
     const cutoff = new Date(base + 3 * day)
     const result = pruneOldBiometrics(cutoff, db)
 
-    // Nine tables × 3 deleted days = 27 rows.
-    expect(result.rowsDeleted).toBe(27)
+    // Ten tables × 3 deleted days = 30 rows.
+    expect(result.rowsDeleted).toBe(30)
     for (const tableName of ['vitals', 'movement', 'bed_temp', 'freezer_temp',
-      'piezo_presence_decisions', 'flow_readings', 'ambient_light',
+      'piezo_presence_decisions', 'piezo_transition_snapshots',
+      'flow_readings', 'ambient_light',
       'water_level_readings', 'pump_alerts'] as const) {
       expect(result.perTable[tableName]).toBe(3)
     }
@@ -337,7 +370,7 @@ describe('runRetentionPass', () => {
 
     const result = runRetentionPass(7)
 
-    expect(result.rowsDeleted).toBe(9)
+    expect(result.rowsDeleted).toBe(10)
     expect(getDb().select().from(vitals).all()).toHaveLength(1)
   })
 

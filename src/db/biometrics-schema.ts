@@ -54,6 +54,35 @@ export const movement = sqliteTable('movement', {
   index('idx_movement_timestamp').on(t.timestamp),
 ])
 
+// Bounded 5-second feature snapshots around debounced capacitance transitions.
+// The source ring is intentionally short and never persists raw 500 Hz samples.
+export const piezoTransitionSnapshots = sqliteTable('piezo_transition_snapshots', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  side: text('side', { enum: ['left', 'right'] }).notNull(),
+  transitionTimestamp: integer('transition_timestamp', { mode: 'timestamp' }).notNull(),
+  sampleTimestamp: integer('sample_timestamp', { mode: 'timestamp' }).notNull(),
+  sampleOffsetSeconds: integer('sample_offset_seconds').notNull(),
+  capPresent: integer('cap_present', { mode: 'boolean' }).notNull(),
+  piezoPresent: integer('piezo_present', { mode: 'boolean' }).notNull(),
+  filteredStd: real('filtered_std').notNull(),
+  rawPeakToPeak: real('raw_peak_to_peak').notNull(),
+  autocorrelationQuality: real('autocorrelation_quality').notNull(),
+  enterThreshold: real('enter_threshold').notNull(),
+  exitThreshold: real('exit_threshold').notNull(),
+  thresholdSource: text('threshold_source', { enum: ['fixed', 'calibrated'] }).notNull(),
+  otherSideFilteredStd: real('other_side_filtered_std'),
+  otherSideAutocorrelationQuality: real('other_side_autocorrelation_quality'),
+  pumpMode: text('pump_mode', { enum: ['asymmetric', 'symmetric'] }),
+}, t => [
+  uniqueIndex('uq_piezo_transition_side_ts_offset').on(
+    t.side,
+    t.transitionTimestamp,
+    t.sampleOffsetSeconds,
+  ),
+  index('idx_piezo_transition_timestamp').on(t.transitionTimestamp),
+  index('idx_piezo_transition_side_timestamp').on(t.side, t.transitionTimestamp),
+])
+
 export const bedTemp = sqliteTable('bed_temp', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   timestamp: integer('timestamp', { mode: 'timestamp' }).notNull(),

@@ -274,6 +274,40 @@ describe('biometrics.getMovement / getMovementBuckets / getMovementSummary', () 
     })
   })
 
+  describe('biometrics.getPiezoTransitionSnapshots', () => {
+    it('returns transition feature snapshots', async () => {
+      const row = {
+        id: 1,
+        side: 'right' as const,
+        transitionTimestamp: new Date(1000),
+        sampleTimestamp: new Date(6000),
+        sampleOffsetSeconds: 5,
+        capPresent: true,
+        piezoPresent: false,
+        filteredStd: 4321,
+        rawPeakToPeak: 987654,
+        autocorrelationQuality: 0.44,
+        enterThreshold: 400000,
+        exitThreshold: 150000,
+        thresholdSource: 'fixed' as const,
+        otherSideFilteredStd: 1200,
+        otherSideAutocorrelationQuality: 0.2,
+        pumpMode: 'symmetric' as const,
+      }
+      dbState.rowsQueue.push([row])
+
+      await expect(caller.getPiezoTransitionSnapshots({ side: 'right' }))
+        .resolves.toEqual([row])
+    })
+
+    it('rejects an inverted date range', async () => {
+      await expect(caller.getPiezoTransitionSnapshots({
+        startDate: new Date('2025-02-01'),
+        endDate: new Date('2025-01-01'),
+      })).rejects.toThrow(/startDate/)
+    })
+  })
+
   it('getMovement rejects inverted date range', async () => {
     await expect(caller.getMovement({
       startDate: new Date('2025-02-01'),
