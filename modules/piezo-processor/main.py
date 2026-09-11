@@ -44,6 +44,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import cbor2
 from common.nats_follower import create_follower
 from common.dialect import KNOWN_RECORD_TYPES, warn_unknown_type_once
+from common.calibration import (
+    CalibrationStore,
+    is_present_capsense_calibrated,
+    is_present_capsense2_calibrated,
+)
 import numpy as np
 from scipy.signal import butter, sosfiltfilt, hilbert, find_peaks
 
@@ -60,6 +65,8 @@ VITALS_INTERVAL_S = 60     # write a vitals row every N seconds
 HR_WINDOW_S = 30           # seconds of data for heart rate calculation
 BREATHING_WINDOW_S = 60    # seconds of data for breathing rate calculation
 HRV_WINDOW_S = 300         # seconds of data for HRV (5-minute RMSSD)
+CAP_PRESENCE_MAX_AGE_S = 10.0
+CALIBRATION_RELOAD_S = 60.0
 
 # Pump gating
 PUMP_ENERGY_MULTIPLIER = 10.0
@@ -195,6 +202,58 @@ def write_vitals(holder: "DBHolder", side: str, ts: datetime,
     except sqlite3.Error as e:
         holder.write_failures += 1
         log.warning("write_vitals failed (%d consecutive): %s",
+                    holder.write_failures, e)
+        if holder.write_failures >= _DB_RECONNECT_THRESHOLD:
+            _reconnect_db(holder)
+            holder.write_failures = 0
+        return False
+
+
+def write_presence_decision(holder: "DBHolder", side: str, timestamp: int,
+                            present: bool, med_std: float, acr_qual: float,
+                            enter_threshold: float, exit_threshold: float,
+                            reason: str, cap_present: Optional[bool],
+                            cap_age_seconds: Optional[float],
+                            other_med_std: Optional[float],
+                            other_acr_qual: Optional[float],
+                            pump_mode: Optional[str]) -> bool:
+    """Persist one decision window for later occupancy/piezo correlation."""
+    conn = holder.conn
+    try:
+        with conn:
+            conn.execute(
+                """INSERT INTO piezo_presence_decisions
+                   (side, timestamp, present, med_std, autocorrelation_quality,
+                    enter_threshold, exit_threshold, threshold_source,
+                    decision_reason, cap_present, cap_age_seconds,
+                    other_side_med_std, other_side_autocorrelation_quality,
+                    pump_mode)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'fixed', ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(side, timestamp) DO UPDATE SET
+                     present=excluded.present,
+                     med_std=excluded.med_std,
+                     autocorrelation_quality=excluded.autocorrelation_quality,
+                     enter_threshold=excluded.enter_threshold,
+                     exit_threshold=excluded.exit_threshold,
+                     threshold_source=excluded.threshold_source,
+                     decision_reason=excluded.decision_reason,
+                     cap_present=excluded.cap_present,
+                     cap_age_seconds=excluded.cap_age_seconds,
+                     other_side_med_std=excluded.other_side_med_std,
+                     other_side_autocorrelation_quality=excluded.other_side_autocorrelation_quality,
+                     pump_mode=excluded.pump_mode""",
+                (
+                    side, timestamp, int(present), med_std, acr_qual,
+                    enter_threshold, exit_threshold, reason,
+                    None if cap_present is None else int(cap_present),
+                    cap_age_seconds, other_med_std, other_acr_qual, pump_mode,
+                ),
+            )
+        holder.write_failures = 0
+        return True
+    except sqlite3.Error as e:
+        holder.write_failures += 1
+        log.warning("write_presence_decision failed (%d consecutive): %s",
                     holder.write_failures, e)
         if holder.write_failures >= _DB_RECONNECT_THRESHOLD:
             _reconnect_db(holder)
@@ -453,6 +512,65 @@ class PresenceDetector:
             else:
                 self.consecutive_low = 0
                 return True
+
+
+class CapacitancePresenceTracker:
+    """Keep a fresh, calibrated capacitance label beside piezo decisions."""
+
+    def __init__(self, db_path: Path):
+        self._store = CalibrationStore(db_path)
+        self._profiles = {"left": None, "right": None}
+        self._last_reload = 0.0
+        self._presence = {"left": None, "right": None}
+        self._updated_at = {"left": 0.0, "right": 0.0}
+
+    def _reload(self, now: float) -> None:
+        if now - self._last_reload < CALIBRATION_RELOAD_S:
+            return
+        self._last_reload = now
+        for side in ("left", "right"):
+            profile = self._store.get_active(side, "capacitance")
+            if not profile or (profile.get("expires_at") or 0) <= int(now):
+                self._profiles[side] = None
+                continue
+            try:
+                params = json.loads(profile["parameters"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self._profiles[side] = None
+                continue
+            self._profiles[side] = params if isinstance(params, dict) else None
+
+    def update(self, record: dict) -> None:
+        now = time.time()
+        self._reload(now)
+        record_type = record.get("type")
+        for side in ("left", "right"):
+            profile = self._profiles[side]
+            if not profile or profile.get("format") != record_type:
+                self._presence[side] = None
+                continue
+            if record_type == "capSense":
+                present = is_present_capsense_calibrated(
+                    record, side, profile, fallback_threshold=1500)
+            elif record_type == "capSense2":
+                present = is_present_capsense2_calibrated(
+                    record, side, profile, fallback_threshold=60.0)
+            else:
+                continue
+            self._presence[side] = present
+            self._updated_at[side] = now
+
+    def get(self, side: str, now: float) -> tuple:
+        updated_at = self._updated_at[side]
+        if updated_at <= 0:
+            return None, None
+        age = max(0.0, now - updated_at)
+        if age > CAP_PRESENCE_MAX_AGE_S:
+            return None, age
+        return self._presence[side], age
+
+    def close(self) -> None:
+        self._store.close()
 
 # ---------------------------------------------------------------------------
 # Heart rate — subharmonic summation autocorrelation (Hermes 1988; Bruser 2011)
@@ -811,7 +929,8 @@ def compute_hrv(samples: np.ndarray,
 
 class SideProcessor:
     def __init__(self, side: str, db_holder: DBHolder,
-                 pump_state: Optional[FrzHealthPumpState] = None):
+                 pump_state: Optional[FrzHealthPumpState] = None,
+                 cap_tracker: Optional[CapacitancePresenceTracker] = None):
         self.side = side
         self.db_holder = db_holder
         self._hr_buf: deque = deque(maxlen=HR_WINDOW_S * SAMPLE_RATE)
@@ -824,6 +943,7 @@ class SideProcessor:
         self._last_med_std: float = 0.0  # cached for cross-channel comparison
         self._last_acr_qual: float = 0.0
         self._pump_state = pump_state
+        self._cap_tracker = cap_tracker
 
     def ingest(self, samples: np.ndarray) -> None:
         self._hr_buf.extend(samples)
@@ -857,6 +977,7 @@ class SideProcessor:
         # left sees right's values from the previous cycle (~60s stale).
         # This is acceptable — coupling produces similar energy regardless
         # of which side checks first.
+        cross_side_suppressed = False
         if self._other is not None and self._other._last_med_std > 0:
             other_std = self._other._last_med_std
             other_acr = self._other._last_acr_qual
@@ -866,6 +987,7 @@ class SideProcessor:
                     and other_std > med_std * 0.7
                     and med_std < self._presence.enter_threshold):
                 acr_qual = 0.0
+                cross_side_suppressed = True
 
         # Cache AFTER suppression so the other side sees post-suppression values
         self._last_med_std = med_std
@@ -879,21 +1001,62 @@ class SideProcessor:
         # cardiac band, both sides look "real"). In both, require elevated
         # energy AND strong autocorrelation to enter PRESENT; coupling
         # rarely produces both, only a real person does.
+        pump_mode = None
         if self._pump_state is not None and self._presence.state == PresenceDetector.ABSENT:
             symmetric = self._pump_state.is_symmetric_active()
             asymmetric = self._pump_state.is_asymmetric_for(self.side)
             if symmetric or asymmetric:
+                pump_mode = "symmetric" if symmetric else "asymmetric"
                 std_threshold = self._presence.enter_threshold * PUMP_COUPLING_STD_FACTOR
                 if not (med_std > std_threshold and acr_qual > PUMP_COUPLING_ACR_THRESHOLD):
                     log.debug(
                         "%s: pump-coupling guard suppressed presence "
                         "(med_std=%.0f, acr=%.2f, mode=%s)",
                         self.side, med_std, acr_qual,
-                        "symmetric" if symmetric else "asymmetric",
+                        pump_mode,
                     )
+                    cap_present, cap_age = (
+                        self._cap_tracker.get(self.side, now)
+                        if self._cap_tracker else (None, None)
+                    )
+                    write_presence_decision(
+                        self.db_holder, self.side, int(now), False,
+                        med_std, acr_qual, self._presence.enter_threshold,
+                        self._presence.exit_threshold, "pump_suppressed",
+                        cap_present, cap_age,
+                        self._other._last_med_std if self._other else None,
+                        self._other._last_acr_qual if self._other else None,
+                        pump_mode,
+                    )
+                    self._last_write = now
                     return
 
+        previous_state = self._presence.state
         present = self._presence.update(med_std, acr_qual)
+        if previous_state == PresenceDetector.ABSENT and present:
+            reason = "std_enter" if med_std > self._presence.enter_threshold else "autocorrelation_enter"
+        elif previous_state == PresenceDetector.PRESENT and not present:
+            reason = "exit"
+        elif present:
+            reason = "hysteresis_hold"
+        elif cross_side_suppressed:
+            reason = "cross_side_suppressed"
+        else:
+            reason = "absent"
+
+        cap_present, cap_age = (
+            self._cap_tracker.get(self.side, now)
+            if self._cap_tracker else (None, None)
+        )
+        write_presence_decision(
+            self.db_holder, self.side, int(now), present,
+            med_std, acr_qual, self._presence.enter_threshold,
+            self._presence.exit_threshold, reason,
+            cap_present, cap_age,
+            self._other._last_med_std if self._other else None,
+            self._other._last_acr_qual if self._other else None,
+            pump_mode,
+        )
 
         if not present:
             # Reset the interval cursor so a return from extended absence
@@ -971,8 +1134,11 @@ def main() -> None:
     db_holder = DBHolder(open_biometrics_db())
     pump_gate = PumpGate()
     pump_state = FrzHealthPumpState()
-    left = SideProcessor("left", db_holder, pump_state=pump_state)
-    right = SideProcessor("right", db_holder, pump_state=pump_state)
+    cap_tracker = CapacitancePresenceTracker(BIOMETRICS_DB)
+    left = SideProcessor("left", db_holder, pump_state=pump_state,
+                         cap_tracker=cap_tracker)
+    right = SideProcessor("right", db_holder, pump_state=pump_state,
+                          cap_tracker=cap_tracker)
     left._other = right
     right._other = left
     # Source selected once at startup: NatsFollower on new-firmware pods (NATS
@@ -999,6 +1165,10 @@ def main() -> None:
                 pump_state.update(record)
                 continue
 
+            if rtype in ("capSense", "capSense2"):
+                cap_tracker.update(record)
+                continue
+
             if rtype != "piezo-dual":
                 continue
 
@@ -1021,6 +1191,7 @@ def main() -> None:
         report_health("down", str(e))
         sys.exit(1)
     finally:
+        cap_tracker.close()
         db_holder.conn.close()
         log.info("Shutdown complete")
 

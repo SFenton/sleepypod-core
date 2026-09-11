@@ -244,3 +244,27 @@ export const vitalsQuality = sqliteTable('vitals_quality', {
   // See idx_vitals_timestamp — retention pruning needs a timestamp seek.
   index('idx_vq_timestamp').on(t.timestamp),
 ])
+
+// One row per side/minute from the piezo processor's presence gate. These
+// features make false-present/false-absent analysis possible without retaining
+// raw 500 Hz waveforms.
+export const piezoPresenceDecisions = sqliteTable('piezo_presence_decisions', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  side: text('side', { enum: ['left', 'right'] }).notNull(),
+  timestamp: integer('timestamp', { mode: 'timestamp' }).notNull(),
+  present: integer('present', { mode: 'boolean' }).notNull(),
+  medStd: real('med_std').notNull(),
+  autocorrelationQuality: real('autocorrelation_quality').notNull(),
+  enterThreshold: real('enter_threshold').notNull(),
+  exitThreshold: real('exit_threshold').notNull(),
+  thresholdSource: text('threshold_source', { enum: ['fixed', 'calibrated'] }).notNull(),
+  decisionReason: text('decision_reason').notNull(),
+  capPresent: integer('cap_present', { mode: 'boolean' }),
+  capAgeSeconds: real('cap_age_seconds'),
+  otherSideMedStd: real('other_side_med_std'),
+  otherSideAutocorrelationQuality: real('other_side_autocorrelation_quality'),
+  pumpMode: text('pump_mode', { enum: ['asymmetric', 'symmetric'] }),
+}, t => [
+  uniqueIndex('uq_piezo_presence_side_timestamp').on(t.side, t.timestamp),
+  index('idx_piezo_presence_timestamp').on(t.timestamp),
+])

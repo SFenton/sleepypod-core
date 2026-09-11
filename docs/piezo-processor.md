@@ -186,6 +186,24 @@ The thresholds `enter=400,000`, `exit=150,000`, and `acr=0.45` were derived from
 - **Occupied right side:** Median std ranged 300k-900k, autocorrelation quality 0.50-0.85 during normal sleep.
 - **The gap between 150k and 400k** provides a comfortable margin that accommodates deep sleep (low amplitude) without triggering on empty-bed coupling.
 
+### Decision Telemetry
+
+Every 60-second gate evaluation is stored in `piezo_presence_decisions`, including
+the median filtered standard deviation, autocorrelation quality, active entry and
+exit thresholds, decision reason, pump/cross-side context, and the latest fresh
+calibrated capacitance-presence label. Raw 500 Hz piezo samples are not retained.
+
+The diagnostic API is:
+
+```text
+GET /biometrics/piezo-presence
+```
+
+It accepts optional `side`, `startDate`, and `endDate` filters plus a bounded
+`limit`. Use this evidence to measure false-present and false-absent windows
+before changing the gate thresholds. The table follows the normal biometrics
+retention window.
+
 ## 6. Heart Rate Extraction
 
 ### Bandpass: 0.8-8.5 Hz

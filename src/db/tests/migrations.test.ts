@@ -83,6 +83,11 @@ describe('migrations smoke test', () => {
       const names = rows.map(r => r.name)
       expect(names).toContain('uq_vitals_side_timestamp')
       expect(names).not.toContain('idx_vitals_side_timestamp')
+
+      const telemetryTable = raw.prepare(
+        'SELECT name FROM sqlite_master WHERE type = \'table\' AND name = \'piezo_presence_decisions\'',
+      ).get() as { name?: string } | undefined
+      expect(telemetryTable?.name).toBe('piezo_presence_decisions')
     }
     finally {
       raw.close()

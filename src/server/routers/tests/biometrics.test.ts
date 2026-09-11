@@ -241,6 +241,39 @@ describe('biometrics.getMovement / getMovementBuckets / getMovementSummary', () 
     expect(out).toHaveLength(1)
   })
 
+  describe('biometrics.getPiezoPresenceDecisions', () => {
+    it('returns persisted decision telemetry', async () => {
+      const row = {
+        id: 1,
+        side: 'left' as const,
+        timestamp: new Date(0),
+        present: false,
+        medStd: 1234,
+        autocorrelationQuality: 0.51,
+        enterThreshold: 400000,
+        exitThreshold: 150000,
+        thresholdSource: 'fixed' as const,
+        decisionReason: 'autocorrelation_enter',
+        capPresent: false,
+        capAgeSeconds: 0.25,
+        otherSideMedStd: 900,
+        otherSideAutocorrelationQuality: 0.2,
+        pumpMode: null,
+      }
+      dbState.rowsQueue.push([row])
+
+      await expect(caller.getPiezoPresenceDecisions({ side: 'left' }))
+        .resolves.toEqual([row])
+    })
+
+    it('rejects an inverted date range', async () => {
+      await expect(caller.getPiezoPresenceDecisions({
+        startDate: new Date('2025-02-01'),
+        endDate: new Date('2025-01-01'),
+      })).rejects.toThrow(/startDate/)
+    })
+  })
+
   it('getMovement rejects inverted date range', async () => {
     await expect(caller.getMovement({
       startDate: new Date('2025-02-01'),

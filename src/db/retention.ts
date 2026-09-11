@@ -7,6 +7,7 @@ import {
   flowReadings,
   freezerTemp,
   movement,
+  piezoPresenceDecisions,
   pumpAlerts,
   vitals,
   vitalsQuality,
@@ -22,7 +23,7 @@ import {
  * reclaims file-system space via incremental_vacuum afterwards.
  *
  * Tables covered (all write at ≥1/minute and have no referential joins):
- *   vitals, movement, bed_temp, freezer_temp, flow_readings,
+ *   vitals, movement, piezo_presence_decisions, bed_temp, freezer_temp, flow_readings,
  *   ambient_light, water_level_readings, pump_alerts, vitals_quality
  *
  * vitals_quality shares vitals' timestamp cutoff so each quality row dies
@@ -39,6 +40,7 @@ const RETENTION_TABLES = [
   { table: vitals, column: vitals.timestamp, name: 'vitals' },
   { table: vitalsQuality, column: vitalsQuality.timestamp, name: 'vitals_quality' },
   { table: movement, column: movement.timestamp, name: 'movement' },
+  { table: piezoPresenceDecisions, column: piezoPresenceDecisions.timestamp, name: 'piezo_presence_decisions' },
   { table: bedTemp, column: bedTemp.timestamp, name: 'bed_temp' },
   { table: freezerTemp, column: freezerTemp.timestamp, name: 'freezer_temp' },
   { table: flowReadings, column: flowReadings.timestamp, name: 'flow_readings' },
