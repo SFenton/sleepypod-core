@@ -328,6 +328,29 @@ describe('dacTransport private transport contracts through the public API', () =
     await expect(transport.sendCommand('stream-end')).rejects.toThrow('stream ended')
   })
 
+  it('reuses the listener and reconnects after frankenfirmware disconnects', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { server, socket } = await connectHarnessSocket()
+    socket.destroy()
+    await new Promise<void>(resolve => setImmediate(resolve))
+
+    expect(transport.isDacConnected()).toBe(false)
+
+    const replacement = new HarnessSocket()
+    const command = transport.sendCommand('after-reconnect')
+    await waitForCondition(
+      () => server.listenerCount('connection') > 0,
+      'Existing DAC listener was not available for reconnection',
+    )
+    server.emit('connection', replacement)
+    await waitForWrites(replacement, 1)
+    replacement.respond('RECOVERED\n\n')
+
+    await expect(command).resolves.toBe('RECOVERED')
+    expect(createServerMock).toHaveBeenCalledTimes(1)
+    expect(warning).toHaveBeenCalledWith('[DAC] frankenfirmware disconnected')
+  })
+
   it('keeps only the newest unsolicited connection and closes every pending socket on shutdown', async () => {
     const { server } = await connectHarnessSocket()
     const stale = new HarnessSocket()

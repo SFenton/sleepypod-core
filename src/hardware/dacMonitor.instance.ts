@@ -238,6 +238,9 @@ export const getDacMonitor = async (): Promise<DacMonitor> => {
       const coverButtonHandler = getCoverButtonActionHandler()
       const stateSync = new DeviceStateSync()
 
+      monitor.on('error', (error) => {
+        console.warn('[DAC] monitor poll failed:', error.message)
+      })
       monitor.on('gesture:detected', (event) => {
         gestureHandler.handle(event)
         // Broadcast to WS clients so browser UI can show gesture events
