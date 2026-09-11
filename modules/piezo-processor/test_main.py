@@ -23,11 +23,19 @@ _stubs = {
     "common.raw_follower": type(sys)("common.raw_follower"),
     "common.nats_follower": type(sys)("common.nats_follower"),
     "common.dialect": type(sys)("common.dialect"),
+    "common.calibration": type(sys)("common.calibration"),
 }
 _stubs["common.raw_follower"].RawFileFollower = None
 _stubs["common.nats_follower"].create_follower = None
 _stubs["common.dialect"].KNOWN_RECORD_TYPES = frozenset()
 _stubs["common.dialect"].warn_unknown_type_once = lambda *a, **kw: None
+_stubs["common.calibration"].CalibrationStore = object
+_stubs["common.calibration"].is_present_capsense_calibrated = (
+    lambda record, side, profile, fallback_threshold: bool(record[side]["present"])
+)
+_stubs["common.calibration"].is_present_capsense2_calibrated = (
+    lambda record, side, profile, fallback_threshold: bool(record[side]["present"])
+)
 sys.modules.update(_stubs)
 
 from main import (  # noqa: E402
@@ -42,8 +50,10 @@ from main import (  # noqa: E402
     PUMP_ACTIVE_RPM_MIN,
     HRTracker,
     PresenceDetector,
+    CapacitancePresenceTracker,
     PumpGate,
     SideProcessor,
+    write_presence_decision,
     SAMPLE_RATE,
     PUMP_GUARD_S,
     VITALS_INTERVAL_S,
@@ -922,6 +932,20 @@ class TestWriteVitalsResilience:
                 created_at INTEGER
             )"""
         )
+        conn.execute(
+            """CREATE TABLE piezo_presence_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                side TEXT, timestamp INTEGER, present INTEGER,
+                med_std REAL, autocorrelation_quality REAL,
+                enter_threshold REAL, exit_threshold REAL,
+                threshold_source TEXT, decision_reason TEXT,
+                cap_present INTEGER, cap_age_seconds REAL,
+                other_side_med_std REAL,
+                other_side_autocorrelation_quality REAL,
+                pump_mode TEXT,
+                UNIQUE(side, timestamp)
+            )"""
+        )
         return conn
 
     def test_happy_path_inserts(self):
@@ -937,6 +961,24 @@ class TestWriteVitalsResilience:
         assert wrote is True
         rows = conn.execute("SELECT * FROM vitals").fetchall()
         assert len(rows) == 1
+
+    def test_presence_decision_upserts_features(self):
+        import main
+        conn = self._make_db()
+        holder = main.DBHolder(conn)
+
+        assert write_presence_decision(
+            holder, "left", 123, True, 1234.0, 0.51,
+            400_000, 150_000, "autocorrelation_enter",
+            False, 0.25, 900.0, 0.2, None,
+        ) is True
+
+        row = conn.execute(
+            """SELECT present, med_std, autocorrelation_quality,
+                      decision_reason, cap_present, threshold_source
+                 FROM piezo_presence_decisions"""
+        ).fetchone()
+        assert row == (1, 1234.0, 0.51, "autocorrelation_enter", 0, "fixed")
 
     def test_sqlite_error_does_not_raise(self, monkeypatch):
         """A transient OperationalError must be logged, not raised."""
@@ -1039,16 +1081,47 @@ class TestWriteVitalsResilience:
         assert rows == [("right",)]
 
 
+class TestCapacitancePresenceTracker:
+    def test_exposes_only_fresh_matching_calibrated_presence(self, monkeypatch):
+        import main
+
+        class Store:
+            def get_active(self, side, sensor_type):
+                return {
+                    "parameters": '{"format":"capSense","channels":{},"threshold":6}',
+                    "expires_at": int(time.time()) + 60,
+                }
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(main, "CalibrationStore", lambda path: Store())
+        tracker = CapacitancePresenceTracker(main.BIOMETRICS_DB)
+        tracker.update({
+            "type": "capSense",
+            "left": {"present": True},
+            "right": {"present": False},
+        })
+
+        assert tracker.get("left", time.time())[0] is True
+        assert tracker.get("right", time.time())[0] is False
+        assert tracker.get(
+            "left", time.time() + main.CAP_PRESENCE_MAX_AGE_S + 1
+        )[0] is None
+
+
 class TestSideProcessorAbsenceThrottle:
     """_maybe_write must update _last_write on 'no user' so return from
     extended absence doesn't trigger burst processing until the first write
     succeeds (#325)."""
 
-    def test_last_write_advances_on_absence(self):
+    def test_last_write_advances_on_absence(self, monkeypatch):
         """When presence is not detected, _last_write should be advanced so
         the next ingest call does not immediately re-enter the heavy
         signal-processing path."""
         np.random.seed(42)
+        import main
+        monkeypatch.setattr(main, "write_presence_decision", lambda *args: True)
         proc = SideProcessor("left", db_holder=None)
         # Simulate extended absence — _last_write far in the past.
         proc._last_write = time.time() - 3600  # 1 hour ago

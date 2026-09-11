@@ -11,6 +11,7 @@ import {
   flowReadings,
   freezerTemp,
   movement,
+  piezoPresenceDecisions,
   pumpAlerts,
   vitals,
   waterLevelReadings,
@@ -68,6 +69,17 @@ function getDb(): BiometricsDb {
 function seedAllTables(db: BiometricsDb, ts: Date): void {
   db.insert(vitals).values({ side: 'left', timestamp: ts, heartRate: 60 }).run()
   db.insert(movement).values({ side: 'left', timestamp: ts, totalMovement: 1 }).run()
+  db.insert(piezoPresenceDecisions).values({
+    side: 'left',
+    timestamp: ts,
+    present: false,
+    medStd: 1,
+    autocorrelationQuality: 0.1,
+    enterThreshold: 400000,
+    exitThreshold: 150000,
+    thresholdSource: 'fixed',
+    decisionReason: 'absent',
+  }).run()
   db.insert(bedTemp).values({ timestamp: ts }).run()
   db.insert(freezerTemp).values({ timestamp: ts }).run()
   db.insert(flowReadings).values({ timestamp: ts }).run()
@@ -130,14 +142,27 @@ describe('pruneOldBiometrics', () => {
       { vitalsId: 1, side: 'left', timestamp: old, qualityScore: 0.5 },
       { vitalsId: 2, side: 'left', timestamp: fresh, qualityScore: 0.9 },
     ]).run()
+    db.insert(piezoPresenceDecisions).values([
+      {
+        side: 'left', timestamp: old, present: false, medStd: 1,
+        autocorrelationQuality: 0.1, enterThreshold: 400000,
+        exitThreshold: 150000, thresholdSource: 'fixed', decisionReason: 'absent',
+      },
+      {
+        side: 'right', timestamp: fresh, present: true, medStd: 2,
+        autocorrelationQuality: 0.5, enterThreshold: 400000,
+        exitThreshold: 150000, thresholdSource: 'fixed', decisionReason: 'autocorrelation_enter',
+      },
+    ]).run()
 
     const result = pruneOldBiometrics(cutoff, db)
 
-    expect(result.rowsDeleted).toBe(9)
+    expect(result.rowsDeleted).toBe(10)
     expect(result.perTable).toEqual({
       vitals: 1,
       vitals_quality: 1,
       movement: 1,
+      piezo_presence_decisions: 1,
       bed_temp: 1,
       freezer_temp: 1,
       flow_readings: 1,
@@ -149,6 +174,7 @@ describe('pruneOldBiometrics', () => {
     // Verify fresh rows remain
     expect(db.select().from(vitals).all()).toHaveLength(1)
     expect(db.select().from(movement).all()).toHaveLength(1)
+    expect(db.select().from(piezoPresenceDecisions).all()).toHaveLength(1)
     expect(db.select().from(bedTemp).all()).toHaveLength(1)
     expect(db.select().from(freezerTemp).all()).toHaveLength(1)
     expect(db.select().from(flowReadings).all()).toHaveLength(1)
@@ -244,6 +270,7 @@ describe('pruneOldBiometrics', () => {
       vitals: 0,
       vitals_quality: 0,
       movement: 0,
+      piezo_presence_decisions: 0,
       bed_temp: 0,
       freezer_temp: 0,
       flow_readings: 0,
@@ -264,10 +291,11 @@ describe('pruneOldBiometrics', () => {
     const cutoff = new Date(base + 3 * day)
     const result = pruneOldBiometrics(cutoff, db)
 
-    // Eight tables × 3 deleted days = 24 rows.
-    expect(result.rowsDeleted).toBe(24)
+    // Nine tables × 3 deleted days = 27 rows.
+    expect(result.rowsDeleted).toBe(27)
     for (const tableName of ['vitals', 'movement', 'bed_temp', 'freezer_temp',
-      'flow_readings', 'ambient_light', 'water_level_readings', 'pump_alerts'] as const) {
+      'piezo_presence_decisions', 'flow_readings', 'ambient_light',
+      'water_level_readings', 'pump_alerts'] as const) {
       expect(result.perTable[tableName]).toBe(3)
     }
     expect(db.select().from(vitals).all()).toHaveLength(2)
@@ -309,7 +337,7 @@ describe('runRetentionPass', () => {
 
     const result = runRetentionPass(7)
 
-    expect(result.rowsDeleted).toBe(8)
+    expect(result.rowsDeleted).toBe(9)
     expect(getDb().select().from(vitals).all()).toHaveLength(1)
   })
 
