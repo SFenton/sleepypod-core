@@ -522,6 +522,17 @@ describe('hardware/dacMonitor.instance', () => {
       log.mockRestore()
     })
 
+    it('logs monitor polling errors instead of leaving an unhandled rejection', async () => {
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const mod = await freshModule()
+      const monitor = await mod.getDacMonitor()
+      const failure = new Error('socket ended')
+
+      monitor.emit('error', failure)
+
+      expect(warning).toHaveBeenCalledWith('[DAC] monitor poll failed:', failure.message)
+    })
+
     it('is idempotent — second call returns the same monitor without re-starting', async () => {
       const mod = await freshModule()
       const a = await mod.getDacMonitor()

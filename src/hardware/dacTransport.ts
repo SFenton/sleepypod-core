@@ -293,6 +293,24 @@ class DacTransport {
     if (!this.socket.destroyed) this.socket.destroy()
   }
 
+  public isClosed(): boolean {
+    return this.socket.destroyed
+  }
+
+  public onDisconnect(listener: () => void): void {
+    let notified = false
+    const notify = () => {
+      if (notified) return
+      notified = true
+      listener()
+    }
+
+    this.socket.once('end', notify)
+    this.socket.once('close', notify)
+
+    if (this.socket.destroyed) notify()
+  }
+
   public static fromSocket(socket: Socket, sequentialQueue: SequentialQueue) {
     const messageStream = new MessageStream(socket, SEPARATOR)
     return new DacTransport(socket, messageStream, sequentialQueue)
@@ -401,6 +419,7 @@ interface DacState {
   dacServer?: DacServer
   transport?: DacTransport
   connectPromise?: Promise<DacTransport>
+  socketPath?: string
   sequentialQueue: SequentialQueue
 }
 
@@ -429,6 +448,34 @@ async function shutdown() {
   }
 }
 
+function activateTransport(transport: DacTransport): void {
+  state.transport = transport
+  transport.onDisconnect(() => {
+    if (state.transport !== transport) return
+    state.transport = undefined
+    beginStatusChange()()
+    console.warn('[DAC] frankenfirmware disconnected')
+  })
+}
+
+function invalidateTransport(transport: DacTransport): void {
+  if (state.transport !== transport) return
+  state.transport = undefined
+  beginStatusChange()()
+  transport.close()
+}
+
+function isDisconnectError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const code = 'code' in error ? error.code : undefined
+  return code === 'EPIPE'
+    || code === 'ECONNRESET'
+    || code === 'ENOTCONN'
+    || code === 'ERR_STREAM_DESTROYED'
+    || error.message === 'stream ended'
+    || error.message === 'This socket has been ended by the other party'
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /**
@@ -436,7 +483,9 @@ async function shutdown() {
  * Retries with server recreation on timeout.
  */
 export async function connectDac(socketPath: string): Promise<void> {
-  if (state.transport) return
+  state.socketPath = socketPath
+  if (state.transport && !state.transport.isClosed()) return
+  state.transport = undefined
   if (state.connectPromise) {
     await state.connectPromise
     return
@@ -445,13 +494,15 @@ export async function connectDac(socketPath: string): Promise<void> {
   state.connectPromise = (async () => {
     let timeoutAttempts = 0
     while (true) {
-      // Failed attempts close their listener before retrying.
-      state.dacServer = await DacServer.start(socketPath)
+      // Reuse the listener after a connected firmware process goes away. It
+      // queues the replacement connection while callers observe degraded mode.
+      state.dacServer ??= await DacServer.start(socketPath)
 
       try {
-        state.transport = await waitWithTimeout(state.dacServer)
+        const transport = await waitWithTimeout(state.dacServer)
+        activateTransport(transport)
         console.log('[DAC] connected')
-        return state.transport
+        return transport
       }
       catch (error) {
         if (error instanceof ConnectionTimeoutError) {
@@ -488,7 +539,11 @@ export async function connectDac(socketPath: string): Promise<void> {
  * @returns Raw response string from firmware
  */
 export async function sendCommand(command: string, arg?: string): Promise<string> {
-  if (!state.transport) {
+  if (!state.transport && state.socketPath) {
+    await connectDac(state.socketPath)
+  }
+  const transport = state.transport
+  if (!transport) {
     throw new Error('[DAC] not connected — call connectDac() first')
   }
 
@@ -497,8 +552,12 @@ export async function sendCommand(command: string, arg?: string): Promise<string
   const finish = command === '0' || command === '14' ? undefined : beginStatusChange()
   try {
     return await (arg === undefined || arg === ''
-      ? state.transport.sendMessage(command)
-      : state.transport.callFunction(command, arg))
+      ? transport.sendMessage(command)
+      : transport.callFunction(command, arg))
+  }
+  catch (error) {
+    if (isDisconnectError(error)) invalidateTransport(transport)
+    throw error
   }
   finally {
     finish?.()
@@ -510,6 +569,7 @@ export async function sendCommand(command: string, arg?: string): Promise<string
  */
 export async function disconnectDac(): Promise<void> {
   state.connectPromise = undefined
+  state.socketPath = undefined
   await shutdown()
 }
 
@@ -517,5 +577,5 @@ export async function disconnectDac(): Promise<void> {
  * Check if frankenfirmware is currently connected.
  */
 export function isDacConnected(): boolean {
-  return state.transport !== undefined
+  return state.transport !== undefined && !state.transport.isClosed()
 }
