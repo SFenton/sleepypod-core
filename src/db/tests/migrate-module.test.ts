@@ -11,9 +11,11 @@ interface RecordedInsert {
 
 const mocks = vi.hoisted(() => {
   const schema = {
+    coverButtonActions: { name: 'cover-button-actions-table' },
     deviceSettings: { name: 'device-settings-table' },
     sideSettings: { name: 'side-settings-table' },
     deviceState: { name: 'device-state-table' },
+    tapGestures: { name: 'tap-gestures-table' },
   }
   return {
     db: {
@@ -74,13 +76,23 @@ describe('database migration module', () => {
     mocks.limit.mockImplementation(async () => mocks.settingsRows)
     mocks.from.mockImplementation(() => ({ limit: mocks.limit }))
     mocks.db.select.mockImplementation(() => ({ from: mocks.from }))
-    mocks.insert.mockImplementation((table: unknown) => ({
-      values: (values: unknown) => ({
+    mocks.insert.mockImplementation((table: unknown) => {
+      const command = {
         run: () => {
           mocks.inserts.push({ table, values })
         },
-      }),
-    }))
+      }
+      let values: unknown
+      return {
+        values: (nextValues: unknown) => {
+          values = nextValues
+          return {
+            ...command,
+            onConflictDoNothing: () => command,
+          }
+        },
+      }
+    })
     mocks.db.transaction.mockImplementation((callback: (tx: { insert: typeof mocks.insert }) => void) => {
       callback({ insert: mocks.insert })
     })
@@ -161,6 +173,26 @@ describe('database migration module', () => {
         values: [
           { side: 'left', isPowered: false, isAlarmVibrating: false },
           { side: 'right', isPowered: false, isAlarmVibrating: false },
+        ],
+      },
+      {
+        table: mocks.schema.coverButtonActions,
+        values: [
+          { side: 'left', button: 'top', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, temperatureStepMode: 'level' },
+          { side: 'left', button: 'middle', actionType: 'power', powerBehavior: 'toggle' },
+          { side: 'left', button: 'bottom', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1, temperatureStepMode: 'level' },
+          { side: 'right', button: 'top', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, temperatureStepMode: 'level' },
+          { side: 'right', button: 'middle', actionType: 'power', powerBehavior: 'toggle' },
+          { side: 'right', button: 'bottom', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1, temperatureStepMode: 'level' },
+        ],
+      },
+      {
+        table: mocks.schema.tapGestures,
+        values: [
+          { side: 'left', button: 'top', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, temperatureStepMode: 'level' },
+          { side: 'left', button: 'bottom', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1, temperatureStepMode: 'level' },
+          { side: 'right', button: 'top', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1, temperatureStepMode: 'level' },
+          { side: 'right', button: 'bottom', tapType: 'doubleTap', actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 1, temperatureStepMode: 'level' },
         ],
       },
     ])

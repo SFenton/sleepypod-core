@@ -441,6 +441,7 @@ describe('iptablesCheck — checkAndRepairIptables', () => {
     const commands: string[] = []
     setExecHandler(({ cmd }) => {
       commands.push(cmd)
+      if (cmd === 'test -x /usr/local/bin/sp-iptables-save') throw new Error('helper unavailable')
       if (cmd.includes(' -L INPUT')) return 'udp dpt:5353'
       if (cmd.includes(' -L OUTPUT')) return 'udp dpt:5353 udp spt:5353 udp dpt:123'
       return ''

@@ -35,15 +35,14 @@ def test_cap_baseline_scans_final_window_and_floors_std():
     result = CapCalibrator().calibrate(records, "left")
     assert (result.window_start, result.window_end, result.samples_used) == (1001, 1300, 300)
     assert result.quality_score == 1
-    assert result.params == {"threshold": 6.0, "channels": {
+    assert result.params == {"format": "capSense", "threshold": 6.0, "channels": {
         "out": {"mean": 100, "std": 5}, "cen": {"mean": 200, "std": 5}, "in": {"mean": 300, "std": 5},
     }}
 
 
-@pytest.mark.parametrize("count", [60, 300])
-def test_capsense2_accepts_six_channel_firmware_and_short_quiet_windows(count):
-    result = CapSense2Calibrator().calibrate(cap2_records(count), "right")
-    assert (result.window_start, result.window_end, result.samples_used) == (1000, 999 + count, count)
+def test_capsense2_accepts_six_channel_firmware_with_a_complete_quiet_window():
+    result = CapSense2Calibrator().calibrate(cap2_records(300), "right")
+    assert (result.window_start, result.window_end, result.samples_used) == (1000, 1299, 300)
     assert result.quality_score == 1
     assert result.params == {"format": "capSense2", "threshold": 6.0, "channels": {
         "A": {"mean": 11, "std": .05}, "B": {"mean": 21, "std": .05}, "C": {"mean": 31, "std": .05},
@@ -63,11 +62,11 @@ def test_capsense2_uses_final_quiet_sensing_window_ignoring_ref_variance():
 
 
 def test_capsense2_mixed_reference_frames_keep_timestamp_alignment():
-    records = cap2_records(60)
+    records = cap2_records(300)
     records[-1]["right"]["values"] = [10, 12, 20, 22, 30, 32, 1.1, 1.3]
     result = CapSense2Calibrator().calibrate(records, "right")
     assert result.params["ref"] == {"mean": 1.2, "std": .001}
-    assert result.samples_used == 60
+    assert result.samples_used == 300
 
 
 @pytest.mark.parametrize("encoding", [list, bytes, bytearray])

@@ -43,6 +43,13 @@ vi.mock('@/src/db', () => {
     update() {
       return { set: () => ({ where: () => ({ run: () => undefined }) }) }
     },
+    insert() {
+      return {
+        values: () => ({
+          onConflictDoUpdate: async () => undefined,
+        }),
+      }
+    },
     transaction: (fn: any) => fn({ update: fakeDb.update }),
   }
   return { db: fakeDb }
