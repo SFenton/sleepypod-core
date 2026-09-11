@@ -2,6 +2,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useSyncExternalStore } from 'react'
 import { normalizeFrame } from '@/src/streaming/normalizeFrame'
+import type { SideStatus } from '@/src/hardware/types'
 
 // ---------------------------------------------------------------------------
 // Sensor frame types (matching piezoStream.ts server output)
@@ -10,7 +11,7 @@ import { normalizeFrame } from '@/src/streaming/normalizeFrame'
 export const ALL_SENSOR_TYPES = [
   'piezo-dual', 'capSense', 'capSense2',
   'bedTemp', 'bedTemp2', 'frzTemp', 'frzTherm', 'frzHealth', 'log',
-  'deviceStatus', 'gesture',
+  'deviceStatus', 'gesture', 'lps',
 ] as const
 
 export type SensorType = typeof ALL_SENSOR_TYPES[number]
@@ -24,6 +25,21 @@ export interface PiezoDualFrame {
   right1: number[]
   left2?: number[]
   right2?: number[]
+}
+
+/**
+ * LPS diagnostic frame. Channel bytes remain in their JSON Buffer envelope,
+ * unlike piezo-dual's decoded sample arrays. Units and physical side mapping
+ * are unconfirmed; preserve sentinel samples and temperature placeholders.
+ */
+export interface LpsFrame {
+  type: 'lps'
+  ts: number
+  temp: Record<'left1' | 'left2' | 'right1' | 'right2', number>
+  pres: {
+    adc: number
+    freq: number
+  } & Record<'left1' | 'left2' | 'right1' | 'right2', { type: 'Buffer', data: number[] }>
 }
 
 /** Capacitive presence sensor frame (~2 Hz). */
@@ -116,24 +132,15 @@ export interface GestureFrame {
   tapType: string
 }
 
-/** Device status frame — pushed by dacMonitor every 2s. */
+/** Device status frame — pushed on DacMonitor's adaptive poll (1s active /
+ * 2s default / 5s idle) and immediately after mutations via
+ * broadcastMutationStatus. Sides carry the full SideStatus payload the
+ * producers spread (nullable temps when a side is off/neutral). */
 export interface DeviceStatusFrame {
   type: 'deviceStatus'
   ts: number
-  leftSide: {
-    currentTemperature: number
-    targetTemperature: number
-    currentLevel: number
-    targetLevel: number
-    isAlarmVibrating: boolean
-  }
-  rightSide: {
-    currentTemperature: number
-    targetTemperature: number
-    currentLevel: number
-    targetLevel: number
-    isAlarmVibrating: boolean
-  }
+  leftSide: SideStatus & { isAlarmVibrating: boolean }
+  rightSide: SideStatus & { isAlarmVibrating: boolean }
   waterLevel: 'low' | 'ok'
   isPriming: boolean
   primeCompletedNotification?: { timestamp: number }
@@ -160,6 +167,7 @@ export interface DeviceStatusFrame {
 /** Union of all sensor frame types. */
 export type SensorFrame
   = | PiezoDualFrame
+    | LpsFrame
     | CapSenseFrame
     | CapSense2Frame
     | BedTempFrame

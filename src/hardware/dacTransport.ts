@@ -17,6 +17,7 @@ import { unlink } from 'fs/promises'
 import { createServer, type Server, type Socket } from 'net'
 import split from 'binary-split'
 import type { Transform } from 'stream'
+import { beginStatusChange } from './statusRevision'
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
@@ -97,8 +98,15 @@ class MessageStream {
     readable.on('error', error => this.splitter.destroy(error as Error))
   }
 
-  public async readMessage(): Promise<Buffer> {
+  /**
+   * Read the next message. When `signal` aborts, the read settles immediately
+   * and stops listening — so an abandoned (timed-out) read can never consume
+   * a later command's response from the shared queue.
+   */
+  public async readMessage(signal?: AbortSignal): Promise<Buffer> {
     while (true) {
+      signal?.throwIfAborted()
+
       if (this.queue.length > 0) {
         return this.queue.shift() as Buffer
       }
@@ -113,8 +121,20 @@ class MessageStream {
         throw new Error('stream ended')
       }
 
-      await once(this.splitter, 'data')
+      await once(this.splitter, 'data', { signal })
     }
+  }
+
+  /**
+   * Drop any buffered messages. Commands execute strictly sequentially, so a
+   * message still buffered when the next command is about to be sent can only
+   * be a stale response to an earlier, timed-out command — consuming it would
+   * shift every subsequent command/response pair by one.
+   */
+  public discardBuffered(): number {
+    const discarded = this.queue.length
+    this.queue.length = 0
+    return discarded
   }
 }
 
@@ -228,27 +248,38 @@ class DacTransport {
 
   public async sendMessage(message: string) {
     return this.sequentialQueue.exec(async () => {
+      // A response to an earlier timed-out command may have arrived after its
+      // read was abandoned; it must not be paired with this command. (A stale
+      // response arriving between this write and our read would still be
+      // mispaired — the protocol has no correlation ids — but the abort below
+      // guarantees the misalignment can no longer become permanent.)
+      const stale = this.messageStream.discardBuffered()
+      if (stale > 0) {
+        console.warn(`[DAC] discarded ${stale} stale response(s) before sending next command`)
+      }
+
       const requestBytes = Buffer.concat([Buffer.from(message), SEPARATOR])
       await this.write(requestBytes)
 
       const timeoutMs = messageResponseTimeoutMs()
-      let timeout: NodeJS.Timeout | undefined
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timeout = setTimeout(
-          () => reject(new MessageResponseTimeoutError(timeoutMs)),
-          timeoutMs,
-        )
-      })
+      const abort = new AbortController()
+      const timeout = setTimeout(() => abort.abort(), timeoutMs)
 
       try {
-        const resp = await Promise.race([this.messageStream.readMessage(), timeoutPromise])
+        const resp = await this.messageStream.readMessage(abort.signal)
         if (RESPONSE_DELAY_MS > 0) {
           await wait(RESPONSE_DELAY_MS)
         }
         return resp.toString()
       }
+      catch (error) {
+        if (abort.signal.aborted) {
+          throw new MessageResponseTimeoutError(timeoutMs)
+        }
+        throw error
+      }
       finally {
-        if (timeout) clearTimeout(timeout)
+        clearTimeout(timeout)
       }
     })
   }
@@ -262,9 +293,9 @@ class DacTransport {
     if (!this.socket.destroyed) this.socket.destroy()
   }
 
-  public static fromSocket(socket: Socket) {
+  public static fromSocket(socket: Socket, sequentialQueue: SequentialQueue) {
     const messageStream = new MessageStream(socket, SEPARATOR)
-    return new DacTransport(socket, messageStream, new SequentialQueue())
+    return new DacTransport(socket, messageStream, sequentialQueue)
   }
 
   private async write(data: Buffer) {
@@ -281,10 +312,10 @@ class DacServer {
     await this.listener.close()
   }
 
-  public async waitForConnection(): Promise<DacTransport> {
+  public async waitForConnection(sequentialQueue: SequentialQueue): Promise<DacTransport> {
     const socket = await this.listener.waitForConnection()
     console.log('[DAC] frankenfirmware connected')
-    return DacTransport.fromSocket(socket)
+    return DacTransport.fromSocket(socket, sequentialQueue)
   }
 
   public static async start(path: string) {
@@ -364,25 +395,37 @@ function withTimeout<T>(promise: Promise<T>, onTimeout: () => Error): Promise<T>
   })
 }
 
-// ─── Module-level state ──────────────────────────────────────────────────────
+// ─── Process-wide state ──────────────────────────────────────────────────────
 
-let dacServer: DacServer | undefined
-let transport: DacTransport | undefined
-let connectPromise: Promise<DacTransport> | undefined
+interface DacState {
+  dacServer?: DacServer
+  transport?: DacTransport
+  connectPromise?: Promise<DacTransport>
+  sequentialQueue: SequentialQueue
+}
+
+// Next.js can evaluate this module separately for instrumentation and routes.
+// Share ownership of the listener, connection, and queue across those bundles.
+const g = globalThis as Record<string, unknown>
+const state = (g.__sp_dac_transport__ ??= {
+  sequentialQueue: new SequentialQueue(),
+}) as DacState
 
 function waitWithTimeout(server: DacServer) {
-  return withTimeout(server.waitForConnection(), () => {
+  return withTimeout(server.waitForConnection(state.sequentialQueue), () => {
     console.warn(`[DAC] restarting after ${connectionTimeoutMs() / 1_000}s timeout`)
     return new ConnectionTimeoutError()
   })
 }
 
 async function shutdown() {
-  transport?.close()
-  transport = undefined
-  if (dacServer) {
-    await dacServer.close()
-    dacServer = undefined
+  // A snapshot from the old connection must not survive a reconnect.
+  beginStatusChange()()
+  state.transport?.close()
+  state.transport = undefined
+  if (state.dacServer) {
+    await state.dacServer.close()
+    state.dacServer = undefined
   }
 }
 
@@ -393,23 +436,22 @@ async function shutdown() {
  * Retries with server recreation on timeout.
  */
 export async function connectDac(socketPath: string): Promise<void> {
-  if (transport) return
-  if (connectPromise) {
-    await connectPromise
+  if (state.transport) return
+  if (state.connectPromise) {
+    await state.connectPromise
     return
   }
 
-  connectPromise = (async () => {
+  state.connectPromise = (async () => {
     let timeoutAttempts = 0
     while (true) {
-      if (!dacServer) {
-        dacServer = await DacServer.start(socketPath)
-      }
+      // Failed attempts close their listener before retrying.
+      state.dacServer = await DacServer.start(socketPath)
 
       try {
-        transport = await waitWithTimeout(dacServer)
+        state.transport = await waitWithTimeout(state.dacServer)
         console.log('[DAC] connected')
-        return transport
+        return state.transport
       }
       catch (error) {
         if (error instanceof ConnectionTimeoutError) {
@@ -431,10 +473,10 @@ export async function connectDac(socketPath: string): Promise<void> {
   })()
 
   try {
-    await connectPromise
+    await state.connectPromise
   }
   finally {
-    connectPromise = undefined
+    state.connectPromise = undefined
   }
 }
 
@@ -446,22 +488,28 @@ export async function connectDac(socketPath: string): Promise<void> {
  * @returns Raw response string from firmware
  */
 export async function sendCommand(command: string, arg?: string): Promise<string> {
-  if (!transport) {
+  if (!state.transport) {
     throw new Error('[DAC] not connected — call connectDac() first')
   }
 
-  if (arg === undefined || arg === '') {
-    return transport.sendMessage(command)
+  // HELLO and DEVICE_STATUS are read-only. Invalidate for every other command,
+  // including raw commands and writes from HomeKit, gestures, and the scheduler.
+  const finish = command === '0' || command === '14' ? undefined : beginStatusChange()
+  try {
+    return await (arg === undefined || arg === ''
+      ? state.transport.sendMessage(command)
+      : state.transport.callFunction(command, arg))
   }
-
-  return transport.callFunction(command, arg)
+  finally {
+    finish?.()
+  }
 }
 
 /**
  * Disconnect and tear down.
  */
 export async function disconnectDac(): Promise<void> {
-  connectPromise = undefined
+  state.connectPromise = undefined
   await shutdown()
 }
 
@@ -469,5 +517,5 @@ export async function disconnectDac(): Promise<void> {
  * Check if frankenfirmware is currently connected.
  */
 export function isDacConnected(): boolean {
-  return transport !== undefined
+  return state.transport !== undefined
 }

@@ -4,8 +4,19 @@ import react from '@vitejs/plugin-react'
 import tsconfigPaths from 'vite-tsconfig-paths'
 import { defineConfig } from 'vitest/config'
 
+const serverOnlyTestStub = '\0server-only-test-stub'
+
 export default defineConfig({
-  plugins: [tsconfigPaths(), react({
+  plugins: [{
+    name: 'server-only-test-stub',
+    enforce: 'pre',
+    resolveId(id) {
+      if (id === 'server-only') return serverOnlyTestStub
+    },
+    load(id) {
+      if (id === serverOnlyTestStub) return 'export {}'
+    },
+  }, tsconfigPaths(), react({
     babel: {
       plugins: ['@lingui/babel-plugin-lingui-macro'],
     },
@@ -28,9 +39,13 @@ export default defineConfig({
     },
     coverage: {
       provider: 'v8',
-      reporter: ['text', 'lcov'],
+      reporter: ['text', 'lcov', 'json-summary'],
+      // Count production files even when no test imports them. Otherwise new,
+      // untested components disappear from the coverage denominator entirely.
+      include: ['src/**/*.{ts,tsx}', 'app/**/*.{ts,tsx}', 'instrumentation.ts', 'proxy.ts'],
+      exclude: ['**/tests/**', '**/*.test.{ts,tsx}', '**/*.d.ts'],
     },
     name: 'unit',
-    exclude: ['.claude/worktrees/**', '.ygg/worktrees/**', 'node_modules/**', '.next/**'],
+    exclude: ['.claude/worktrees/**', '.codex/**', '.ygg/worktrees/**', 'node_modules/**', '.next/**'],
   },
 })

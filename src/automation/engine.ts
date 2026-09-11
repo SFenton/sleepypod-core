@@ -42,6 +42,9 @@ import {
 } from './types'
 import { WindowStore } from './windows'
 
+/** How many minutes after a timeOfDay slot a late tick may still fire it. */
+const TIME_OF_DAY_GRACE_MIN = 10
+
 /** Minimal hardware surface the engine writes through (shared client shape). */
 export interface HardwareWriter {
   connect: () => Promise<void>
@@ -53,10 +56,15 @@ export interface AutomationEngineDeps {
   signals: SignalReader
   /** Epoch ms — injectable for deterministic tests. */
   now: () => number
-  /** Timezone-aware wall clock. */
-  clock: () => { nowMinutes: number, dayOfWeek: DayOfWeek }
+  /** Timezone-aware wall clock. dateKey (local yyyy-mm-dd) keys timeOfDay
+   * "already fired today"; when absent, dayOfWeek is used as a fallback. */
+  clock: () => { nowMinutes: number, dayOfWeek: DayOfWeek, dateKey?: string }
   getHardware: () => HardwareWriter
   withSideLock: <T>(side: Side, fn: () => Promise<T>) => Promise<T>
+  /** Pump stall guard gate — energizing writes are skipped while it blocks
+   * the side (ADR 0022: a tripped side stays parked until acknowledgment
+   * or successful opt-in auto-recovery). */
+  pumpStallShouldBlock: (side: Side) => boolean
   broadcast: (side: Side, overlay: Record<string, unknown>) => void
   markMutated: (side: Side) => void
   loadRules: () => Promise<AutomationRule[]>
@@ -86,6 +94,7 @@ export class AutomationEngine {
   private deps: AutomationEngineDeps
   private rules: AutomationRule[] = []
   private runtime = new Map<number, RuleRuntime>()
+  private triggerFingerprints = new Map<number, string>()
   private windows = new WindowStore()
   private windowSignals = new Set<string>()
   private timer: ReturnType<typeof setInterval> | null = null
@@ -120,12 +129,25 @@ export class AutomationEngine {
 
   /** Reload automations from the source (call after CRUD mutations). */
   async reload(): Promise<void> {
-    this.rules = await this.deps.loadRules()
+    const nextRules = await this.deps.loadRules()
+    const nextIds = new Set<number>()
+    for (const rule of nextRules) {
+      nextIds.add(rule.id)
+      const nextTrigger = JSON.stringify(rule.trigger)
+      if (this.triggerFingerprints.get(rule.id) !== nextTrigger) {
+        this.runtime.delete(rule.id)
+      }
+      this.triggerFingerprints.set(rule.id, nextTrigger)
+    }
+
+    this.rules = nextRules
     this.windowSignals = collectWindowSignals(this.rules)
     // Drop runtime for rules that no longer exist.
-    const ids = new Set(this.rules.map(r => r.id))
     for (const id of [...this.runtime.keys()]) {
-      if (!ids.has(id)) this.runtime.delete(id)
+      if (!nextIds.has(id)) this.runtime.delete(id)
+    }
+    for (const id of [...this.triggerFingerprints.keys()]) {
+      if (!nextIds.has(id)) this.triggerFingerprints.delete(id)
     }
   }
 
@@ -142,6 +164,10 @@ export class AutomationEngine {
    */
   registerManualOverride(side: Side): void {
     this.manualOverrideUntil[side] = this.deps.now() + AUTOMATION_MANUAL_OVERRIDE_MS
+    // The user changed the setpoint out from under us — the anti-thrash
+    // baseline no longer reflects hardware, and keeping it would suppress
+    // the first re-assertion after the override window expires.
+    this.lastAsserted[side] = undefined
   }
 
   /** Flip the global kill-switch. `false` suspends all evaluation immediately. */
@@ -172,7 +198,7 @@ export class AutomationEngine {
     try {
       const now = this.deps.now()
       const snapshot = this.deps.signals.read()
-      const { nowMinutes, dayOfWeek } = this.deps.clock()
+      const { nowMinutes, dayOfWeek, dateKey } = this.deps.clock()
 
       // Feed windowed-aggregate buffers, then prune to the largest window asked.
       for (const key of this.windowSignals) {
@@ -187,6 +213,7 @@ export class AutomationEngine {
         nowMs: now,
         nowMinutes,
         dayOfWeek,
+        dateKey,
       }
 
       for (const rule of this.rules) {
@@ -240,10 +267,20 @@ export class AutomationEngine {
       case 'timeOfDay': {
         const [h, m] = t.at.split(':').map(Number)
         const atMin = h * 60 + m
-        if (ctx.nowMinutes !== atMin) return false
         if (t.days && !t.days.includes(ctx.dayOfWeek)) return false
-        const key = `${ctx.dayOfWeek}:${atMin}`
-        if (rt.lastTimeKey === key) return false // already fired this minute
+        // Fire on the first tick at-or-after the slot, within a grace window:
+        // exact-minute equality silently skipped the slot whenever a tick
+        // landed >60s late (engine stall, scheduler reload). The window stays
+        // bounded so an engine (re)started hours later doesn't fire a long-
+        // gone morning slot at 3pm.
+        if (ctx.nowMinutes < atMin || ctx.nowMinutes > atMin + TIME_OF_DAY_GRACE_MIN) {
+          return false
+        }
+        // Key by local calendar date so the same slot re-arms next week
+        // (weekday-only keys blocked every later occurrence for the life of
+        // the process) but fires at most once per day.
+        const key = `${ctx.dateKey ?? ctx.dayOfWeek}:${atMin}`
+        if (rt.lastTimeKey === key) return false // already fired today
         rt.lastTimeKey = key
         return true
       }
@@ -322,6 +359,9 @@ export class AutomationEngine {
     if (action.kind === 'setTemperature' && raw === undefined) {
       return sides.map(side => ({ kind: action.kind, side, skipped: 'temp-unknown' }))
     }
+    if (action.kind === 'setPower' && action.on && action.temp && raw === undefined) {
+      return sides.map(side => ({ kind: action.kind, side, skipped: 'temp-unknown' }))
+    }
 
     // Two-layer clamp (only when a temperature is involved).
     let temp: number | undefined
@@ -374,8 +414,16 @@ export class AutomationEngine {
       return { kind: action.kind, side, dryRun: true, raw, temp, clamped, on: action.kind === 'setPower' ? action.on : undefined }
     }
 
-    // Real write through the shared, serialized hardware path.
+    // Real write through the shared, serialized hardware path. The stall-guard
+    // check runs inside the lock so a trip while this write is queued still
+    // blocks it; power-off is the safe direction and is never blocked.
+    const energizing = action.kind === 'setTemperature' || action.on
+    let stallBlocked = false
     await this.deps.withSideLock(side, async () => {
+      if (energizing && this.deps.pumpStallShouldBlock(side)) {
+        stallBlocked = true
+        return
+      }
       const hw = this.deps.getHardware()
       await hw.connect()
       if (action.kind === 'setTemperature') {
@@ -395,6 +443,10 @@ export class AutomationEngine {
         else if (!action.on) this.lastAsserted[side] = undefined
       }
     })
+    if (stallBlocked) {
+      console.warn(`[automation] skipped ${action.kind}: pump stall guard blocks ${side}`)
+      return { kind: action.kind, side, skipped: 'pump-stall', raw, temp, clamped }
+    }
     rt.actionTimes.push(now)
     return { kind: action.kind, side, sent: true, raw, temp, clamped, on: action.kind === 'setPower' ? action.on : undefined }
   }

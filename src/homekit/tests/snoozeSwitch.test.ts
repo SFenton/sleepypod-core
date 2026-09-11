@@ -28,6 +28,13 @@ describe('snoozeSwitch accessory', () => {
     vi.useRealTimers()
   })
 
+  it.each(['left', 'right'] as const)('uses stable metadata for the %s side', (side) => {
+    const { service, stop } = buildSnoozeSwitch(side)
+    expect(service.displayName).toBe(`Snooze ${side}`)
+    expect(service.subtype).toBe(`snooze-${side}`)
+    stop()
+  })
+
   it('on → requests one five-minute lifecycle snooze', async () => {
     const { service, stop } = buildSnoozeSwitch('left')
     await service.getCharacteristic(Characteristic.On).setValue(true)
@@ -70,10 +77,31 @@ describe('snoozeSwitch accessory', () => {
     stop()
   })
 
-  it('stop() clears the poll interval', () => {
-    const { stop } = buildSnoozeSwitch('left')
+  it('publishes the latest snooze state on each poll', () => {
+    const { service, stop } = buildSnoozeSwitch('left')
+    const update = vi.spyOn(service, 'updateCharacteristic')
+    state.active = true
+
+    vi.advanceTimersByTime(5_000)
+
+    expect(update).toHaveBeenCalledWith(Characteristic.On, true)
     stop()
-    // Advance well past the poll interval — no errors / no leaked timers.
+  })
+
+  it('does not require Node-specific unref support on the poll handle', () => {
+    vi.spyOn(globalThis, 'setInterval').mockReturnValue(7 as never)
+    expect(() => buildSnoozeSwitch('left')).not.toThrow()
+  })
+
+  it('stop() clears the poll interval', () => {
+    const { service, stop } = buildSnoozeSwitch('left')
+    const update = vi.spyOn(service, 'updateCharacteristic')
+    stop()
+    state.active = true
+
+    // Advance well past the poll interval — a stopped switch publishes nothing.
     vi.advanceTimersByTime(60_000)
+
+    expect(update).not.toHaveBeenCalled()
   })
 })

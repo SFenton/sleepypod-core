@@ -18,11 +18,14 @@ See docs/adr/0014-sensor-calibration.md for architecture rationale.
 import os
 import sys
 import time
+import math
+import json
 import signal
 import logging
 import sqlite3
 import threading
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -31,6 +34,13 @@ from common.calibration import (
     CapCalibrator, CapSense2Calibrator, PiezoCalibrator, TempCalibrator,
 )
 from common.cbor_raw import read_raw_record
+from common.dialect import log_capsense_status_once
+from common.nats_follower import (
+    NatsFollowerError,
+    NatsRecordBuffer,
+    nats_firmware_expected,
+    wait_for_nats,
+)
 import cbor2
 
 # ---------------------------------------------------------------------------
@@ -43,6 +53,16 @@ BIOMETRICS_DB = Path(os.environ.get(
     "file:/persistent/sleepypod-data/biometrics.db",
 ).replace("file:", ""))
 DAILY_HOUR = int(os.environ.get("CALIBRATION_HOUR", "6"))  # 06:00 UTC
+DAILY_MIN_AGE_HOURS = 23
+
+CAL_SIDES = ("left", "right")
+CAL_SENSOR_TYPES = ("capacitance", "piezo", "temperature")
+# Missing profiles retry quickly while a new NATS buffer warms, then back off
+# so disconnected sensors cannot append six failed audit rows every minute.
+CAL_RETRY_INITIAL_S = 60
+CAL_RETRY_MAX_S = 3600
+CAL_RUN_RETENTION_S = 30 * 86400
+CAL_RUN_PRUNE_INTERVAL_S = 86400
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -75,14 +95,34 @@ signal.signal(signal.SIGINT, _on_signal)
 # ---------------------------------------------------------------------------
 
 
-def load_recent_records(hours: int = 6) -> dict:
-    """Load recent CBOR records from RAW files via bounded scan (not tailing).
+def load_recent_records(hours: int = 6, buffer=None) -> dict:
+    """Load recent CBOR records for calibration.
 
-    Reads ALL .RAW files (sorted newest first), stopping when records are
-    older than the cutoff. Does NOT use RawFileFollower (which tails live
-    data and would hang/spin on stale files).
+    On a NATS-only pod (``buffer`` is a live ``NatsRecordBuffer``) there are no
+    ``.RAW`` files to scan and core NATS has no backfill, so we return a
+    snapshot of the bounded live buffer instead. Otherwise we scan ``.RAW``
+    files (sorted newest first), stopping when records are older than the
+    cutoff. Does NOT use RawFileFollower (which tails live data and would
+    hang/spin on stale files).
     """
-    cutoff = time.time() - hours * 3600
+    now = time.time()
+    cutoff = now - hours * 3600
+
+    if buffer is not None:
+        snap = buffer.snapshot()
+        records = {"capSense": [], "capSense2": [], "piezo-dual": [], "bedTemp": [], "bedTemp2": []}
+        for rtype in records:
+            recent = []
+            for record in snap.get(rtype, []):
+                try:
+                    ts = float(record.get("ts"))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if math.isfinite(ts) and cutoff <= ts <= now + 60:
+                    recent.append(record)
+            records[rtype] = recent
+        return records
+
     records: dict = {"capSense": [], "capSense2": [], "piezo-dual": [], "bedTemp": [], "bedTemp2": []}
 
     # Find all RAW files, newest first
@@ -109,7 +149,7 @@ def load_recent_records(hours: int = 6) -> dict:
                         if ts < cutoff:
                             continue
                         rtype = inner.get("type", "")
-                        if rtype in records:
+                        if isinstance(rtype, str) and rtype in records:
                             records[rtype].append(inner)
                     except EOFError:
                         break
@@ -128,8 +168,12 @@ def load_recent_records(hours: int = 6) -> dict:
 
 
 def run_calibration(store: CalibrationStore, side: str, sensor_type: str,
-                    triggered_by: str) -> bool:
-    """Run calibration for a specific sensor type and side."""
+                    triggered_by: str, buffer=None) -> bool:
+    """Run calibration for a specific sensor type and side.
+
+    ``buffer`` (a live ``NatsRecordBuffer``) selects the NATS record source on
+    new-firmware pods; None keeps the ``.RAW`` scan path.
+    """
     log.info("Starting %s calibration for %s (triggered: %s)",
              sensor_type, side, triggered_by)
 
@@ -138,7 +182,11 @@ def run_calibration(store: CalibrationStore, side: str, sensor_type: str,
 
     try:
         if sensor_type == "capacitance":
-            records = load_recent_records(hours=6)
+            records = load_recent_records(hours=6, buffer=buffer)
+            # Record (do not gate on) new-firmware capSense per-side status —
+            # the future quiet-window suppression gate needs this evidence.
+            for rec in records["capSense"]:
+                log_capsense_status_once(rec, "calibrator")
             # Auto-detect hardware: prefer capSense2 (Pod 5) over capSense (Pod 3)
             if records["capSense2"]:
                 calibrator = CapSense2Calibrator()
@@ -148,7 +196,7 @@ def run_calibration(store: CalibrationStore, side: str, sensor_type: str,
                 result = calibrator.calibrate(records["capSense"], side)
 
         elif sensor_type == "piezo":
-            records = load_recent_records(hours=6)
+            records = load_recent_records(hours=6, buffer=buffer)
             calibrator = PiezoCalibrator()
             result = calibrator.calibrate(records["piezo-dual"], side)
 
@@ -190,17 +238,93 @@ def run_calibration(store: CalibrationStore, side: str, sensor_type: str,
         return False
 
 
-def should_run_daily(now: float, last_run: float) -> bool:
+def live_capacitance_format(buffer) -> Optional[str]:
+    """Return the newest buffered capacitance dialect, if one is available."""
+    if buffer is None:
+        return None
+    snapshot = buffer.snapshot()
+    newest = None
+    for rtype, profile_format in (("capSense", "capSense"),
+                                  ("capSense2", "capSense2")):
+        for record in snapshot.get(rtype, []):
+            try:
+                ts = float(record.get("ts"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if math.isfinite(ts) and (newest is None or ts > newest[0]):
+                newest = (ts, profile_format)
+    return newest[1] if newest else None
+
+
+def compute_pending(store: CalibrationStore, now: float, buffer=None) -> set:
+    """Return the set of (side, sensor_type) whose profile is missing or
+    expired and therefore still needs (re)calibration."""
+    pending = set()
+    live_format = live_capacitance_format(buffer)
+    for side in CAL_SIDES:
+        for sensor_type in CAL_SENSOR_TYPES:
+            profile = store.get_active(side, sensor_type)
+            needs = profile is None
+            if profile and profile.get("expires_at"):
+                needs = profile["expires_at"] < now
+            if profile and sensor_type == "capacitance" and live_format:
+                try:
+                    params = json.loads(profile.get("parameters") or "{}")
+                except (TypeError, ValueError):
+                    params = {}
+                profile_format = params.get("format", "capSense")
+                needs = needs or profile_format != live_format
+            if needs:
+                pending.add((side, sensor_type))
+    return pending
+
+
+def run_pending_calibrations(store: CalibrationStore, now: float,
+                             triggered_by: str, buffer=None) -> set:
+    """Attempt every missing/expired profile once, then report what remains.
+
+    A failed attempt (e.g. an empty live buffer right after boot) leaves the
+    profile missing, so it stays in the returned set and the caller retries it
+    on the next tick — the one-shot startup failure never persists until the
+    next process restart.
+    """
+    pending = compute_pending(store, now, buffer=buffer)
+    for side, sensor_type in sorted(pending):
+        run_calibration(store, side, sensor_type, triggered_by, buffer=buffer)
+    return compute_pending(store, time.time(), buffer=buffer)
+
+
+def next_retry_interval(current: float, remaining: set) -> float:
+    """Reset after success; otherwise exponentially back off to one hour."""
+    if not remaining:
+        return CAL_RETRY_INITIAL_S
+    return min(CAL_RETRY_MAX_S, max(CAL_RETRY_INITIAL_S, current * 2))
+
+
+def should_run_daily(store: CalibrationStore, now: float, last_run: float) -> bool:
     """Fallback daily calibration if scheduler trigger didn't fire.
 
     The primary trigger is the jobManager's pre-prime-calibration job
-    (30min before pod priming). This fallback only fires if no calibration
-    has run in the last 25 hours — covers the case where priming is disabled.
+    (30min before pod priming). This fallback only fires in the configured UTC
+    hour when profiles are at least 23 hours old — daily without duplicate
+    runs inside the same window, including when priming is disabled.
+
+    Gated on PERSISTED profile age, not just the in-memory last_run:
+    last_run starts at 0 on every process start, so without the persisted
+    check every restart re-ran a full recalibration. Also restricted to the
+    DAILY_HOUR UTC window so the fallback fires at the configured quiet hour
+    instead of whenever the process happens to (re)start.
     """
-    if now - last_run < 25 * 3600:
+    if now - last_run < DAILY_MIN_AGE_HOURS * 3600:
         return False
-    # Check if any profile is older than 25h
-    return True
+    if time.gmtime(now).tm_hour != DAILY_HOUR:
+        return False
+    for side in ("left", "right"):
+        for sensor_type in ("capacitance", "piezo", "temperature"):
+            age = store.get_profile_age_hours(side, sensor_type)
+            if age is None or age >= DAILY_MIN_AGE_HOURS:
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -213,48 +337,99 @@ def main() -> None:
 
     store = CalibrationStore(BIOMETRICS_DB)
     watcher = CalibrationWatcher()
-
-    # Run startup calibration if profiles are missing or expired (>48h old)
     now = time.time()
-    for side in ("left", "right"):
-        for sensor_type in ("capacitance", "piezo", "temperature"):
-            profile = store.get_active(side, sensor_type)
-            needs_cal = profile is None
-            if profile and profile.get("expires_at"):
-                needs_cal = profile["expires_at"] < now
-            if needs_cal:
-                run_calibration(store, side, sensor_type, triggered_by="startup")
+    pruned = store.prune_runs(int(now - CAL_RUN_RETENTION_S))
+    if pruned:
+        log.info("Pruned %d expired calibration audit rows", pruned)
+    last_prune = now
 
+    # Select the record source once at startup (no mid-flight switching). On a
+    # new-firmware pod NATS is reachable, so start a bounded live collector the
+    # batch calibrators read from; otherwise stay on the .RAW scan path.
+    nats_buffer = None
+    if wait_for_nats(_shutdown):
+        log.info("NATS reachable — collecting live sensor records for calibration")
+        nats_buffer = NatsRecordBuffer(_shutdown)
+        nats_buffer.start()
+    elif nats_firmware_expected() and not _shutdown.is_set():
+        raise NatsFollowerError(
+            "NATS firmware detected but NATS was unavailable after startup grace")
+    else:
+        log.info("NATS not reachable — calibrating from .RAW scans (%s)", RAW_DATA_DIR)
+
+    # Attempt startup calibration for missing/expired profiles. `remaining` is
+    # what still needs a profile; on a fresh NATS buffer that is everything,
+    # and the retry loop below fills them in as samples accrue.
+    remaining = run_pending_calibrations(store, now, "startup", buffer=nats_buffer)
+    last_retry = time.time()
+    retry_interval = CAL_RETRY_INITIAL_S
     daily_last_run = 0.0
 
     try:
         while not _shutdown.is_set():
+            # A dead NATS collector must not leave us calibrating a stale
+            # buffer forever — exit so systemd restarts and re-probes.
+            if nats_buffer is not None:
+                nats_buffer.raise_if_fatal()
+
             # Check on-demand trigger
             trigger = watcher.check_trigger()
             if trigger:
                 t_side = trigger.get("side", "all")
                 t_type = trigger.get("sensor_type", "all")
 
-                sides = ("left", "right") if t_side == "all" else (t_side,)
-                types = ("capacitance", "piezo", "temperature") if t_type == "all" else (t_type,)
+                sides = CAL_SIDES if t_side == "all" else (t_side,)
+                types = CAL_SENSOR_TYPES if t_type == "all" else (t_type,)
 
                 for s in sides:
                     for st in types:
-                        run_calibration(store, s, st, triggered_by="manual")
+                        run_calibration(store, s, st, triggered_by="manual",
+                                        buffer=nats_buffer)
 
                 watcher.clear_trigger()
+                remaining = compute_pending(
+                    store, time.time(), buffer=nats_buffer)
+                retry_interval = CAL_RETRY_INITIAL_S
+                last_retry = time.time()
 
             # Check daily schedule
             now = time.time()
-            if should_run_daily(now, daily_last_run):
+            if should_run_daily(store, now, daily_last_run):
                 log.info("Running daily calibration")
-                for side in ("left", "right"):
-                    for st in ("capacitance", "piezo", "temperature"):
-                        run_calibration(store, side, st, triggered_by="daily")
+                for side in CAL_SIDES:
+                    for st in CAL_SENSOR_TYPES:
+                        run_calibration(store, side, st, triggered_by="daily",
+                                        buffer=nats_buffer)
                 daily_last_run = now
+                remaining = compute_pending(
+                    store, time.time(), buffer=nats_buffer)
+                retry_interval = CAL_RETRY_INITIAL_S
+                last_retry = time.time()
+
+            if now - last_prune >= CAL_RUN_PRUNE_INTERVAL_S:
+                pruned = store.prune_runs(int(now - CAL_RUN_RETENTION_S))
+                if pruned:
+                    log.info("Pruned %d expired calibration audit rows", pruned)
+                last_prune = now
+
+            # Retry any still-missing/failed profiles as samples accrue.
+            now = time.time()
+            if nats_buffer is not None:
+                remaining |= compute_pending(
+                    store, now, buffer=nats_buffer)
+            if remaining and now - last_retry >= retry_interval:
+                last_retry = now
+                remaining = run_pending_calibrations(store, now, "retry",
+                                                     buffer=nats_buffer)
+                retry_interval = next_retry_interval(retry_interval, remaining)
+                if not remaining:
+                    log.info("All calibration profiles now present")
 
             _shutdown.wait(timeout=10)  # poll every 10s
 
+    except NatsFollowerError as e:
+        log.error("NATS collector lost (%s) — exiting for systemd restart/re-probe", e)
+        sys.exit(1)
     except Exception as e:
         log.exception("Fatal error: %s", e)
         sys.exit(1)

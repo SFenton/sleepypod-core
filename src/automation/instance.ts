@@ -12,6 +12,7 @@ import { db } from '@/src/db'
 import { automationRuns, automations, deviceSettings, runOnceSessions } from '@/src/db/schema'
 import { getSharedHardwareClient } from '@/src/hardware/dacMonitor.instance'
 import { markSideMutated } from '@/src/hardware/deviceStateSync'
+import { shouldBlock as pumpStallShouldBlock } from '@/src/hardware/pumpStallGuard'
 import { withSideLock } from '@/src/hardware/sideLock'
 import { broadcastMutationStatus } from '@/src/streaming/broadcastMutationStatus'
 import { AutomationEngine } from './engine'
@@ -31,6 +32,9 @@ const DEFAULT_TIMEZONE = 'America/Los_Angeles'
 let engineInstance: AutomationEngine | null = null
 let engineInitPromise: Promise<AutomationEngine> | null = null
 let cachedTimezone: string | null = null
+// Read by the engine's clock closure on every tick, so a timezone change
+// takes effect without rebuilding the engine.
+let activeTimezone: string = DEFAULT_TIMEZONE
 
 async function loadTimezone(): Promise<string> {
   if (cachedTimezone) return cachedTimezone
@@ -101,6 +105,7 @@ export async function getAutomationEngine(): Promise<AutomationEngine> {
   engineInitPromise = (async () => {
     try {
       const timezone = await loadTimezone()
+      activeTimezone = timezone
       // DAC status first, biometrics merged on top; the DAC reader stays
       // authoritative for any overlapping key (e.g. water.low).
       const reader = new CompositeSignalReader([
@@ -110,9 +115,10 @@ export async function getAutomationEngine(): Promise<AutomationEngine> {
       const engine = new AutomationEngine({
         signals: reader,
         now: () => Date.now(),
-        clock: () => clockInTimezone(timezone, new Date()),
+        clock: () => clockInTimezone(activeTimezone, new Date()),
         getHardware: () => getSharedHardwareClient(),
         withSideLock,
+        pumpStallShouldBlock,
         broadcast: (side, overlay) => broadcastMutationStatus(side, overlay),
         markMutated: markSideMutated,
         loadRules,
@@ -145,6 +151,18 @@ export async function getAutomationEngine(): Promise<AutomationEngine> {
 
 export function getAutomationEngineIfRunning(): AutomationEngine | null {
   return engineInstance
+}
+
+/**
+ * Propagate a device-settings timezone change to the running engine. The
+ * clock closure reads activeTimezone on every tick, so timeOfDay triggers
+ * evaluate in the new timezone immediately — previously the closure kept the
+ * boot-time tz (and cachedTimezone was never invalidated) until restart.
+ */
+export function updateAutomationTimezone(timezone: string): void {
+  cachedTimezone = timezone
+  activeTimezone = timezone
+  console.log('[automation] timezone updated to', timezone)
 }
 
 export async function shutdownAutomationEngine(): Promise<void> {

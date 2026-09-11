@@ -16,6 +16,7 @@ counts (~1440 rows/day vs 21k if writing every raw sample).
 
 import os
 import sys
+import math
 import time
 import signal
 import logging
@@ -28,8 +29,12 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cbor2
-from common.raw_follower import RawFileFollower
-from common.dialect import normalize_bed_temp
+from common.nats_follower import NatsFollower, create_follower
+from common.dialect import (
+    KNOWN_RECORD_TYPES,
+    normalize_bed_temp,
+    warn_unknown_type_once,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -47,6 +52,42 @@ SLEEPYPOD_DB = Path(os.environ.get(
 
 # Write at most once per 60s per record type
 DOWNSAMPLE_INTERVAL_S = 60
+ENVIRONMENT_NATS_SUBJECTS = ("raw.sens.bedtemp", "raw.frz.temp")
+
+# Timestamp sanity window (mirrors sleep-detector's sanitize_ts)
+MIN_VALID_WALL_CLOCK_TS = 1577836800.0  # 2020-01-01 00:00:00 UTC
+MAX_FUTURE_SKEW_S = 60.0
+
+
+def sanitize_ts(raw_ts, receipt_fallback: bool = False) -> Optional[float]:
+    """Coerce a RAW frame's `ts` field into a sane wall-clock timestamp.
+
+    The downsample cursors seed from MAX(timestamp) at startup, so a single
+    far-future timestamp written to the DB would permanently block all
+    subsequent writes — surviving restarts. The timestamp is invalid when:
+      - the field is missing or not a number
+      - the value is NaN or +/-inf (CBOR-encoded IEEE 754 specials)
+      - the value is < 2020-01-01 epoch (firmware emitted a relative
+        timestamp before establishing wall-clock)
+      - the value is more than MAX_FUTURE_SKEW_S in the future
+
+    Live NATS messages may use receipt time while firmware establishes its
+    clock. Replayable RAW files must reject invalid timestamps so historical
+    frames cannot be rewritten as current readings after a restart.
+    """
+    now = time.time()
+    fallback = now if receipt_fallback else None
+    try:
+        ts = float(raw_ts) if raw_ts is not None else fallback
+    except (TypeError, ValueError):
+        return fallback
+    if ts is None or not math.isfinite(ts):
+        return fallback
+    if ts < MIN_VALID_WALL_CLOCK_TS:
+        return fallback
+    if ts > now + MAX_FUTURE_SKEW_S:
+        return fallback
+    return ts
 
 # Hardware sentinel for "no sensor connected"
 NO_SENSOR = -327.68
@@ -127,7 +168,7 @@ def write_bed_temp(conn: sqlite3.Connection, ts: float, record: dict) -> bool:
     Returns True on a successful insert, False if the record didn't match
     a known dialect (caller should not advance the downsample cursor).
     """
-    canonical = normalize_bed_temp(record)
+    canonical = normalize_bed_temp({**record, "ts": ts})
     if canonical is None:
         return False
 
@@ -217,15 +258,26 @@ def main() -> None:
         sys.exit(1)
 
     db_conn = open_biometrics_db()
-    follower = RawFileFollower(RAW_DATA_DIR, _shutdown, poll_interval=0.5)
+    # Source selected once at startup: NatsFollower on new-firmware pods (NATS
+    # reachable), else the unchanged .RAW tailer. Same decoded-record contract.
+    follower = create_follower(
+        RAW_DATA_DIR,
+        _shutdown,
+        poll_interval=0.5,
+        subjects=ENVIRONMENT_NATS_SUBJECTS,
+    )
+    receipt_fallback = isinstance(follower, NatsFollower)
 
-    # Seed cursors from DB so restarts don't replay already-ingested samples
-    last_bed_write = float(
+    # Seed cursors from DB so restarts don't replay already-ingested samples.
+    # Clamp to now so a DB already poisoned by a far-future timestamp (written
+    # before sanitize_ts existed) self-heals instead of blocking writes forever.
+    now = time.time()
+    last_bed_write = min(now, float(
         db_conn.execute("SELECT COALESCE(MAX(timestamp), 0) FROM bed_temp").fetchone()[0] or 0
-    )
-    last_frz_write = float(
+    ))
+    last_frz_write = min(now, float(
         db_conn.execute("SELECT COALESCE(MAX(timestamp), 0) FROM freezer_temp").fetchone()[0] or 0
-    )
+    ))
 
     report_health("healthy", "environment-monitor started")
 
@@ -234,12 +286,17 @@ def main() -> None:
             if not isinstance(record, dict):
                 continue
             rtype = record.get("type")
+            # Surface genuinely-new firmware types once (blanketReadings, log,
+            # …); known types this module doesn't consume fall through quietly.
+            if not isinstance(rtype, str):
+                continue
+            if rtype not in KNOWN_RECORD_TYPES:
+                warn_unknown_type_once(record, "environment-monitor")
+                continue
             if rtype not in ("bedTemp", "bedTemp2", "frzTemp"):
                 continue
-            try:
-                ts = float(record.get("ts", time.time()))
-            except (TypeError, ValueError):
-                log.warning("Skipping record with invalid ts: %r", record.get("ts"))
+            ts = sanitize_ts(record.get("ts"), receipt_fallback=receipt_fallback)
+            if ts is None:
                 continue
 
             if rtype in ("bedTemp", "bedTemp2"):

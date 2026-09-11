@@ -65,7 +65,12 @@ from typing import Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cbor2
-from common.raw_follower import RawFileFollower
+from common.nats_follower import create_follower
+from common.dialect import (
+    KNOWN_RECORD_TYPES,
+    log_capsense_status_once,
+    warn_unknown_type_once,
+)
 from common.calibration import (
     CalibrationStore,
     is_present_capsense_calibrated,
@@ -478,18 +483,25 @@ class PumpGateCapSense:
     def __init__(self):
         # Per-side pump RPM state from frzHealth records
         self._pump_rpm: Dict[str, float] = {"left": 0.0, "right": 0.0}
-        # Timestamp (monotonic) when pump last turned off — for guard period
-        self._pump_off_at: float = 0.0
-        # Whether pump was active on previous check (for detecting pump-off transition)
-        self._was_pump_active: bool = False
+        # Per-side timestamp (monotonic) when that pump last turned off —
+        # for the guard period. Per-side because gating both beds on either
+        # pump under-counted the movement table during long pump runtimes;
+        # cross-side mechanical coupling is what Signal 2 (correlated
+        # ref-anomaly) exists to catch. -inf = never turned off (0.0 would
+        # falsely gate the first PUMP_GUARD_S after process start, since
+        # time.monotonic() has an arbitrary, possibly near-zero origin).
+        self._pump_off_at: Dict[str, float] = {"left": float("-inf"), "right": float("-inf")}
+        # Whether each pump was active on previous check (for detecting pump-off transition)
+        self._was_pump_active: Dict[str, bool] = {"left": False, "right": False}
         # Reference channel anomaly state
         self._ref_anomaly_active: bool = False
 
     def update_pump_state(self, record: dict) -> None:
-        """Update pump RPM state from a frzHealth or frzTherm record.
+        """Update pump RPM state from a frzHealth or pump-specific record.
 
         frzHealth format: { type: "frzHealth", ts, left: {..., pumpRpm: N}, right: {..., pumpRpm: N}, fan: {...} }
-        frzTherm format:  { type: "frzTherm", ts, left: {..., pumpDuty: N}, right: {..., pumpDuty: N} }
+        frzTherm ``power`` is TEC thermal output, not pump activity. Only
+        explicit pump RPM/duty fields are accepted from that record type.
 
         The exact field names depend on firmware version. We check multiple
         possible field names for robustness.
@@ -501,7 +513,7 @@ class PumpGateCapSense:
             if not isinstance(side_data, dict):
                 continue
 
-            rpm = 0.0
+            rpm = None
             if rtype == "frzHealth":
                 # Try known field names for pump RPM
                 for key in ("pumpRpm", "pump_rpm", "pumpRPM", "rpm"):
@@ -512,20 +524,33 @@ class PumpGateCapSense:
                         except (TypeError, ValueError):
                             pass
                         break
+                # NATS Pod 5 frzHealth nests pump state under side.pump.
+                pump = side_data.get("pump")
+                if rpm is None and isinstance(pump, dict):
+                    val = pump.get("rpm")
+                    if val is not None:
+                        try:
+                            rpm = float(val)
+                        except (TypeError, ValueError):
+                            pass
                 # Also check pumpDuty as fallback — any duty > 0 means pump is running
-                if rpm == 0:
-                    for key in ("pumpDuty", "pump_duty", "duty"):
-                        val = side_data.get(key)
-                        if val is not None:
-                            try:
-                                rpm = 1.0 if float(val) > 0 else 0.0
-                            except (TypeError, ValueError):
-                                pass
-                            break
+                if rpm is None:
+                    duty = next((side_data.get(key) for key in
+                                 ("pumpDuty", "pump_duty", "duty")
+                                 if side_data.get(key) is not None), None)
+                    if duty is None and isinstance(pump, dict):
+                        duty = next((pump.get(key) for key in ("duty", "power")
+                                     if pump.get(key) is not None), None)
+                    if duty is not None:
+                        try:
+                            rpm = 1.0 if float(duty) > 0 else 0.0
+                        except (TypeError, ValueError):
+                            pass
 
             elif rtype == "frzTherm":
-                # frzTherm may carry pump duty cycle
-                for key in ("pumpDuty", "pump_duty", "duty", "pumpRpm", "pump_rpm"):
+                # Never use the captured `power` field here: it is TEC output.
+                for key in ("pumpDuty", "pump_duty", "duty", "pumpRpm",
+                            "pump_rpm"):
                     val = side_data.get(key)
                     if val is not None:
                         try:
@@ -534,14 +559,16 @@ class PumpGateCapSense:
                             pass
                         break
 
-            self._pump_rpm[side] = rpm
+            if rpm is not None:
+                self._pump_rpm[side] = rpm
 
-        # Track pump-off transitions for guard period
-        pump_active = self._pump_rpm["left"] > 0 or self._pump_rpm["right"] > 0
-        if self._was_pump_active and not pump_active:
-            # Pump just turned off — start guard period
-            self._pump_off_at = time.monotonic()
-        self._was_pump_active = pump_active
+        # Track per-side pump-off transitions for the guard period
+        for side in ("left", "right"):
+            pump_active = self._pump_rpm[side] > 0
+            if self._was_pump_active[side] and not pump_active:
+                # This side's pump just turned off — start its guard period
+                self._pump_off_at[side] = time.monotonic()
+            self._was_pump_active[side] = pump_active
 
     def is_gated(self, record: dict, side: str,
                  channel_deltas: Optional[List[float]] = None,
@@ -558,12 +585,15 @@ class PumpGateCapSense:
 
         Returns True if the delta should be suppressed.
         """
-        # Signal 1: frzHealth pump RPM
-        if self._pump_rpm["left"] > 0 or self._pump_rpm["right"] > 0:
+        # Signal 1: frzHealth pump RPM — this side's pump only. Gating both
+        # sides on either pump zeroed real movement on the idle side for the
+        # whole pump runtime; the other pump's mechanical coupling (if any)
+        # is caught by the correlated ref-anomaly check below.
+        if self._pump_rpm.get(side, 0.0) > 0:
             return True
 
         # Signal 3: Guard period (checked before ref anomaly since it's cheap)
-        if time.monotonic() - self._pump_off_at < PUMP_GUARD_S:
+        if time.monotonic() - self._pump_off_at.get(side, float("-inf")) < PUMP_GUARD_S:
             return True
 
         # Signal 2: Reference channel anomaly (capSense2 only)
@@ -616,6 +646,10 @@ class SessionTracker:
     _epoch_scores: deque = field(default_factory=lambda: deque(maxlen=BASELINE_TRAILING_EPOCHS))
     _median_buf: deque = field(default_factory=lambda: deque(maxlen=MEDIAN_FILTER_WINDOW))
     _pump_gated_samples: int = 0  # counter for logging
+    # Sessions closed only by the MAX_SESSION_S cap since the last natural
+    # (absence-timeout) close. Two in a row means the presence signal never
+    # dropped for 32+ hours — a stuck level signal, not a sleeper.
+    _consecutive_cap_closes: int = 0
 
     def process(self, ts: float, record: dict) -> None:
         baselines = self.calibration.get_baselines(self.side)
@@ -736,6 +770,8 @@ class SessionTracker:
                 # avoid emitting absent intervals with end < start
                 close_ts = self._interval_start if self._interval_start is not None else self._last_present_ts
                 self._close_session(close_ts)
+                if self._session_start is None:  # committed — a real exit was seen
+                    self._consecutive_cap_closes = 0
 
         # Safety net: force-close a runaway session that never reaches the
         # absence timeout, capping sleep_duration_seconds at MAX_SESSION_S.
@@ -746,6 +782,16 @@ class SessionTracker:
                 and self._debounced_present
                 and ts - self._session_start.timestamp() >= MAX_SESSION_S):
             self._close_session(self._session_start.timestamp() + MAX_SESSION_S)
+            if self._session_start is None:  # committed — count it, don't spam retries
+                self._consecutive_cap_closes += 1
+                log.warning(
+                    "%s: session force-closed at the %dh cap — presence never dropped (%d consecutive)",
+                    self.side, MAX_SESSION_S // 3600, self._consecutive_cap_closes)
+                if self._consecutive_cap_closes >= 2:
+                    log.warning(
+                        "%s: presence looks stuck-occupied — %d back-to-back sessions closed only at "
+                        "the cap; check capSense2 level deviation vs calibration baseline (/debug)",
+                        self.side, self._consecutive_cap_closes)
 
     def _close_session(self, left_ts: float) -> None:
         if self._session_start is None:
@@ -875,7 +921,9 @@ def main() -> None:
     # side is observed by the other on its next write (no orphaned handles).
     left = SessionTracker(side="left", db=db_holder, calibration=cal_cache, pump_gate=pump_gate)
     right = SessionTracker(side="right", db=db_holder, calibration=cal_cache, pump_gate=pump_gate)
-    follower = RawFileFollower(RAW_DATA_DIR, _shutdown, poll_interval=0.5)
+    # Source selected once at startup: NatsFollower on new-firmware pods (NATS
+    # reachable), else the unchanged .RAW tailer. Same decoded-record contract.
+    follower = create_follower(RAW_DATA_DIR, _shutdown, poll_interval=0.5)
 
     report_health("healthy", "sleep-detector started")
     log.info("Calibration profiles will be loaded from biometrics.db (reload every %ds)", CALIBRATION_RELOAD_S)
@@ -888,7 +936,17 @@ def main() -> None:
 
     try:
         for record in follower.read_records():
+            if not isinstance(record, dict):
+                continue
             rtype = record.get("type")
+
+            # Surface genuinely-new firmware types once (blanketReadings, log,
+            # …) instead of dropping them silently.
+            if not isinstance(rtype, str):
+                continue
+            if rtype not in KNOWN_RECORD_TYPES:
+                warn_unknown_type_once(record, "sleep-detector")
+                continue
 
             # Update pump state from freezer health/thermal records
             if rtype in PUMP_STATE_TYPES:
@@ -897,6 +955,9 @@ def main() -> None:
 
             if rtype not in CAPSENSE_TYPES:
                 continue
+
+            # Record (do not gate on) new-firmware capSense per-side status.
+            log_capsense_status_once(record, "sleep-detector")
 
             ts = sanitize_ts(record.get("ts"))
             left.process(ts, record)

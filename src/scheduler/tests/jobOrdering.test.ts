@@ -56,6 +56,10 @@ vi.mock('@/src/services/autoOffWatcher', () => ({
   cancelAutoOffTimer: (side: 'left' | 'right') => cancelAutoOffTimer(side),
 }))
 
+vi.mock('@/src/hardware/pumpStallGuard', () => ({
+  shouldBlock: () => false,
+}))
+
 // Mock child_process.exec so executeReboot tests never spawn systemctl.
 const execMock = vi.fn<(cmd: string, cb: (err: Error | null) => void) => void>()
 execMock.mockImplementation((_cmd, cb) => cb(null))
@@ -1425,7 +1429,7 @@ describe('JobManager handler closures', () => {
 
     await handler!()
 
-    expect(execMock).toHaveBeenCalledWith('systemctl reboot', expect.any(Function))
+    expect(execMock).toHaveBeenCalledWith('sudo -n systemctl reboot', expect.any(Function))
   })
 
   it('daily-reboot handler surfaces exec failure as a rejected promise', async () => {
@@ -1446,7 +1450,7 @@ describe('JobManager handler closures', () => {
     execMock.mockImplementationOnce((_cmd, cb) => cb(null))
 
     await handler()
-    expect(execMock).toHaveBeenCalledWith('systemctl reboot', expect.any(Function))
+    expect(execMock).toHaveBeenCalledWith('sudo -n systemctl reboot', expect.any(Function))
   })
 
   it('pre-prime-calibration handler writes a trigger file', async () => {

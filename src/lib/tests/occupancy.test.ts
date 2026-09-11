@@ -8,6 +8,18 @@ let movementRows: MovementRow[] = []
 let calRows: CalRow[] = []
 let snapshot: LatestCapSenseSnapshot | null = null
 
+const drizzle = vi.hoisted(() => ({
+  and: vi.fn((...conditions: unknown[]) => ({ op: 'and', conditions })),
+  eq: vi.fn((left: unknown, right: unknown) => ({ op: 'eq', left, right })),
+  gt: vi.fn((left: unknown, right: unknown) => ({ op: 'gt', left, right })),
+  gte: vi.fn((left: unknown, right: unknown) => ({ op: 'gte', left, right })),
+  isNull: vi.fn((column: unknown) => ({ op: 'isNull', column })),
+  or: vi.fn((...conditions: unknown[]) => ({ op: 'or', conditions })),
+  sql: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({ strings: [...strings], values })),
+}))
+
+vi.mock('drizzle-orm', () => drizzle)
+
 const movementAll = vi.fn<() => MovementRow[]>(() => movementRows)
 const calAll = vi.fn<() => CalRow[]>(() => calRows)
 
@@ -37,6 +49,7 @@ vi.mock('@/src/db/biometrics-schema', () => ({
     sensorType: {},
     status: {},
     parameters: {},
+    qualityScore: {},
   },
 }))
 
@@ -53,6 +66,14 @@ const BASELINE_CAL = {
   format: 'capSense2',
   ref: { mean: 1.157 },
 }
+const NAMED_CAPSENSE_CAL = {
+  channels: {
+    out: { mean: 1000, std: 10 },
+    cen: { mean: 2000, std: 20 },
+    in: { mean: 3000, std: 25 },
+  },
+  threshold: 6.0,
+}
 
 function makeFrame(side: 'left' | 'right', values: number[]): LatestCapSenseSnapshot {
   return {
@@ -61,6 +82,17 @@ function makeFrame(side: 'left' | 'right', values: number[]): LatestCapSenseSnap
     receivedAtMs: FIXED_NOW - 500,
     left: side === 'left' ? values : [14.45, 14.45, 13.65, 13.65, 19.3, 19.3, 1.157, 1.157],
     right: side === 'right' ? values : [14.45, 14.45, 13.65, 13.65, 19.3, 19.3, 1.157, 1.157],
+  }
+}
+
+function makeNamedFrame(side: 'left' | 'right', values: number[]): LatestCapSenseSnapshot {
+  const baseline = [1000, 1000, 2000, 2000, 3000, 3000]
+  return {
+    type: 'capSense',
+    ts: Math.floor(FIXED_NOW / 1000),
+    receivedAtMs: FIXED_NOW - 500,
+    left: side === 'left' ? values : baseline,
+    right: side === 'right' ? values : baseline,
   }
 }
 
@@ -73,6 +105,10 @@ describe('getOccupancy', () => {
     snapshot = null
     movementAll.mockClear()
     calAll.mockClear()
+    drizzle.gte.mockClear()
+    drizzle.gt.mockClear()
+    drizzle.isNull.mockClear()
+    drizzle.or.mockClear()
   })
   afterEach(() => {
     vi.useRealTimers()
@@ -86,6 +122,8 @@ describe('getOccupancy', () => {
     expect(r.occupied).toBe(false)
     expect(r.movement.active).toBe(false)
     expect(r.level.active).toBe(false)
+    expect(r.available).toBe(true)
+    expect(drizzle.gt).toHaveBeenCalledWith(expect.anything(), 0)
   })
 
   it('returns occupied=true via the movement signal alone', () => {
@@ -96,6 +134,18 @@ describe('getOccupancy', () => {
     expect(r.movement.peakScore).toBe(350)
     expect(r.level.active).toBe(false)
     expect(r.occupied).toBe(true)
+    expect(r.available).toBe(false)
+  })
+
+  it('queries movement from exactly fifteen minutes ago and treats the threshold as active', () => {
+    movementRows = [{ peak: 50 }]
+
+    const result = getOccupancy('left')
+
+    expect(drizzle.gte).toHaveBeenCalledOnce()
+    expect(drizzle.gte.mock.calls[0]?.[1]).toEqual(new Date(FIXED_NOW - 15 * 60_000))
+    expect(drizzle.sql.mock.calls[0]?.[0]).toEqual(['MAX(', ')'])
+    expect(result.movement).toEqual({ active: true, peakScore: 50 })
   })
 
   it('returns occupied=true via the level signal alone (still occupant)', () => {
@@ -119,6 +169,26 @@ describe('getOccupancy', () => {
     calRows = [{ parameters: BASELINE_CAL }]
     const r = getOccupancy('left')
     expect(r.level.active).toBe(false)
+    expect(r.level.deviation).toBeCloseTo(6, 10)
+    expect(r.level.threshold).toBe(6)
+  })
+
+  it('uses strict greater-than for the calibrated deviation threshold', () => {
+    movementRows = [{ peak: 0 }]
+    snapshot = makeFrame('left', [16.45, 16.45, 15.65, 15.65, 21.3, 21.3])
+    calRows = [{ parameters: BASELINE_CAL }]
+
+    const result = getOccupancy('left')
+    expect(result.level.deviation).toBeCloseTo(6, 10)
+    expect(result.level.active).toBe(false)
+  })
+
+  it('adds all three compensated channel deviations', () => {
+    movementRows = [{ peak: 0 }]
+    snapshot = makeFrame('left', [15.45, 15.45, 15.65, 15.65, 22.3, 22.3])
+    calRows = [{ parameters: BASELINE_CAL }]
+
+    expect(getOccupancy('left').level.deviation).toBeCloseTo(6, 10)
   })
 
   it('ignores stale capSense frames', () => {
@@ -138,6 +208,20 @@ describe('getOccupancy', () => {
     expect(r.occupied).toBe(false)
   })
 
+  it('accepts a capSense frame at the exact thirty-second freshness boundary', () => {
+    movementRows = [{ peak: 0 }]
+    snapshot = {
+      ...makeFrame('left', [25, 25, 23, 23, 30, 30, 1.157, 1.157]),
+      receivedAtMs: FIXED_NOW - 30_000,
+    }
+    calRows = [{ parameters: BASELINE_CAL }]
+
+    const result = getOccupancy('left')
+    expect(result.level.ageMs).toBe(30_000)
+    expect(result.level.deviation).not.toBeNull()
+    expect(result.available).toBe(true)
+  })
+
   it('skips level signal for legacy capSense (Pod 3) frames', () => {
     movementRows = [{ peak: 0 }]
     snapshot = {
@@ -151,6 +235,116 @@ describe('getOccupancy', () => {
     const r = getOccupancy('left')
     expect(r.level.active).toBe(false)
     expect(r.level.deviation).toBeNull()
+    expect(r.level.threshold).toBeNull()
+    expect(calAll).not.toHaveBeenCalled()
+  })
+
+  it('detects named-channel capSense presence with a missing-format calibration', () => {
+    movementRows = [{ peak: 0 }]
+    // Pair averages are 1030/2040/3050 → |z| sum 3 + 2 + 2 = 7.
+    snapshot = makeNamedFrame('left', [1020, 1040, 2020, 2060, 3025, 3075])
+    calRows = [{ parameters: NAMED_CAPSENSE_CAL }]
+
+    const result = getOccupancy('left')
+
+    expect(result.level).toEqual({ active: true, deviation: 7, threshold: 6, ageMs: 500 })
+    expect(result.occupied).toBe(true)
+    expect(result.available).toBe(true)
+  })
+
+  it('accepts an explicit capSense format and keeps the threshold strict', () => {
+    movementRows = [{ peak: 0 }]
+    // |z| sum 2 + 2 + 2 = exactly 6, which is not above the threshold.
+    snapshot = makeNamedFrame('right', [1020, 1020, 2040, 2040, 3050, 3050])
+    calRows = [{ parameters: { ...NAMED_CAPSENSE_CAL, format: 'capSense' } }]
+
+    const result = getOccupancy('right')
+
+    expect(result.level).toEqual({ active: false, deviation: 6, threshold: 6, ageMs: 500 })
+    expect(result.occupied).toBe(false)
+    expect(result.available).toBe(true)
+  })
+
+  it('uses absolute named-channel z-scores for below-baseline presence', () => {
+    movementRows = [{ peak: 0 }]
+    snapshot = makeNamedFrame('left', [970, 970, 1960, 1960, 2950, 2950])
+    calRows = [{ parameters: NAMED_CAPSENSE_CAL }]
+
+    const result = getOccupancy('left')
+
+    expect(result.level.deviation).toBe(7)
+    expect(result.level.active).toBe(true)
+  })
+
+  it('rejects a capSense2 calibration for a named-channel capSense frame', () => {
+    movementRows = [{ peak: 0 }]
+    snapshot = makeNamedFrame('left', [1030, 1030, 2040, 2040, 3050, 3050])
+    calRows = [{ parameters: BASELINE_CAL }]
+
+    const result = getOccupancy('left')
+
+    expect(result.level).toMatchObject({ active: false, deviation: null, threshold: null })
+    expect(result.available).toBe(false)
+  })
+
+  it.each([0, -1, Number.NaN])('rejects named-channel calibration std=%s', (std) => {
+    movementRows = [{ peak: 0 }]
+    snapshot = makeNamedFrame('left', [1030, 1030, 2040, 2040, 3050, 3050])
+    calRows = [{
+      parameters: {
+        ...NAMED_CAPSENSE_CAL,
+        channels: {
+          ...NAMED_CAPSENSE_CAL.channels,
+          cen: { ...NAMED_CAPSENSE_CAL.channels.cen, std },
+        },
+      },
+    }]
+
+    const result = getOccupancy('left')
+
+    expect(result.level).toMatchObject({ active: false, deviation: null, threshold: null })
+    expect(result.available).toBe(false)
+  })
+
+  it('rejects named-channel calibration with a missing channel', () => {
+    movementRows = [{ peak: 0 }]
+    snapshot = makeNamedFrame('left', [1030, 1030, 2040, 2040, 3050, 3050])
+    calRows = [{
+      parameters: {
+        ...NAMED_CAPSENSE_CAL,
+        channels: {
+          ...NAMED_CAPSENSE_CAL.channels,
+          cen: undefined,
+        },
+      },
+    }]
+
+    const result = getOccupancy('left')
+
+    expect(result.level).toMatchObject({ active: false, deviation: null, threshold: null })
+    expect(result.available).toBe(false)
+  })
+
+  it('rejects a non-finite named-channel calibration threshold', () => {
+    movementRows = [{ peak: 0 }]
+    snapshot = makeNamedFrame('left', [1030, 1030, 2040, 2040, 3050, 3050])
+    calRows = [{ parameters: { ...NAMED_CAPSENSE_CAL, threshold: Number.NaN } }]
+
+    const result = getOccupancy('left')
+
+    expect(result.level).toMatchObject({ active: false, deviation: null, threshold: null })
+    expect(result.available).toBe(false)
+  })
+
+  it('rejects non-finite named-channel frame values without marking presence available', () => {
+    movementRows = [{ peak: 0 }]
+    snapshot = makeNamedFrame('left', [Number.NaN, 1000, 2000, 2000, 3000, 3000])
+    calRows = [{ parameters: NAMED_CAPSENSE_CAL }]
+
+    const result = getOccupancy('left')
+
+    expect(result.level).toEqual({ active: false, deviation: null, threshold: 6, ageMs: 500 })
+    expect(result.available).toBe(false)
   })
 
   it('skips level signal when calibration is missing', () => {
@@ -218,6 +412,24 @@ describe('getOccupancy', () => {
     const r = getOccupancy('left')
     expect(r.level.active).toBe(false)
     expect(r.level.threshold).toBeNull()
+  })
+
+  it.each(['B', 'C'] as const)('validates malformed calibration channel %s independently', (channel) => {
+    movementRows = [{ peak: 0 }]
+    snapshot = makeFrame('left', [25, 25, 23, 23, 30, 30, 1.157, 1.157])
+    calRows = [{
+      parameters: {
+        ...BASELINE_CAL,
+        channels: {
+          ...BASELINE_CAL.channels,
+          [channel]: { mean: 'bad' },
+        },
+      },
+    }]
+
+    const result = getOccupancy('left')
+
+    expect(result.level).toMatchObject({ active: false, deviation: null, threshold: null })
   })
 
   it('skips level signal when calibration threshold is missing', () => {

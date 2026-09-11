@@ -17,10 +17,348 @@
 #
 # Requires INSTALL_DIR to be set by the caller.
 
+remove_biometrics_archiver_for_nats() {
+  # A pod can be upgraded from RAW-writing firmware after this module was
+  # already installed. Merely skipping setup would leave frank.service's
+  # WorkingDirectory override, the tmpfs mount, and archive timers enabled.
+  # Remove only Sleepypod-owned artifacts; preserve the cold archive.
+  # Path overrides keep the destructive transition testable without touching
+  # the host. Production callers use these defaults.
+  local systemd_dir="${BIOMETRICS_SYSTEMD_DIR:-/etc/systemd/system}"
+  local local_bin_dir="${BIOMETRICS_LOCAL_BIN_DIR:-/usr/local/bin}"
+  local tmpfs_dir="${BIOMETRICS_TMPFS_DIR:-/persistent/biometrics}"
+  local archiver_bin="${BIOMETRICS_ARCHIVER_BIN:-$local_bin_dir/sleepypod-biometrics-archiver}"
+  local frank_sh="${BIOMETRICS_FRANK_SH:-/opt/eight/bin/frank.sh}"
+  local dropin="$systemd_dir/frank.service.d/sleepypod-biometrics-tmpfs.conf"
+  local restart_frank=false
+  local migration_changed=false
+  local routing_changed=false
+  local frank_routing_backup=""
+  local dropin_routing_backup=""
+  local u
+  local consumer
+  local consumers=(
+    sleepypod-piezo-processor.service
+    sleepypod-sleep-detector.service
+    sleepypod-environment-monitor.service
+    sleepypod-calibrator.service
+    sleepypod-cover-buttons.service
+  )
+  local active_consumers=()
+  local timer
+  local timer_units=(
+    sleepypod-biometrics-archiver.timer
+    sleepypod-biometrics-pruner.timer
+  )
+  local active_timers=()
+
+  restore_previous_firmware_routing() {
+    local restore_failed=false
+    if [ -n "$frank_routing_backup" ] && [ -f "$frank_routing_backup" ]; then
+      if ! cp -pf "$frank_routing_backup" "$frank_sh"; then
+        echo "Error: failed to restore the prior frank.sh routing" >&2
+        restore_failed=true
+      fi
+    fi
+    if [ -n "$dropin_routing_backup" ] && [ -f "$dropin_routing_backup" ]; then
+      mkdir -p "$(dirname "$dropin")"
+      if ! cp -pf "$dropin_routing_backup" "$dropin"; then
+        echo "Error: failed to restore the prior frank.service drop-in" >&2
+        restore_failed=true
+      fi
+    fi
+    if [ "$routing_changed" = true ]; then
+      if ! systemctl daemon-reload 2>/dev/null \
+         || ! systemctl restart frank.service 2>/dev/null; then
+        echo "Error: failed to reactivate the previous firmware RAW routing" >&2
+        restore_failed=true
+      fi
+    fi
+    rm -f "$frank_routing_backup" "$dropin_routing_backup" 2>/dev/null || true
+    [ "$restore_failed" = false ]
+  }
+
+  abort_before_nats_boundary() {
+    if ! restore_previous_firmware_routing; then
+      # If RAW routing cannot be restored, retain the NATS-capable consumers
+      # instead of rolling back to modules that require a detached tmpfs.
+      SLEEPYPOD_NATS_MIGRATION_COMMITTED=true
+    fi
+    restore_biometrics_runtime || true
+  }
+
+  if mountpoint -q "$tmpfs_dir" \
+     || [ -f "$dropin" ] \
+     || [ -f "$systemd_dir/persistent-biometrics.mount" ] \
+     || [ -x "$archiver_bin" ] \
+     || { [ -f "$frank_sh" ] && grep -q 'cd /persistent/biometrics' "$frank_sh"; }; then
+    migration_changed=true
+  fi
+
+  restart_biometrics_consumers() {
+    local service
+    local restart_failed=false
+    for service in "${active_consumers[@]}"; do
+      if ! systemctl restart "$service" 2>/dev/null; then
+        echo "Error: failed to restart $service after NATS firmware cleanup" >&2
+        restart_failed=true
+      fi
+    done
+    [ "$restart_failed" = false ]
+  }
+
+  restore_biometrics_timers() {
+    local service
+    local restore_failed=false
+    for service in "${active_timers[@]}"; do
+      if ! systemctl start "$service" 2>/dev/null; then
+        echo "Error: failed to restore $service after NATS firmware cleanup" >&2
+        restore_failed=true
+      fi
+    done
+    [ "$restore_failed" = false ]
+  }
+
+  restore_biometrics_runtime() {
+    local restore_failed=false
+    restart_biometrics_consumers || restore_failed=true
+    restore_biometrics_timers || restore_failed=true
+    [ "$restore_failed" = false ]
+  }
+
+  # Readers can retain an open descriptor into the tmpfs even after frank
+  # switches to NATS. Stop only services that were active, then restore that
+  # exact set after cleanup (including every failure path).
+  for consumer in "${consumers[@]}"; do
+    if systemctl is-active --quiet "$consumer" 2>/dev/null; then
+      active_consumers+=("$consumer")
+      if ! systemctl stop "$consumer" 2>/dev/null; then
+        echo "Error: failed to stop $consumer before NATS firmware cleanup" >&2
+        restore_biometrics_runtime || true
+        return 1
+      fi
+    fi
+  done
+
+  # Stop timers to prevent concurrent archive/prune work, but leave them
+  # enabled until cleanup succeeds. Failure paths can then restore durability.
+  for timer in "${timer_units[@]}"; do
+    if systemctl is-active --quiet "$timer" 2>/dev/null; then
+      active_timers+=("$timer")
+      if ! systemctl stop "$timer" 2>/dev/null; then
+        echo "Error: failed to stop $timer before NATS firmware cleanup" >&2
+        restore_biometrics_runtime || true
+        return 1
+      fi
+    fi
+  done
+
+  for u in sleepypod-biometrics-archiver.service sleepypod-biometrics-pruner.service \
+           sleepypod-tmpfs-prep.service; do
+    systemctl stop "$u" 2>/dev/null || true
+  done
+
+  # Undo the exact firmware shim edit this helper owns. Prefer the preserved
+  # pre-tmpfs file; reverse the narrow substitution when no backup survived a
+  # firmware upgrade.
+  if [ -f "$frank_sh" ] \
+     && grep -q 'cd /persistent/biometrics' "$frank_sh"; then
+    frank_routing_backup="/tmp/sleepypod-frank-routing.$$"
+    if ! cp -pf "$frank_sh" "$frank_routing_backup"; then
+      echo "Error: failed to back up the current frank.sh routing" >&2
+      restore_biometrics_runtime || true
+      return 1
+    fi
+    local backups newest_backup backup
+    shopt -s nullglob
+    backups=("$frank_sh".bak-pre-tmpfs-*)
+    shopt -u nullglob
+    if [ "${#backups[@]}" -gt 0 ]; then
+      newest_backup=${backups[0]}
+      for backup in "${backups[@]:1}"; do
+        if [ "$backup" -nt "$newest_backup" ]; then
+          newest_backup=$backup
+        fi
+      done
+      if ! cp -f "$newest_backup" "$frank_sh"; then
+        echo "Error: failed to restore $frank_sh from $newest_backup" >&2
+        abort_before_nats_boundary
+        return 1
+      fi
+    else
+      if ! sed -i 's|cd /persistent/biometrics \&\&|cd /persistent \&\&|' \
+        "$frank_sh"; then
+        echo "Error: failed to restore the legacy frank.sh working directory" >&2
+        abort_before_nats_boundary
+        return 1
+      fi
+    fi
+    routing_changed=true
+    if grep -q 'cd /persistent/biometrics' "$frank_sh"; then
+      echo "Error: frank.sh still points at the biometrics tmpfs after restoration" >&2
+      abort_before_nats_boundary
+      return 1
+    fi
+    restart_frank=true
+  fi
+
+  if [ -f "$dropin" ]; then
+    dropin_routing_backup="/tmp/sleepypod-frank-dropin.$$"
+    if ! cp -pf "$dropin" "$dropin_routing_backup"; then
+      echo "Error: failed to back up $dropin" >&2
+      abort_before_nats_boundary
+      return 1
+    fi
+    if ! rm -f "$dropin"; then
+      echo "Error: failed to remove $dropin" >&2
+      abort_before_nats_boundary
+      return 1
+    fi
+    routing_changed=true
+    restart_frank=true
+  fi
+  rmdir "$systemd_dir/frank.service.d" 2>/dev/null || true
+  if ! systemctl daemon-reload 2>/dev/null; then
+    echo "Error: failed to reload systemd before NATS firmware cleanup" >&2
+    abort_before_nats_boundary
+    return 1
+  fi
+
+  # Restart after removing the override so frank releases any cwd held inside
+  # the tmpfs. Always do this for a mounted transition: if an earlier attempt
+  # removed the override but its restart failed, the next attempt must retry.
+  # New firmware resumes publishing to NATS immediately.
+  if [ "$restart_frank" = true ] || mountpoint -q "$tmpfs_dir"; then
+    if ! systemctl restart frank.service 2>/dev/null; then
+      echo "Error: failed to restart frank.service; preserving RAW tmpfs and recovery tools" >&2
+      abort_before_nats_boundary
+      return 1
+    fi
+  fi
+
+  # Preserve every remaining RAW frame before unmounting the volatile tmpfs.
+  # KEEP_RECENT_MIN=-1 includes files younger than the normal 15-minute guard;
+  # frank has already restarted on the NATS path and no longer writes them.
+  local tmpfs_was_mounted=false
+  if mountpoint -q "$tmpfs_dir"; then
+    tmpfs_was_mounted=true
+    if [ -x "$archiver_bin" ] \
+       && ! KEEP_RECENT_MIN=-1 "$archiver_bin"; then
+      echo "Error: failed to archive all remaining tmpfs RAW frames; preserving mount and recovery tools" >&2
+      abort_before_nats_boundary
+      return 1
+    fi
+
+    # The archiver's exit status is the first barrier; this independent check
+    # catches a skipped/missed file before the only volatile copy is unmounted.
+    local raw_file
+    local remaining_raw
+    shopt -s nullglob
+    remaining_raw=("$tmpfs_dir"/*.RAW)
+    shopt -u nullglob
+    for raw_file in "${remaining_raw[@]}"; do
+      [ -f "$raw_file" ] || continue
+      if [ "$(basename "$raw_file")" != "SEQNO.RAW" ]; then
+        echo "Error: unarchived RAW frame remains at $raw_file; preserving mount and recovery tools" >&2
+        abort_before_nats_boundary
+        return 1
+      fi
+    done
+  fi
+
+  # Keep RAW fallback on persistent storage after the legacy mount goes away.
+  # NATS consumers still select NATS first; cover-buttons can safely remain idle
+  # when this firmware supplies no RAW button records.
+  for u in sleepypod sleepypod-piezo-processor sleepypod-sleep-detector \
+           sleepypod-environment-monitor sleepypod-calibrator sleepypod-cover-buttons; do
+    mkdir -p "$systemd_dir/$u.service.d"
+    printf '[Service]\nEnvironment="RAW_DATA_DIR=/persistent"\n' \
+      > "$systemd_dir/$u.service.d/zz-nats-raw-fallback.conf"
+  done
+  systemctl daemon-reload
+
+  if ! systemctl stop persistent-biometrics.mount 2>/dev/null \
+     && [ "$tmpfs_was_mounted" = true ]; then
+    echo "Error: failed to stop persistent-biometrics.mount; preserving recovery tools" >&2
+    abort_before_nats_boundary
+    return 1
+  fi
+  if mountpoint -q "$tmpfs_dir"; then
+    echo "Error: $tmpfs_dir is still mounted; preserving recovery tools" >&2
+    abort_before_nats_boundary
+    return 1
+  fi
+  systemctl disable persistent-biometrics.mount 2>/dev/null || true
+  rm -f "$frank_routing_backup" "$dropin_routing_backup" 2>/dev/null || true
+
+  # The legacy tmpfs is now verified unmounted and firmware no longer depends
+  # on its working-directory override. From this point onward callers must not
+  # roll back to RAW-only consumers, even if deleting a later recovery asset
+  # fails.
+  if [ "$migration_changed" = true ]; then
+    SLEEPYPOD_NATS_MIGRATION_COMMITTED=true
+  fi
+
+  for u in "${timer_units[@]}" sleepypod-biometrics-archiver.service \
+           sleepypod-biometrics-pruner.service sleepypod-tmpfs-prep.service; do
+    systemctl disable "$u" 2>/dev/null || true
+  done
+
+  if ! rm -f "$systemd_dir/sleepypod-biometrics-archiver.service" \
+        "$systemd_dir/sleepypod-biometrics-archiver.timer" \
+        "$systemd_dir/sleepypod-biometrics-pruner.service" \
+        "$systemd_dir/sleepypod-biometrics-pruner.timer" \
+        "$systemd_dir/sleepypod-tmpfs-prep.service" \
+        "$systemd_dir/persistent-biometrics.mount" \
+        "$local_bin_dir/sleepypod-tmpfs-prep" \
+        "$local_bin_dir/sleepypod-biometrics-archiver" \
+        "$local_bin_dir/sleepypod-biometrics-pruner"; then
+    echo "Error: failed to remove one or more legacy RAW recovery assets" >&2
+    restore_biometrics_runtime || true
+    return 1
+  fi
+  if ! systemctl daemon-reload 2>/dev/null; then
+    echo "Error: failed to reload systemd after removing legacy RAW assets" >&2
+    restore_biometrics_runtime || true
+    return 1
+  fi
+
+  if ! restart_biometrics_consumers; then
+    return 1
+  fi
+  echo "biometrics-archiver: removed legacy RAW tmpfs units for NATS firmware (cold archive preserved)"
+}
+
 install_biometrics_archiver() {
   local archiver_src="${INSTALL_DIR:-/home/dac/sleepypod-core}/modules/biometrics-archiver"
 
   if [ ! -d "$archiver_src" ]; then
+    return 0
+  fi
+
+  # New firmware (April 2026+, e.g. rat_version ca35aafa) writes biometric
+  # frames to NATS JetStream stream `raw` (subject raw.>) at
+  # /persistent/jetstream/ instead of /persistent/*.RAW. The whole
+  # tmpfs + cd-patch workflow is inapplicable there; installing the mount
+  # + timers anyway tripped sp-update's set -euo pipefail (a subsequent
+  # `systemctl enable --now <timer>` failure rolled back OTA updates on
+  # Pod 5 with the new firmware). Skip cleanly when NATS is the data path.
+  #
+  # NOTE: `frank.sh` absence is NOT a reliable canary on its own —
+  # frankenfirmware shipped without the shim ~1 year ago, so a large mid-
+  # era population also has no /opt/eight/bin/frank.sh but is still on
+  # the .RAW write path (firmware direct → /persistent/*.RAW). Those pods
+  # depend on the archive/migration loop below to keep eMMC from filling.
+  # Gate on persistent firmware identity, not transient service health. The
+  # server may be restarting during sp-update; an installed unit plus its
+  # JetStream store still identifies the NATS-writing firmware generation.
+  if [ -d /persistent/jetstream ] \
+     && systemctl cat nats-server.service >/dev/null 2>&1; then
+    echo "biometrics-archiver: NATS firmware detected (nats-server installed; /persistent/jetstream present) — removing/skipping RAW tmpfs setup"
+    if ! remove_biometrics_archiver_for_nats; then
+      echo "biometrics-archiver: NATS cleanup stopped to preserve unarchived RAW data" >&2
+      return 1
+    fi
     return 0
   fi
 
@@ -32,48 +370,108 @@ install_biometrics_archiver() {
   # restart below avoids a redundant ~1s biometrics gap on every upgrade.
   local was_mounted=false
   mountpoint -q /persistent/biometrics && was_mounted=true
+  local setup_was_present=false
+  local frank_backup=""
+  if [ "$was_mounted" = true ] \
+     || [ -f /etc/systemd/system/persistent-biometrics.mount ] \
+     || [ -f /etc/systemd/system/frank.service.d/sleepypod-biometrics-tmpfs.conf ]; then
+    setup_was_present=true
+  fi
+
+  rollback_biometrics_archiver_install() {
+    if [ "$setup_was_present" = true ]; then
+      return 0
+    fi
+
+    systemctl stop sleepypod-biometrics-archiver.timer \
+      sleepypod-biometrics-pruner.timer \
+      sleepypod-tmpfs-prep.service 2>/dev/null || true
+    systemctl disable sleepypod-biometrics-archiver.timer \
+      sleepypod-biometrics-pruner.timer 2>/dev/null || true
+
+    if [ -n "$frank_backup" ] && [ -f "$frank_backup" ]; then
+      cp -pf "$frank_backup" /opt/eight/bin/frank.sh 2>/dev/null || true
+    elif [ -f /opt/eight/bin/frank.sh ]; then
+      sed -i 's|cd /persistent/biometrics \&\&|cd /persistent \&\&|' \
+        /opt/eight/bin/frank.sh 2>/dev/null || true
+    fi
+
+    rm -f /etc/systemd/system/frank.service.d/sleepypod-biometrics-tmpfs.conf
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl restart frank.service 2>/dev/null || true
+
+    systemctl stop persistent-biometrics.mount 2>/dev/null || true
+    systemctl disable persistent-biometrics.mount 2>/dev/null || true
+
+    rm -f \
+      /etc/systemd/system/persistent-biometrics.mount \
+      /etc/systemd/system/sleepypod-tmpfs-prep.service \
+      /etc/systemd/system/sleepypod-biometrics-archiver.service \
+      /etc/systemd/system/sleepypod-biometrics-archiver.timer \
+      /etc/systemd/system/sleepypod-biometrics-pruner.service \
+      /etc/systemd/system/sleepypod-biometrics-pruner.timer \
+      /usr/local/bin/sleepypod-tmpfs-prep \
+      /usr/local/bin/sleepypod-biometrics-archiver \
+      /usr/local/bin/sleepypod-biometrics-pruner
+    rmdir /etc/systemd/system/frank.service.d 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+  }
 
   # Scripts
   local s
   for s in sleepypod-tmpfs-prep sleepypod-biometrics-archiver sleepypod-biometrics-pruner; do
-    install -m 0755 "$archiver_src/$s" "/usr/local/bin/$s"
+    if ! install -m 0755 "$archiver_src/$s" "/usr/local/bin/$s"; then
+      rollback_biometrics_archiver_install
+      return 1
+    fi
   done
 
   # Systemd units
-  install -m 0644 "$archiver_src/persistent-biometrics.mount"      /etc/systemd/system/
-  install -m 0644 "$archiver_src/sleepypod-tmpfs-prep.service"     /etc/systemd/system/
-  install -m 0644 "$archiver_src/sleepypod-biometrics-archiver.service" /etc/systemd/system/
-  install -m 0644 "$archiver_src/sleepypod-biometrics-archiver.timer"   /etc/systemd/system/
-  install -m 0644 "$archiver_src/sleepypod-biometrics-pruner.service"   /etc/systemd/system/
-  install -m 0644 "$archiver_src/sleepypod-biometrics-pruner.timer"     /etc/systemd/system/
+  if ! install -m 0644 "$archiver_src/persistent-biometrics.mount" \
+        "$archiver_src/sleepypod-tmpfs-prep.service" \
+        "$archiver_src/sleepypod-biometrics-archiver.service" \
+        "$archiver_src/sleepypod-biometrics-archiver.timer" \
+        "$archiver_src/sleepypod-biometrics-pruner.service" \
+        "$archiver_src/sleepypod-biometrics-pruner.timer" \
+        /etc/systemd/system/; then
+    rollback_biometrics_archiver_install
+    return 1
+  fi
 
   # frank.service drop-in: pull in mount + prep before frankenfirmware execs
   mkdir -p /etc/systemd/system/frank.service.d
-  install -m 0644 "$archiver_src/frank.service.d/sleepypod-biometrics-tmpfs.conf" \
-    /etc/systemd/system/frank.service.d/sleepypod-biometrics-tmpfs.conf
+  if ! install -m 0644 "$archiver_src/frank.service.d/sleepypod-biometrics-tmpfs.conf" \
+    /etc/systemd/system/frank.service.d/sleepypod-biometrics-tmpfs.conf; then
+    rollback_biometrics_archiver_install
+    return 1
+  fi
 
-  systemctl daemon-reload
+  if ! systemctl daemon-reload; then
+    rollback_biometrics_archiver_install
+    return 1
+  fi
 
   # Bring up the mount + symlinks BEFORE patching frank.sh so the cd
   # target exists when frank restarts.
-  systemctl enable --now persistent-biometrics.mount
-  systemctl enable --now sleepypod-tmpfs-prep.service
+  if ! systemctl enable --now persistent-biometrics.mount \
+    || ! systemctl enable --now sleepypod-tmpfs-prep.service; then
+    rollback_biometrics_archiver_install
+    return 1
+  fi
 
   # Patch /opt/eight/bin/frank.sh idempotently. The original is a 12-line
   # firmware shim that does `cd /persistent && exec frankenfirmware`. We
   # need cwd=/persistent/biometrics so RAW frames land in tmpfs.
   if [ -f /opt/eight/bin/frank.sh ]; then
     if ! grep -q 'cd /persistent/biometrics' /opt/eight/bin/frank.sh; then
-      local backup
-      backup="/opt/eight/bin/frank.sh.bak-pre-tmpfs-$(date -u +%Y%m%dT%H%M%SZ)"
-      cp -p /opt/eight/bin/frank.sh "$backup"
-      echo "Backed up frank.sh to $backup"
-      sed -i 's|cd /persistent &&|cd /persistent/biometrics \&\&|' /opt/eight/bin/frank.sh
+      frank_backup="/opt/eight/bin/frank.sh.bak-pre-tmpfs-$(date -u +%Y%m%dT%H%M%SZ)"
+      if ! cp -p /opt/eight/bin/frank.sh "$frank_backup" \
+        || ! sed -i 's|cd /persistent &&|cd /persistent/biometrics \&\&|' /opt/eight/bin/frank.sh; then
+        rollback_biometrics_archiver_install
+        return 1
+      fi
+      echo "Backed up frank.sh to $frank_backup"
       echo "Patched frank.sh: cwd -> /persistent/biometrics"
-      # Guarded — sp-update's rollback trap fires on uncaught failures here
-      # and would leave orphaned systemd units behind while rolling back
-      # only the codebase. Module restarts below use the same guard.
-      systemctl restart frank.service 2>/dev/null || true
     else
       echo "frank.sh already patched — skipping"
     fi
@@ -85,6 +483,15 @@ install_biometrics_archiver() {
     echo "frank.sh absent (newer firmware variant) — relying on systemd WorkingDirectory= to redirect RAW writes"
   fi
 
+  # daemon-reload does not change a running process's cwd. Require frank to
+  # restart successfully after the drop-in/patch is installed before readers
+  # switch to tmpfs or root RAW files are migrated and unlinked.
+  if ! systemctl restart frank.service 2>/dev/null; then
+    echo "Error: frank.service did not adopt the biometrics tmpfs; refusing to migrate RAW files" >&2
+    rollback_biometrics_archiver_install
+    return 1
+  fi
+
   # Restart sleepypod modules so they pick up RAW_DATA_DIR=/persistent/biometrics.
   # Skip if the mount was already established at entry — the caller's own
   # module-sync loop has already restarted them against a correct cwd.
@@ -92,12 +499,18 @@ install_biometrics_archiver() {
     local u
     for u in sleepypod-piezo-processor sleepypod-sleep-detector \
              sleepypod-environment-monitor sleepypod-cover-buttons; do
-      systemctl restart "$u.service" 2>/dev/null || true
+      if ! systemctl restart "$u.service" 2>/dev/null; then
+        rollback_biometrics_archiver_install
+        return 1
+      fi
     done
   fi
 
-  systemctl enable --now sleepypod-biometrics-archiver.timer
-  systemctl enable --now sleepypod-biometrics-pruner.timer
+  if ! systemctl enable --now sleepypod-biometrics-archiver.timer \
+    || ! systemctl enable --now sleepypod-biometrics-pruner.timer; then
+    rollback_biometrics_archiver_install
+    return 1
+  fi
 
   # One-time migration: gzip + relocate any pre-tmpfs RAW files at
   # /persistent root (firmware now writes to /persistent/biometrics, so

@@ -20,6 +20,7 @@ Medical threshold citations:
   - Presence via noise floor: PMC6522616 (BCG adaptive thresholds)
 """
 
+import itertools
 import json
 import math
 import os
@@ -89,10 +90,17 @@ class CalibrationStore:
         return self._conn
 
     def get_active(self, side: str, sensor_type: str) -> Optional[dict]:
-        """Return the active calibration profile or None."""
+        """Return the active, usable calibration profile or None.
+
+        A zero quality score means the candidate failed the calibrator's own
+        quality model. Older profiles may have a NULL score, so retain those
+        for backwards compatibility rather than forcing every upgraded pod to
+        recalibrate immediately.
+        """
         row = self._get_conn().execute(
             """SELECT * FROM calibration_profiles
                WHERE side=? AND sensor_type=? AND status='completed'
+                 AND (quality_score IS NULL OR quality_score > 0)
                ORDER BY created_at DESC LIMIT 1""",
             (side, sensor_type),
         ).fetchone()
@@ -103,6 +111,15 @@ class CalibrationStore:
                        window_start: int, window_end: int,
                        samples: int) -> int:
         """Insert or update the active calibration profile."""
+        # All consumers treat quality <= 0 as the calibrator's rejection
+        # floor. Enforce that invariant here as a final guard for every sensor
+        # dialect so no calibrator can overwrite a usable profile with a
+        # completed-but-inactive row.
+        if not math.isfinite(quality) or quality <= 0:
+            raise ValueError(
+                f"Refusing unusable {side}/{sensor_type} calibration "
+                f"(quality={quality})"
+            )
         now = int(time.time())
         expires = now + 86400 * 2  # 48h expiry
         conn = self._get_conn()
@@ -129,7 +146,14 @@ class CalibrationStore:
             return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     def mark_running(self, side: str, sensor_type: str) -> None:
-        """Mark a calibration as in-progress."""
+        """Mark a calibration as in-progress when no active profile exists.
+
+        A replacement calibration is computed before it is activated. Keep an
+        existing completed profile readable while that work is in flight; the
+        calibration_runs audit table records the eventual outcome.
+        """
+        if self.get_active(side, sensor_type) is not None:
+            return
         now = int(time.time())
         conn = self._get_conn()
         with conn:
@@ -143,7 +167,14 @@ class CalibrationStore:
             )
 
     def mark_failed(self, side: str, sensor_type: str, error: str) -> None:
-        """Mark a calibration as failed."""
+        """Mark a first calibration as failed, preserving an active profile.
+
+        Failed replacements must not take a previously working baseline out of
+        service. The failure itself is still appended to calibration_runs by
+        the caller.
+        """
+        if self.get_active(side, sensor_type) is not None:
+            return
         now = int(time.time())
         conn = self._get_conn()
         with conn:
@@ -177,6 +208,16 @@ class CalibrationStore:
                  duration_ms, triggered_by, error, int(time.time())),
             )
 
+    def prune_runs(self, created_before: int) -> int:
+        """Delete calibration audit rows older than the retention cutoff."""
+        conn = self._get_conn()
+        with conn:
+            cursor = conn.execute(
+                "DELETE FROM calibration_runs WHERE created_at < ?",
+                (created_before,),
+            )
+        return cursor.rowcount
+
     def get_profile_age_hours(self, side: str, sensor_type: str) -> Optional[float]:
         """Hours since last completed calibration, or None if never calibrated."""
         profile = self.get_active(side, sensor_type)
@@ -202,14 +243,18 @@ class CapCalibrator:
     """
 
     LOOKBACK_HOURS = 6
-    MIN_WINDOW_S = 300       # 5 minutes
+    # A complete candidate is required before a profile may become active.
+    # Legacy .RAW capSense is ~1 Hz; the named NATS dialect is ~2 Hz, so this
+    # represents roughly 2.5--5 minutes depending on firmware.
+    MIN_WINDOW_SAMPLES = 300
     CHANNELS = ("out", "cen", "in")
     MIN_STD = 5.0            # prevent division by zero
+    VARIANCE_QUALITY_SCALE = 100000.0
 
     def calibrate(self, records: list, side: str) -> CalibrationResult:
         """
-        Given capSense records, find the quietest 5-min window and compute
-        per-channel mean+std baselines.
+        Given capSense records, find the quietest complete 300-sample window
+        and compute per-channel mean+std baselines.
         """
         if not records:
             raise ValueError("No capSense records available for calibration")
@@ -227,15 +272,20 @@ class CapCalibrator:
             for ch in self.CHANNELS:
                 channels[ch].append(int(data.get(ch, 0)))
 
-        if len(timestamps) < 60:
-            raise ValueError(f"Insufficient capSense data: {len(timestamps)} samples (need ≥60)")
+        if len(timestamps) < self.MIN_WINDOW_SAMPLES:
+            raise ValueError(
+                f"Insufficient capSense data: {len(timestamps)} samples "
+                f"(need ≥{self.MIN_WINDOW_SAMPLES})"
+            )
 
-        # Find quietest 5-minute window (lowest total variance)
+        # Find quietest complete candidate window (lowest total variance).
         best_start = 0
         best_variance = float("inf")
-        window_samples = self.MIN_WINDOW_S  # ~1 sample/sec for capSense
+        window_samples = self.MIN_WINDOW_SAMPLES
 
-        for i in range(len(timestamps) - window_samples):
+        # +1 so the final window is scanned (and a dataset exactly one window
+        # long yields one candidate instead of none) — matches CapSense2Calibrator.
+        for i in range(len(timestamps) - window_samples + 1):
             total_var = 0
             for ch in self.CHANNELS:
                 segment = channels[ch][i:i + window_samples]
@@ -249,7 +299,7 @@ class CapCalibrator:
 
         # Compute baselines from best window
         window_end = min(best_start + window_samples, len(timestamps))
-        baseline = {"channels": {}, "threshold": 6.0}
+        baseline = {"channels": {}, "threshold": 6.0, "format": "capSense"}
 
         for ch in self.CHANNELS:
             segment = channels[ch][best_start:window_end]
@@ -258,12 +308,28 @@ class CapCalibrator:
             std = max(std, self.MIN_STD)
             baseline["channels"][ch] = {"mean": round(mean, 2), "std": round(std, 2)}
 
-        # Quality: lower variance = better baseline (normalize against typical)
-        quality = max(0.0, min(1.0, 1.0 - (best_variance / 100000)))
+        if not math.isfinite(best_variance):
+            raise ValueError("No complete capSense calibration window available")
+        # Quality 0 is the model's rejection floor, not a usable baseline.
+        # Keeping it "completed" makes an occupied/noisy window look normal
+        # and can suppress presence indefinitely. Leave it pending for a later
+        # empty-bed retry instead.
+        quality = max(
+            0.0,
+            min(1.0, 1.0 - (best_variance / self.VARIANCE_QUALITY_SCALE)),
+        )
+        rounded_quality = round(quality, 3)
+        if rounded_quality <= 0:
+            raise ValueError(
+                "No stable capSense calibration window available "
+                f"(variance={best_variance:.1f}, need "
+                f"<{self.VARIANCE_QUALITY_SCALE:.0f}); keep the bed empty and retry"
+            )
 
+        # Quality: lower variance = better baseline (normalize against typical)
         return CalibrationResult(
             params=baseline,
-            quality_score=round(quality, 3),
+            quality_score=rounded_quality,
             window_start=int(timestamps[best_start]),
             window_end=int(timestamps[window_end - 1]),
             samples_used=window_end - best_start,
@@ -307,22 +373,30 @@ class CapSense2Calibrator:
         for rec in records:
             data = rec.get(side, {})
             vals = data.get("values") if data else None
-            if not vals or len(vals) < 8:
+            # Newer Pod 4 / Pod 5 firmware emits 6-value capSense2 frames
+            # (3 sensing pairs, no REF pair). The REF pair (indices 6-7) is
+            # optional — mirror sleep-detector._extract_channel_values, which
+            # accepts >=6 and uses the REF pair only when present.
+            if not vals or len(vals) < 6:
                 continue
             ts = float(rec.get("ts", 0))
             timestamps.append(ts)
             for name, ia, ib in self.SENSE_PAIRS:
                 channels[name].append((vals[ia] + vals[ib]) / 2.0)
-            rn, ria, rib = self.REF_PAIR
-            channels["REF"].append((vals[ria] + vals[rib]) / 2.0)
+            if len(vals) >= 8:
+                rn, ria, rib = self.REF_PAIR
+                channels["REF"].append((vals[ria] + vals[rib]) / 2.0)
+            else:
+                channels["REF"].append(None)  # keep aligned with timestamps
 
-        if len(timestamps) < 60:
+        if len(timestamps) < self.MIN_WINDOW_SAMPLES:
             raise ValueError(
-                f"Insufficient capSense2 data: {len(timestamps)} samples (need >= 60)"
+                f"Insufficient capSense2 data: {len(timestamps)} samples "
+                f"(need >= {self.MIN_WINDOW_SAMPLES})"
             )
 
         # Find quietest 5-min window across sensing channels only
-        window = min(self.MIN_WINDOW_SAMPLES, len(timestamps))
+        window = self.MIN_WINDOW_SAMPLES
         best_start = 0
         best_variance = float("inf")
         sense_names = [name for name, _, _ in self.SENSE_PAIRS]
@@ -349,11 +423,14 @@ class CapSense2Calibrator:
             std = max(std, self.MIN_STD)
             baseline["channels"][name] = {"mean": round(m, 4), "std": round(std, 4)}
 
-        # Store REF baseline for drift compensation
-        ref_seg = channels["REF"][best_start:window_end]
-        ref_mean = sum(ref_seg) / len(ref_seg)
-        ref_std = math.sqrt(sum((x - ref_mean) ** 2 for x in ref_seg) / len(ref_seg))
-        baseline["ref"] = {"mean": round(ref_mean, 4), "std": round(max(ref_std, 0.001), 4)}
+        # Store REF baseline for drift compensation — only when the firmware
+        # actually emits the reference pair (8-value frames). Consumers treat
+        # `ref` as optional, so omitting it on 6-value firmware is safe.
+        ref_seg = [v for v in channels["REF"][best_start:window_end] if v is not None]
+        if ref_seg:
+            ref_mean = sum(ref_seg) / len(ref_seg)
+            ref_std = math.sqrt(sum((x - ref_mean) ** 2 for x in ref_seg) / len(ref_seg))
+            baseline["ref"] = {"mean": round(ref_mean, 4), "std": round(max(ref_std, 0.001), 4)}
 
         # Quality: lower variance = better baseline
         # capSense2 floats are ~10-30 range, so normalize differently than capSense ints
@@ -718,18 +795,38 @@ def is_present_capsense_calibrated(
     return z_sum > threshold
 
 
+# Nominal capSense2 reference-channel value used when a profile predates the
+# stored `ref` baseline. Must match REF_NOMINAL in src/lib/occupancy.ts.
+CAPSENSE2_REF_NOMINAL = 1.16
+
+
 def is_present_capsense2_calibrated(
     record: dict, side: str, baselines: Optional[dict],
     fallback_threshold: float = 60.0,
 ) -> bool:
-    """Z-score based presence detection for capSense2 (Pod 5).
+    """Presence detection for capSense2 (Pod 4/5).
 
-    Uses the averaged A/B/C channel pairs against calibrated baselines.
-    Falls back to raw sum threshold if no calibration available.
+    Mirrors the Node occupancy sensor (src/lib/occupancy.ts readLevelSignal):
+    summed SIGNED per-channel deviation from the calibrated baseline in RAW
+    units, with reference-channel drift compensation when the frame carries
+    the optional REF pair. `threshold` in the profile is in raw units.
+
+    History: this used to be a z-score check (|val-mean|/std with std floored
+    at 0.05). On firmware whose channel values run in the hundreds, the
+    quietest-window std lands at the floor, so a fraction of a raw unit of
+    thermal drift read as z >> threshold — presence saturated 24/7, sessions
+    only ever closed at the MAX_SESSION_S cap, and a *better* (quieter)
+    calibration made the trigger finer, not coarser. Raw-unit deviation with
+    ref compensation cancels the drift and keeps this check and Node
+    getOccupancy() in agreement on the same stored profile.
+
+    Falls back to a raw sum threshold if no calibration available.
     """
     data = record.get(side, {})
     vals = data.get("values") if data else None
-    if not vals or len(vals) < 8:
+    # Accept 6-value frames (newer firmware drops the optional REF pair).
+    # Only indices 0-5 (A/B/C sensing pairs) are used below.
+    if not vals or len(vals) < 6:
         return False
 
     if baselines is None or baselines.get("format") != "capSense2":
@@ -737,19 +834,22 @@ def is_present_capsense2_calibrated(
         total = sum((vals[i] + vals[i + 1]) / 2.0 for i in (0, 2, 4))
         return total > fallback_threshold
 
-    z_sum = 0.0
+    ref_delta = 0.0
+    if len(vals) >= 8:
+        ref = (vals[6] + vals[7]) / 2.0
+        ref_cal = baselines.get("ref") or {}
+        ref_delta = ref - float(ref_cal.get("mean", CAPSENSE2_REF_NOMINAL))
+
+    deviation = 0.0
     channels = baselines.get("channels", {})
     sense_pairs = (("A", 0, 1), ("B", 2, 3), ("C", 4, 5))
     for name, ia, ib in sense_pairs:
         val = (vals[ia] + vals[ib]) / 2.0
-        ch_cal = channels.get(name, {})
-        std = ch_cal.get("std", 0.05)
-        mean = ch_cal.get("mean", 0)
-        if std > 0:
-            z_sum += abs((val - mean) / std)
+        mean = float(channels.get(name, {}).get("mean", 0))
+        deviation += val - ref_delta - mean
 
-    threshold = baselines.get("threshold", 6.0)
-    return z_sum > threshold
+    threshold = float(baselines.get("threshold", 6.0))
+    return deviation > threshold
 
 
 def is_present_piezo_calibrated(
@@ -764,6 +864,15 @@ def is_present_piezo_calibrated(
 
 # ── CalibrationWatcher ──
 
+def _trigger_sort_key(path: Path) -> tuple:
+    """Order timestamp/PID/counter numerically, including legacy queued files.
+
+    The bare legacy trigger has no numeric suffix and sorts first. Within a
+    writer's same-millisecond requests, counter 9 must precede counter 10.
+    """
+    return tuple(int(part) for part in path.name.split(".")[2:] if part.isdecimal())
+
+
 class CalibrationWatcher:
     """Watch for calibration trigger files written by tRPC.
 
@@ -777,11 +886,16 @@ class CalibrationWatcher:
         try:
             # Check for queued triggers (*.trigger files)
             trigger_dir = TRIGGER_PATH.parent
-            triggers = sorted(trigger_dir.glob(".calibrate-trigger*"))
+            triggers = sorted(trigger_dir.glob(".calibrate-trigger*"), key=_trigger_sort_key)
             triggers = [t for t in triggers if not t.suffix == ".tmp"]
             if not triggers:
                 return None
             data = json.loads(triggers[0].read_text())
+            if not isinstance(data, dict):
+                # Valid JSON but not an object — consumers call .get() on it
+                # and would crash-loop on the same file after every restart.
+                triggers[0].unlink(missing_ok=True)
+                return None
             return data
         except (json.JSONDecodeError, OSError):
             # Corrupt trigger file — remove it
@@ -795,7 +909,7 @@ class CalibrationWatcher:
         """Delete the oldest trigger file after calibration completes."""
         try:
             trigger_dir = TRIGGER_PATH.parent
-            triggers = sorted(trigger_dir.glob(".calibrate-trigger*"))
+            triggers = sorted(trigger_dir.glob(".calibrate-trigger*"), key=_trigger_sort_key)
             triggers = [t for t in triggers if not t.suffix == ".tmp"]
             if triggers:
                 triggers[0].unlink(missing_ok=True)
@@ -803,14 +917,31 @@ class CalibrationWatcher:
             pass
 
 
+_trigger_seq = itertools.count()
+
+
 def write_trigger_atomic(payload: dict) -> None:
     """Write a calibration trigger file atomically.
 
-    Uses write-to-tmp-then-rename to prevent partial reads.
-    Each trigger gets a unique filename to support queuing.
+    Uses write-to-tmp-then-rename to prevent partial reads. The
+    pid + counter uniquifier keeps concurrent writers from colliding on a
+    same-millisecond timestamp — and from sharing a tmp path (the old
+    with_suffix(".tmp") collapsed every trigger's tmp file to one name).
+    fsync of the file and its directory make the rename durable, so a power
+    cut can't leave a truncated trigger that check_trigger then deletes,
+    silently dropping the request.
     """
     ts = int(time.time() * 1000)
-    target = TRIGGER_PATH.parent / f".calibrate-trigger.{ts}"
-    tmp = target.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload))
+    unique = f"{ts}.{os.getpid()}.{next(_trigger_seq)}"
+    target = TRIGGER_PATH.parent / f".calibrate-trigger.{unique}"
+    tmp = TRIGGER_PATH.parent / f".calibrate-trigger.{unique}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(payload))
+        f.flush()
+        os.fsync(f.fileno())
     tmp.rename(target)
+    dir_fd = os.open(str(TRIGGER_PATH.parent), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)

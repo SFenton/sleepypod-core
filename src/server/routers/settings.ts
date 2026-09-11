@@ -121,9 +121,10 @@ const getAllSettingsResponse = z.object({
   }),
 })
 import { getJobManager } from '@/src/scheduler'
+import { updateAutomationTimezone } from '@/src/automation/instance'
 import { startKeepalive, stopKeepalive } from '@/src/services/temperatureKeepalive'
 import { restartAutoOffTimers } from '@/src/services/autoOffWatcher'
-import { invalidateGuardSettingsCache } from '@/src/hardware/pumpStallGuard'
+import { invalidateGuardSettingsCache, standDown as standDownPumpStallGuard } from '@/src/hardware/pumpStallGuard'
 
 const REBOOT_KEYS = ['rebootDaily', 'rebootTime'] as const
 const PRIME_KEYS = ['primePodDaily', 'primePodTime'] as const
@@ -181,6 +182,9 @@ async function applySettingsSchedulerChanges(input: Record<string, unknown>): Pr
   if (tzChanged) {
     // Full reload — every cron job rebinds against the new tz.
     await jobManager.updateTimezone(input.timezone as string)
+    // The automation engine's clock closure must follow too, or timeOfDay
+    // triggers keep firing in the boot-time timezone until restart.
+    updateAutomationTimezone(input.timezone as string)
     return
   }
 
@@ -345,6 +349,11 @@ export const settingsRouter = router({
           priorHomekitEnabled = Boolean(prevRow?.homekitEnabled)
         }
 
+        // Captured from the transaction's own current row (not a separate
+        // pre-transaction read) so the disable-edge decision below cannot
+        // race a concurrent settings mutation.
+        let priorPumpStallProtectionEnabled = false
+
         const updated = db.transaction((tx) => {
           // Fetch current settings to validate final computed state
           const [current] = tx
@@ -360,6 +369,8 @@ export const settingsRouter = router({
               message: 'Device settings not found',
             })
           }
+
+          priorPumpStallProtectionEnabled = Boolean(current.pumpStallProtectionEnabled)
 
           // Compute final state after update
           const finalRebootDaily = input.rebootDaily ?? current.rebootDaily
@@ -398,6 +409,23 @@ export const settingsRouter = router({
 
           return result
         })
+
+        // Disabling stall protection must also stand down the guard:
+        // onFrame's disabled branch clears the block per frame but leaves
+        // the banner notice up and the alert rows active-invisible — the
+        // banner then outlives the feature, and the rows resurrect a block
+        // at the first restart after a re-enable. Runs immediately after
+        // the commit (before the scheduler/LED awaits) so no concurrent
+        // mutation or guard frame can interleave with the decision.
+        if (input.pumpStallProtectionEnabled === false && priorPumpStallProtectionEnabled) {
+          invalidateGuardSettingsCache()
+          try {
+            await standDownPumpStallGuard()
+          }
+          catch (e) {
+            console.error('pump stall guard stand-down failed:', e)
+          }
+        }
 
         try {
           await applySettingsSchedulerChanges(input)

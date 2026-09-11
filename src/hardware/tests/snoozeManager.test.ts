@@ -134,7 +134,6 @@ describe('AlarmLifecycleController', () => {
     client.setAlarm.mockClear()
     await vi.advanceTimersByTimeAsync(180_000)
     expect(client.setAlarm).not.toHaveBeenCalled()
-
     await vi.advanceTimersByTimeAsync(120_000)
     expect(client.setAlarm).toHaveBeenCalledOnce()
   })
@@ -297,5 +296,17 @@ describe('AlarmLifecycleController', () => {
   it.each(['left', 'right'] satisfies Side[])('uses the side-specific hardware clear for stop on %s', async (side) => {
     await controller.stop(side)
     expect(client.clearAlarm).toHaveBeenCalledWith(side)
+  })
+
+  it('clamps delays to the signed 32-bit setTimeout ceiling', async () => {
+    vi.setSystemTime(0)
+    const maxSeconds = Math.floor((2 ** 31 - 1) / 1000)
+
+    await controller.start('right', { ...CONFIG, duration: 0 })
+    const status = await controller.snooze('right', Number.MAX_SAFE_INTEGER)
+
+    expect(status?.snoozeUntil).toBe(maxSeconds)
+    expect(controller.getStatus('right').snoozeUntil).toBe(maxSeconds)
+    expect(vi.getTimerCount()).toBe(1)
   })
 })

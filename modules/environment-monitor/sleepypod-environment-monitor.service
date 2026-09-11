@@ -1,7 +1,9 @@
 [Unit]
 Description=SleepyPod Environment Monitor (Bed and Freezer Temperatures)
 Documentation=https://github.com/sleepypod/core/tree/main/modules/environment-monitor
-After=network.target sleepypod.service
+# Order after nats-server on new-firmware pods; a no-op ordering where that
+# unit is absent (old-shim / mid-era pods keep the .RAW path).
+After=network.target sleepypod.service nats-server.service
 Wants=sleepypod.service
 
 [Service]
@@ -19,8 +21,9 @@ Environment="RAW_DATA_DIR=/persistent/biometrics"
 Environment="DATABASE_URL=file:/persistent/sleepypod-data/sleepypod.db"
 Environment="BIOMETRICS_DATABASE_URL=file:/persistent/sleepypod-data/biometrics.db"
 
-# Resource limits
-MemoryMax=32M
+# Resource limits. nats-py + asyncio add roughly 10 MiB over the RAW-only
+# runtime; leave headroom for SQLite caches and decoded temperature frames.
+MemoryMax=64M
 CPUQuota=10%
 
 # Sandboxing

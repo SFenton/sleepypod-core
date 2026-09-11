@@ -56,6 +56,7 @@ const broadcastMock = vi.fn()
 
 vi.mock('@/src/hardware/dacMonitor.instance', () => ({ getSharedHardwareClient: () => hardwareClient }))
 vi.mock('@/src/hardware/deviceStateSync', () => ({ markSideMutated: markSideMutatedMock }))
+vi.mock('@/src/hardware/pumpStallGuard', () => ({ shouldBlock: () => false }))
 vi.mock('@/src/hardware/sideLock', () => ({ withSideLock: async (_side: any, fn: () => Promise<any>) => fn() }))
 vi.mock('@/src/streaming/broadcastMutationStatus', () => ({ broadcastMutationStatus: broadcastMock }))
 vi.mock('drizzle-orm', () => ({ and: (...a: any[]) => ({ a }), eq: (...a: any[]) => ({ a }), gt: (...a: any[]) => ({ a }) }))
@@ -179,6 +180,29 @@ describe('automation/instance — kill-switch restore', () => {
     const mod = await freshModule()
     await mod.getAutomationEngine()
     expect(setGlobalEnabledMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('automation/instance — updateAutomationTimezone', () => {
+  it('the clock closure follows a timezone change without engine rebuild', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    selectImpl = async () => [{ timezone: 'UTC', on: true }]
+    const mod = await freshModule()
+    await mod.getAutomationEngine()
+
+    const { clockInTimezone } = await import('../signals')
+    const clockSpy = vi.mocked(clockInTimezone)
+    clockSpy.mockClear()
+
+    capturedDeps.clock()
+    expect(clockSpy).toHaveBeenLastCalledWith('UTC', expect.any(Date))
+
+    // Settings change: the engine's clock must evaluate in the new tz on the
+    // very next tick — previously the closure kept the boot-time timezone.
+    mod.updateAutomationTimezone('Australia/Sydney')
+    capturedDeps.clock()
+    expect(clockSpy).toHaveBeenLastCalledWith('Australia/Sydney', expect.any(Date))
+    log.mockRestore()
   })
 })
 

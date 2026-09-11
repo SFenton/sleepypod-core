@@ -1,6 +1,9 @@
 import type { HardwareClient } from './client'
 import { MAX_TEMP, MIN_TEMP, TEMP_NEUTRAL, type Side } from './types'
 import type { GestureEvent } from './dacMonitor'
+import { getAutomationEngineIfRunning } from '@/src/automation'
+import { shouldBlock as pumpStallShouldBlock } from './pumpStallGuard'
+import { withSideLock } from '@/src/hardware/sideLock'
 import { getAlarmStatus, snoozeAlarm, stopAlarm } from './snoozeManager'
 
 // Re-export for callers that need to build deps
@@ -95,15 +98,22 @@ export class GestureActionHandler {
     const delta = gesture.temperatureChange === 'increment' ? amount : -amount
     const newTemp = Math.min(MAX_TEMP, Math.max(MIN_TEMP, currentTemp + delta))
 
-    const client = this.deps.newHardwareClient(this.socketPath)
-    try {
-      await client.connect()
-      await client.setTemperature(event.side, newTemp)
-      await this.deps.recordTemperatureChange?.(event.side, newTemp)
-    }
-    finally {
-      client.disconnect()
-    }
+    await withSideLock(event.side, async () => {
+      if (pumpStallShouldBlock(event.side)) {
+        console.warn(`[gestureActionHandler] skipped setTemperature: pump stall guard blocks ${event.side}`)
+        return
+      }
+      const client = this.deps.newHardwareClient(this.socketPath)
+      try {
+        getAutomationEngineIfRunning()?.registerManualOverride(event.side)
+        await client.connect()
+        await client.setTemperature(event.side, newTemp)
+        await this.deps.recordTemperatureChange?.(event.side, newTemp)
+      }
+      finally {
+        client.disconnect()
+      }
+    })
   }
 
   private handleAlarmAction = async (
@@ -144,14 +154,21 @@ export class GestureActionHandler {
         // across off-cycles instead of landing on the firmware-default
         // fallback in DacHardwareClient.setPower.
         const target = state?.targetTemperature ?? TEMP_NEUTRAL
-        const client = this.deps.newHardwareClient(this.socketPath)
-        try {
-          await client.connect()
-          await client.setPower(event.side, nextPowered, nextPowered ? target : undefined)
-        }
-        finally {
-          client.disconnect()
-        }
+        await withSideLock(event.side, async () => {
+          if (nextPowered && pumpStallShouldBlock(event.side)) {
+            console.warn(`[gestureActionHandler] skipped power-on: pump stall guard blocks ${event.side}`)
+            return
+          }
+          const client = this.deps.newHardwareClient(this.socketPath)
+          try {
+            getAutomationEngineIfRunning()?.registerManualOverride(event.side)
+            await client.connect()
+            await client.setPower(event.side, nextPowered, nextPowered ? target : undefined)
+          }
+          finally {
+            client.disconnect()
+          }
+        })
       }
       // alarmInactiveBehavior === 'none': no-op
     }

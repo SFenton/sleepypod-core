@@ -25,6 +25,7 @@ import { GestureActionHandler } from './gestureActionHandler'
 import { defaultGestureActionDeps } from './gestureActionHandler.deps'
 import { DeviceStateSync } from './deviceStateSync'
 import { trackPrimingState, resetPrimingState, getPrimeCompletedAt } from './primeNotification'
+import { getAllPumpStallNotices } from './pumpStallNotification'
 import { getAlarmStatus, getSnoozeStatus } from './snoozeManager'
 import { clearSharedHardwareClient, getSharedHardwareClient } from './sharedClient'
 import type { Side } from './types'
@@ -265,6 +266,7 @@ export const getDacMonitor = async (): Promise<DacMonitor> => {
         // Dynamic import to avoid circular dependency (piezoStream is started separately)
         import('../streaming/piezoStream').then(({ broadcastFrame }) => {
           const primeCompletedAt = getPrimeCompletedAt()
+          const stallNotices = getAllPumpStallNotices()
           const leftAlarm = getAlarmStatus('left')
           const rightAlarm = getAlarmStatus('right')
           broadcastFrame({
@@ -275,6 +277,7 @@ export const getDacMonitor = async (): Promise<DacMonitor> => {
             waterLevel: status.waterLevel,
             isPriming: status.isPriming,
             ...(primeCompletedAt && { primeCompletedNotification: { timestamp: primeCompletedAt } }),
+            ...((stallNotices.left || stallNotices.right) && { pumpStallNotifications: stallNotices }),
             snooze: {
               left: getSnoozeStatus('left'),
               right: getSnoozeStatus('right'),

@@ -25,6 +25,8 @@ node_modules
 # Testing
 test-results
 coverage
+.coverage
+.coverage.*
 .stryker-tmp
 reports/mutation
 
@@ -32,6 +34,10 @@ reports/mutation
 sleepypod.dev.db
 sleepypod.dev.db-shm
 sleepypod.dev.db-wal
+# biometrics.dev.db itself stays tracked (intentional dev fixture); the WAL/SHM
+# sidecars are transient per-machine state and must not be committed.
+biometrics.dev.db-shm
+biometrics.dev.db-wal
 
 # SQLite test/local databases
 sleepypod.test.db
@@ -55,3 +61,4 @@ sleepypod.local.db-wal
 # SQLite databases (local)
 *.db
 .reviews/
+__pycache__/
