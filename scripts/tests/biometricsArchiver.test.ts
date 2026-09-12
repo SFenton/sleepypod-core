@@ -217,6 +217,19 @@ describe('module deployment guards', () => {
     expect(helper.slice(requiredRestart, consumerRestart)).not.toContain('|| true')
   })
 
+  it('keeps the occupancy study recorder outside mandatory module health gates', () => {
+    const install = readFileSync(installScript, 'utf8')
+
+    expect(install).toContain('INSTALL_OPTIONAL_MODULE_NAMES+=("$name")')
+    expect(install).toContain('for name in "${INSTALL_REQUIRED_MODULE_NAMES[@]}"; do')
+    expect(install).toContain(
+      'Warning: optional module $name did not start; core biometrics installation will continue',
+    )
+    expect(install).toContain(
+      'Warning: optional module $name is not active; occupancy behavior is unchanged',
+    )
+  })
+
   it('rolls a fresh RAW tmpfs setup back when mandatory firmware restart fails', () => {
     const helper = readFileSync(helperPath, 'utf8')
     const rollback = helper.indexOf('rollback_biometrics_archiver_install()')

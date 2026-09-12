@@ -1,0 +1,40 @@
+[Unit]
+Description=SleepyPod Occupancy Study Recorder
+Documentation=https://github.com/SFenton/sleepypod-core/blob/dev/docs/occupancy-study.md
+After=network.target nats-server.service
+Wants=nats-server.service
+ConditionPathIsDirectory=/persistent/jetstream
+
+[Service]
+Type=simple
+User=dac
+SupplementaryGroups=sleepypod
+UMask=0077
+WorkingDirectory=/opt/sleepypod/modules/occupancy-study-recorder
+ExecStart=/opt/sleepypod/modules/occupancy-study-recorder/.venv/bin/python main.py record
+Restart=on-failure
+RestartSec=15
+
+EnvironmentFile=-/etc/sleepypod/modules/occupancy-study-recorder.env
+Environment="OCCUPANCY_STUDY_DIR=/persistent/sleepypod-data/occupancy-study"
+Environment="BIOMETRICS_DATABASE_URL=file:/persistent/sleepypod-data/biometrics.db"
+Environment="OCCUPANCY_STUDY_RETENTION_DAYS=10"
+Environment="OCCUPANCY_STUDY_MAX_BYTES=4294967296"
+
+MemoryMax=96M
+CPUQuota=35%
+Nice=10
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ReadOnlyPaths=/persistent
+ReadWritePaths=/persistent/sleepypod-data/occupancy-study
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

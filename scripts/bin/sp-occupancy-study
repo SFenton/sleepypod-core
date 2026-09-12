@@ -1,0 +1,22 @@
+#!/bin/bash
+set -euo pipefail
+
+DATA_DIR="/persistent/sleepypod-data"
+if [ -r /etc/sleepypod/data-dir ] && [ -s /etc/sleepypod/data-dir ]; then
+  DATA_DIR="$(cat /etc/sleepypod/data-dir)"
+fi
+
+MODULE_DIR="/opt/sleepypod/modules/occupancy-study-recorder"
+PYTHON="$MODULE_DIR/.venv/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  echo "Error: occupancy-study recorder is not installed" >&2
+  exit 1
+fi
+
+export OCCUPANCY_STUDY_DIR="$DATA_DIR/occupancy-study"
+export BIOMETRICS_DATABASE_URL="file:$DATA_DIR/biometrics.db"
+
+if [ "$#" -eq 0 ]; then
+  set -- status
+fi
+exec "$PYTHON" "$MODULE_DIR/main.py" "$@"

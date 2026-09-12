@@ -865,6 +865,9 @@ rm -f "$SUDOERS_TMP"
 mkdir -p "$DATA_DIR"
 chown root:sleepypod "$DATA_DIR"
 chmod 2770 "$DATA_DIR"
+mkdir -p "$DATA_DIR/occupancy-study"
+chown root:sleepypod "$DATA_DIR/occupancy-study"
+chmod 2770 "$DATA_DIR/occupancy-study"
 
 # Fix permissions on existing database files (upgrades from older installs)
 fix_db_permissions() {
@@ -1677,6 +1680,8 @@ else
   INSTALL_MODULE_STAGE=$(mktemp -d "$MODULES_DEST/.install-stage.XXXXXX")
   INSTALL_MODULE_BACKUP=$(mktemp -d "$MODULES_DEST/.install-backup.XXXXXX")
   INSTALL_MODULE_NAMES=()
+  INSTALL_REQUIRED_MODULE_NAMES=()
+  INSTALL_OPTIONAL_MODULE_NAMES=()
   INSTALL_SWAPPED_MODULES=()
   INSTALL_ACTIVE_MODULES=()
   INSTALL_COMMON_SWAPPED=false
@@ -1715,8 +1720,20 @@ else
     done
   }
 
-  # Build every venv before touching the live module tree.
-  for name in piezo-processor sleep-detector environment-monitor calibrator cover-buttons; do
+  # Build every venv before touching the live module tree. The occupancy-study
+  # recorder is NATS-only and must not become a restart loop on RAW firmware.
+  INSTALL_MODULE_CANDIDATES=(
+    piezo-processor
+    sleep-detector
+    environment-monitor
+    calibrator
+    cover-buttons
+  )
+  if [ -d /persistent/jetstream ] \
+     && systemctl cat nats-server.service >/dev/null 2>&1; then
+    INSTALL_MODULE_CANDIDATES+=(occupancy-study-recorder)
+  fi
+  for name in "${INSTALL_MODULE_CANDIDATES[@]}"; do
     src="$MODULES_SRC/$name"
     if [ ! -d "$src" ]; then
       echo "Warning: module source not found at $src, skipping"
@@ -1724,6 +1741,11 @@ else
     fi
     echo "Staging module: $name..."
     INSTALL_MODULE_NAMES+=("$name")
+    if [ "$name" = "occupancy-study-recorder" ]; then
+      INSTALL_OPTIONAL_MODULE_NAMES+=("$name")
+    else
+      INSTALL_REQUIRED_MODULE_NAMES+=("$name")
+    fi
     stage="$INSTALL_MODULE_STAGE/$name"
     mkdir -p "$stage"
     cp -r "$src/." "$stage/"
@@ -1777,9 +1799,17 @@ else
       chmod 0644 "/etc/systemd/system/$service"
       unset _data_dir_sed
       systemctl daemon-reload
-      systemctl enable "$service"
-      systemctl restart "$service"
-      echo "Module $name installed and started"
+      if [ "$name" = "occupancy-study-recorder" ]; then
+        if systemctl enable "$service" && systemctl restart "$service"; then
+          echo "Optional module $name installed and started"
+        else
+          echo "Warning: optional module $name did not start; core biometrics installation will continue" >&2
+        fi
+      else
+        systemctl enable "$service"
+        systemctl restart "$service"
+        echo "Module $name installed and started"
+      fi
     else
       echo "Warning: no service file found for $name"
     fi
@@ -1805,7 +1835,7 @@ fi
 # survives Python initialization. The installer rollback remains safe here.
 if [ "$INSTALL_MODULE_SWAP_ACTIVE" = true ]; then
   sleep 5
-  for name in "${INSTALL_MODULE_NAMES[@]}"; do
+  for name in "${INSTALL_REQUIRED_MODULE_NAMES[@]}"; do
     if ! systemctl is-active --quiet "sleepypod-$name.service"; then
       echo "Error: module $name did not remain active before RAW migration" >&2
       exit 1
@@ -1823,7 +1853,7 @@ if [ -f "$INSTALL_DIR/scripts/lib/biometrics-archiver-helpers" ]; then
 fi
 if [ "$INSTALL_MODULE_SWAP_ACTIVE" = true ]; then
   sleep 5
-  for name in "${INSTALL_MODULE_NAMES[@]}"; do
+  for name in "${INSTALL_REQUIRED_MODULE_NAMES[@]}"; do
     if ! systemctl is-active --quiet "sleepypod-$name.service"; then
       if [ "$SLEEPYPOD_NATS_MIGRATION_COMMITTED" = true ]; then
         echo "Error: module $name failed after NATS migration; retaining NATS-capable modules" >&2
@@ -1831,6 +1861,11 @@ if [ "$INSTALL_MODULE_SWAP_ACTIVE" = true ]; then
         INSTALL_MODULE_SWAP_ACTIVE=false
       fi
       exit 1
+    fi
+  done
+  for name in "${INSTALL_OPTIONAL_MODULE_NAMES[@]}"; do
+    if ! systemctl is-active --quiet "sleepypod-$name.service"; then
+      echo "Warning: optional module $name is not active; occupancy behavior is unchanged" >&2
     fi
   done
   rm -rf "$INSTALL_MODULE_BACKUP"
@@ -2075,6 +2110,7 @@ echo "  - Ambient, bed zone, and freezer temperature monitoring (environment-mon
 echo ""
 echo "CLI Commands:"
 echo "  sp-status        - View service status"
+echo "  sp-occupancy-study - Label, inspect, and export occupancy-study evidence"
 echo "  sp-restart       - Restart service"
 echo "  sp-logs          - View live logs"
 echo "  sp-bundle-logs   - Capture redacted diagnostic bundle for support"
