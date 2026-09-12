@@ -1720,6 +1720,28 @@ else
     done
   }
 
+  restore_optional_install_module() {
+    local optional_mod="$1"
+    local optional_svc="sleepypod-$optional_mod.service"
+    systemctl stop "$optional_svc" 2>/dev/null || true
+    rm -rf "$MODULES_DEST/$optional_mod"
+    if [ -d "$INSTALL_MODULE_BACKUP/$optional_mod" ]; then
+      mv "$INSTALL_MODULE_BACKUP/$optional_mod" "$MODULES_DEST/$optional_mod"
+    fi
+    if [ -f "$INSTALL_MODULE_BACKUP/units/$optional_svc" ]; then
+      cp -f "$INSTALL_MODULE_BACKUP/units/$optional_svc" "/etc/systemd/system/$optional_svc"
+    else
+      systemctl disable "$optional_svc" 2>/dev/null || true
+      rm -f "/etc/systemd/system/$optional_svc"
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+    for active_mod in "${INSTALL_ACTIVE_MODULES[@]}"; do
+      if [ "$active_mod" = "$optional_mod" ]; then
+        systemctl restart "$optional_svc" 2>/dev/null || true
+      fi
+    done
+  }
+
   # Build every venv before touching the live module tree. The occupancy-study
   # recorder is NATS-only and must not become a restart loop on RAW firmware.
   INSTALL_MODULE_CANDIDATES=(
@@ -1740,12 +1762,6 @@ else
       continue
     fi
     echo "Staging module: $name..."
-    INSTALL_MODULE_NAMES+=("$name")
-    if [ "$name" = "occupancy-study-recorder" ]; then
-      INSTALL_OPTIONAL_MODULE_NAMES+=("$name")
-    else
-      INSTALL_REQUIRED_MODULE_NAMES+=("$name")
-    fi
     stage="$INSTALL_MODULE_STAGE/$name"
     mkdir -p "$stage"
     cp -r "$src/." "$stage/"
@@ -1755,12 +1771,24 @@ else
       _uv_sync_args+=(--python-preference only-managed)
     fi
     if ! (cd "$stage" && uv sync "${_uv_sync_args[@]}"); then
+      if [ "$name" = "occupancy-study-recorder" ]; then
+        echo "Warning: optional module $name dependencies failed to build; core biometrics installation will continue" >&2
+        rm -rf "$stage"
+        unset _uv_sync_args
+        continue
+      fi
       echo "Error: uv sync failed for module $name — live modules were not replaced" >&2
       rm -rf "$INSTALL_MODULE_STAGE" "$INSTALL_MODULE_BACKUP"
       exit 1
     fi
     unset _uv_sync_args
     chmod -R o+rX "$stage/.venv" 2>/dev/null || true
+    INSTALL_MODULE_NAMES+=("$name")
+    if [ "$name" = "occupancy-study-recorder" ]; then
+      INSTALL_OPTIONAL_MODULE_NAMES+=("$name")
+    else
+      INSTALL_REQUIRED_MODULE_NAMES+=("$name")
+    fi
   done
 
   INSTALL_MODULE_SWAP_ACTIVE=true
@@ -1787,7 +1815,6 @@ else
     if [ -d "$MODULES_DEST/$name" ]; then
       mv "$MODULES_DEST/$name" "$INSTALL_MODULE_BACKUP/$name"
     fi
-    INSTALL_SWAPPED_MODULES+=("$name")
     mv "$INSTALL_MODULE_STAGE/$name" "$MODULES_DEST/$name"
 
     if [ -f "$MODULES_DEST/$name/$service" ]; then
@@ -1801,17 +1828,26 @@ else
       systemctl daemon-reload
       if [ "$name" = "occupancy-study-recorder" ]; then
         if systemctl enable "$service" && systemctl restart "$service"; then
+          INSTALL_SWAPPED_MODULES+=("$name")
           echo "Optional module $name installed and started"
         else
+          restore_optional_install_module "$name"
           echo "Warning: optional module $name did not start; core biometrics installation will continue" >&2
         fi
       else
+        INSTALL_SWAPPED_MODULES+=("$name")
         systemctl enable "$service"
         systemctl restart "$service"
         echo "Module $name installed and started"
       fi
     else
-      echo "Warning: no service file found for $name"
+      if [ "$name" = "occupancy-study-recorder" ]; then
+        restore_optional_install_module "$name"
+        echo "Warning: optional module $name has no service file; core biometrics installation will continue" >&2
+      else
+        INSTALL_SWAPPED_MODULES+=("$name")
+        echo "Warning: no service file found for $name"
+      fi
     fi
   done
 
