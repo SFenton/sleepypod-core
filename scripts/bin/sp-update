@@ -425,6 +425,9 @@ fi
 if [ -d "$INSTALL_DIR/modules" ]; then
   MODULES_DEST="/opt/sleepypod/modules"
   mkdir -p "$MODULES_DEST"
+  mkdir -p "$DATA_DIR/occupancy-study"
+  chown root:sleepypod "$DATA_DIR/occupancy-study"
+  chmod 2770 "$DATA_DIR/occupancy-study"
   # Match the install script's shared uv cache + Python install dir so
   # User=dac modules can execute the managed Python (otherwise it lives
   # under root's home at 0700 and the .venv symlink fails with 203/EXEC).
@@ -463,6 +466,8 @@ if [ -d "$INSTALL_DIR/modules" ]; then
   MODULES_STAGE=$(mktemp -d "$MODULES_DEST/.update-stage.XXXXXX")
   MODULES_BACKUP=$(mktemp -d "$MODULES_DEST/.update-backup.XXXXXX")
   MODULE_NAMES=()
+  REQUIRED_MODULE_NAMES=()
+  OPTIONAL_MODULE_NAMES=()
   SWAPPED_MODULES=()
   ACTIVE_MODULES=()
   COMMON_SWAPPED=false
@@ -501,14 +506,46 @@ if [ -d "$INSTALL_DIR/modules" ]; then
     done
   }
 
+  restore_optional_module() {
+    local optional_mod="$1"
+    local optional_svc="sleepypod-$optional_mod.service"
+    systemctl stop "$optional_svc" 2>/dev/null || true
+    rm -rf "$MODULES_DEST/$optional_mod"
+    if [ -d "$MODULES_BACKUP/$optional_mod" ]; then
+      mv "$MODULES_BACKUP/$optional_mod" "$MODULES_DEST/$optional_mod"
+    fi
+    if [ -f "$MODULES_BACKUP/units/$optional_svc" ]; then
+      cp -f "$MODULES_BACKUP/units/$optional_svc" "/etc/systemd/system/$optional_svc"
+    else
+      systemctl disable "$optional_svc" 2>/dev/null || true
+      rm -f "/etc/systemd/system/$optional_svc"
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+    for active_mod in "${ACTIVE_MODULES[@]}"; do
+      if [ "$active_mod" = "$optional_mod" ]; then
+        systemctl restart "$optional_svc" 2>/dev/null || true
+      fi
+    done
+  }
+
   # Build every replacement venv before touching the live module tree. A
   # dependency/download failure therefore leaves every running module intact
   # and prevents the later NATS cleanup from removing its RAW source.
-  for mod in piezo-processor sleep-detector environment-monitor calibrator cover-buttons; do
+  MODULE_CANDIDATES=(
+    piezo-processor
+    sleep-detector
+    environment-monitor
+    calibrator
+    cover-buttons
+  )
+  if [ -d /persistent/jetstream ] \
+     && systemctl cat nats-server.service >/dev/null 2>&1; then
+    MODULE_CANDIDATES+=(occupancy-study-recorder)
+  fi
+  for mod in "${MODULE_CANDIDATES[@]}"; do
     if [ ! -d "$INSTALL_DIR/modules/$mod" ]; then
       continue
     fi
-    MODULE_NAMES+=("$mod")
     stage="$MODULES_STAGE/$mod"
     mkdir -p "$stage"
     cp -r "$INSTALL_DIR/modules/$mod/." "$stage/"
@@ -518,12 +555,24 @@ if [ -d "$INSTALL_DIR/modules" ]; then
       _uv_sync_args+=(--python-preference only-managed)
     fi
     if ! (cd "$stage" && uv sync "${_uv_sync_args[@]}"); then
+      if [ "$mod" = "occupancy-study-recorder" ]; then
+        echo "Warning: optional module $mod dependencies failed to build; core update will continue." >&2
+        rm -rf "$stage"
+        unset _uv_sync_args
+        continue
+      fi
       echo "ERROR: uv sync failed for module $mod — live modules were not replaced." >&2
       rm -rf "$MODULES_STAGE" "$MODULES_BACKUP"
       exit 1
     fi
     unset _uv_sync_args
     chmod -R o+rX "$stage/.venv" 2>/dev/null || true
+    MODULE_NAMES+=("$mod")
+    if [ "$mod" = "occupancy-study-recorder" ]; then
+      OPTIONAL_MODULE_NAMES+=("$mod")
+    else
+      REQUIRED_MODULE_NAMES+=("$mod")
+    fi
   done
 
   MODULE_SWAP_ACTIVE=true
@@ -568,8 +617,6 @@ if [ -d "$INSTALL_DIR/modules" ]; then
       MODULE_SWAP_ACTIVE=false
       exit 1
     fi
-    SWAPPED_MODULES+=("$mod")
-
     if [ -f "$MODULES_DEST/$mod/$svc" ]; then
       # Substitute the chosen $DATA_DIR for the baked-in
       # /persistent/sleepypod-data. Mirrors install_module() in
@@ -585,12 +632,23 @@ if [ -d "$INSTALL_DIR/modules" ]; then
       systemctl enable "$svc" 2>/dev/null || true
     fi
 
-    if ! systemctl restart "$svc"; then
+    if [ "$mod" = "occupancy-study-recorder" ]; then
+      if systemctl restart "$svc"; then
+        SWAPPED_MODULES+=("$mod")
+        echo "Optional module $mod updated and started."
+      else
+        restore_optional_module "$mod"
+        echo "Warning: optional module $mod failed to start; core update will continue." >&2
+      fi
+    elif ! systemctl restart "$svc"; then
+      SWAPPED_MODULES+=("$mod")
       echo "ERROR: updated module $mod failed to start — restoring previous module." >&2
       rollback_module_update
       rm -rf "$MODULES_STAGE" "$MODULES_BACKUP"
       MODULE_SWAP_ACTIVE=false
       exit 1
+    else
+      SWAPPED_MODULES+=("$mod")
     fi
   done
 
@@ -604,7 +662,7 @@ fi
 # a bounded startup grace period.
 if [ "$MODULE_SWAP_ACTIVE" = true ]; then
   sleep 5
-  for mod in "${MODULE_NAMES[@]}"; do
+  for mod in "${REQUIRED_MODULE_NAMES[@]}"; do
     if ! systemctl is-active --quiet "sleepypod-$mod.service"; then
       echo "ERROR: updated module $mod did not remain active before RAW migration." >&2
       exit 1
@@ -686,10 +744,15 @@ systemctl start sleepypod.service
 sleep 5
 MODULES_HEALTHY=true
 if [ "$MODULE_SWAP_ACTIVE" = true ]; then
-  for mod in "${MODULE_NAMES[@]}"; do
+  for mod in "${REQUIRED_MODULE_NAMES[@]}"; do
     if ! systemctl is-active --quiet "sleepypod-$mod.service"; then
       echo "Updated module $mod is not active after deployment." >&2
       MODULES_HEALTHY=false
+    fi
+  done
+  for mod in "${OPTIONAL_MODULE_NAMES[@]}"; do
+    if ! systemctl is-active --quiet "sleepypod-$mod.service"; then
+      echo "Optional module $mod is not active; occupancy behavior is unchanged." >&2
     fi
   done
 fi
