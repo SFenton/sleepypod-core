@@ -76,6 +76,11 @@ jobs:
             target: .
             cov_source: .
             deps: ""
+          - name: occupancy-study-recorder
+            workdir: modules/occupancy-study-recorder
+            target: .
+            cov_source: .
+            deps: ""
 
     steps:
       - name: Checkout

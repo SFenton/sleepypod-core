@@ -61,6 +61,7 @@ SERVICES=(
   sleepypod-environment-monitor.service
   sleepypod-calibrator.service
   sleepypod-cover-buttons.service
+  sleepypod-occupancy-study-recorder.service
 )
 for svc in "${SERVICES[@]}"; do
   systemctl stop "$svc" 2>/dev/null || true
@@ -106,6 +107,7 @@ rm -f /usr/local/bin/sp-restart
 rm -f /usr/local/bin/sp-logs
 rm -f /usr/local/bin/sp-update
 rm -f /usr/local/bin/sp-uninstall
+rm -f /usr/local/bin/sp-occupancy-study
 
 # Remove the narrow sudo grants installed by scripts/install and the OTA
 # self-heal path. Leaving either fragment behind can reactivate root access if

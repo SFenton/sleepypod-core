@@ -157,9 +157,15 @@ printf ".RAW.gz in archive:            %s\n" "$(count_archive_gz /persistent/bio
 probe_section "sleepypod modules"
 for m in sleepypod-piezo-processor sleepypod-sleep-detector \
          sleepypod-environment-monitor sleepypod-cover-buttons \
-         sleepypod-calibrator; do
+         sleepypod-calibrator sleepypod-occupancy-study-recorder; do
   printf "%-40s %s\n" "$m.service" "$(active_or "$m.service")"
 done
+
+if [ -x /usr/local/bin/sp-occupancy-study ]; then
+  echo
+  /usr/local/bin/sp-occupancy-study status 2>/dev/null \
+    || echo "occupancy study: status unavailable"
+fi
 
 # ----- biometrics-archiver units -------------------------------------------
 probe_section "biometrics-archiver units"

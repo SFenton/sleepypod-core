@@ -176,6 +176,7 @@ After installation (installed from `scripts/bin/`):
 - `sp-restart` - Restart sleepypod + reconnect frankenfirmware
 - `sp-logs` - View live logs
 - `sp-bundle-logs` - One-shot diagnostic capture (`/tmp/sleepypod-bundle-<ts>.tar.gz`); redacts secrets by default, pass `--no-redact` for raw
+- `sp-occupancy-study` - Status, explicit ground-truth labels, and checksum-protected exports for the bounded read-only occupancy study recorder
 - `sp-update` - Update to latest version from GitHub
 - `sp-uninstall` - Remove sleepypod and all related services
 
