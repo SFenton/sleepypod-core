@@ -690,6 +690,16 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--from", dest="start", required=True)
     export_parser.add_argument("--to", dest="end", required=True)
     export_parser.add_argument("--out", required=True)
+
+    analyze_parser = subparsers.add_parser(
+        "analyze",
+        help="replay capSense rows through the adaptive detector",
+    )
+    analyze_parser.add_argument("--from", dest="start", required=True)
+    analyze_parser.add_argument("--to", dest="end", required=True)
+    analyze_parser.add_argument("--baseline-from", required=True)
+    analyze_parser.add_argument("--baseline-to", required=True)
+    analyze_parser.add_argument("--include-decisions", action="store_true")
     return parser
 
 
@@ -750,6 +760,25 @@ def main() -> int:
             Path(args.out),
         )
         print(json.dumps(manifest, sort_keys=True))
+        return 0
+    if args.command == "analyze":
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+        from common.adaptive_occupancy import analyze_database
+
+        connection = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+        try:
+            report = analyze_database(
+                connection,
+                parse_timestamp(args.start),
+                parse_timestamp(args.end),
+                parse_timestamp(args.baseline_from),
+                parse_timestamp(args.baseline_to),
+                include_decisions=args.include_decisions,
+            )
+        finally:
+            connection.close()
+        print(json.dumps(report, sort_keys=True))
         return 0
     return 2
 

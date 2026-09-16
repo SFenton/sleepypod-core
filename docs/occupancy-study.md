@@ -1,9 +1,8 @@
 # Occupancy study recorder
 
 The occupancy-study recorder is a read-only JetStream consumer for deliberately
-labeled bed-entry and bed-exit trials. It does not calculate occupancy and is
-not connected to HomeKit, Home Assistant, auto-off, alarms, pumps, or any other
-control path.
+labeled bed-entry and bed-exit trials. It does not calculate occupancy or
+control HomeKit, auto-off, alarms, pumps, or any other behavior.
 
 ## Evidence retained
 
@@ -65,6 +64,113 @@ the physical side mapping must be established by the labeled trial.
 Full-scale values such as `0x7fffffff` remain in the source payload. Offline
 analysis must mark them invalid and preserve them as gaps rather than replacing
 them with zero or using them in feature calculations.
+
+## Shadow occupancy replay
+
+The study includes a non-controlling candidate detector for named-channel
+`capSense` data. It uses an explicit empty-bed baseline, positive-only
+multi-channel load evidence, raw-unit scale floors, entry/exit dwell, slow
+empty-state baseline adaptation, directional load/unload velocity, and
+paired-side comparison to flag cross-bed coupling. A threshold crossing must
+follow a meaningful load impulse within the preceding minute; slow post-exit
+mattress recovery or cross-side creep cannot create a new load. An
+inner-zone-only load on an empty side is classified as likely encroachment while
+the opposite side is occupied, rather than immediately creating a second
+occupant. It does not feed HomeKit, sleep sessions, auto-off, alarms, or hardware
+control.
+
+The shadow `occupied` boolean means that capacitance supports a sustained
+surface load. It does **not** establish that the load is a person. Decisions
+therefore report `classification: loaded_unconfirmed`; operator labels and
+future independently validated sensing are required before promoting that state
+to person occupancy. `person_present` is consequently `null` for an
+unconfirmed load, `false` for empty or classified encroachment, and is never set
+to `true` by the current candidate. Current piezo presence and derived vitals
+are not accepted as confirmation because labeled nuisance loads can produce
+plausible values.
+
+Choose a known-empty baseline window and replay a later interval:
+
+```bash
+sp-occupancy-study analyze \
+  --baseline-from 2026-09-12T19:30:00-07:00 \
+  --baseline-to 2026-09-12T19:45:00-07:00 \
+  --from 2026-09-12T19:45:00-07:00 \
+  --to 2026-09-13T10:00:00-07:00 \
+  --include-decisions
+```
+
+The JSON report contains the initial and adapted baselines, state transitions,
+transition scores, coupling flags, and final shadow state. With
+`--include-decisions`, it also contains every per-side score and decision reason.
+Baseline windows must be operator-confirmed or otherwise independently
+established as empty; the analyzer deliberately does not treat a low-variance
+window as proof of an empty bed.
+
+## Continuous adaptive runtime
+
+The optional `sleepypod-adaptive-occupancy.service` runs the same detector
+continuously from the downsampled `cap_sense_frames` table. It writes one
+current-state row per side to `adaptive_occupancy_state` and an atomic detector
+checkpoint to
+`/persistent/sleepypod-data/adaptive-occupancy-checkpoint.json`. The checkpoint
+preserves adapted baselines, dwell candidates, recent velocity, and coupling
+state across restarts.
+
+The first start requires an operator-confirmed empty window in
+`/etc/sleepypod/modules/adaptive-occupancy.env`:
+
+```ini
+ADAPTIVE_OCCUPANCY_BASELINE_FROM=2026-09-12T19:30:00-07:00
+ADAPTIVE_OCCUPANCY_BASELINE_TO=2026-09-12T19:45:00-07:00
+```
+
+The service replays from that window through the newest retained capSense
+frame, saves a checkpoint, and then tails new five-second frames. Later starts
+restore the checkpoint and do not need the original baseline rows. If neither a
+valid checkpoint nor an explicit baseline window is available, the service
+fails closed instead of guessing that a quiet or calibrated bed was empty.
+
+After a detected entry, a load that remains below the independent-entry score
+on only one channel for 15 continuous minutes is cleared. This handles
+post-exit mattress rebound without reacting to the much shorter weak
+single-channel intervals observed during occupied nights. Any renewed
+multi-channel load, independent-strength score, or entry velocity resets the
+guard.
+
+The independent-entry score bypass applies only when velocity cannot be
+measured after a stream gap. During continuous data, every new entry still
+requires a recent load impulse, so slow thermal or mechanical rebound cannot
+re-enter merely by drifting above the independent score.
+
+When MQTT is enabled, the core publishes retained production and comparison
+signals:
+
+- `state/occupancy/<side>/legacy` contains the previous movement and
+  calibrated-level result for comparison.
+- `state/occupancy/<side>/adaptive` contains adaptive load state,
+  classification, nullable person presence, scores, baseline, and transition
+  timestamps.
+- `availability/adaptive-occupancy` is `online` only while both adaptive
+  sensor sample timestamps are no more than 60 seconds old. Database write
+  time is not used, so replaying a backlog cannot make historical evidence
+  appear live.
+
+Home Assistant discovery creates the primary occupancy binary sensor, a legacy
+comparison binary sensor, an explicitly named adaptive-load comparison sensor,
+and an adaptive classification enum sensor for each side. The primary and
+adaptive binary sensors intentionally share the fresh adaptive-load topic and
+both represent sustained surface load, not confirmed person presence. If that
+topic is stale, both become unavailable rather than publishing a potentially
+misleading absence; the legacy comparison entity remains separate.
+
+Fresh adaptive state is also the shared production source used by HomeKit, the
+occupancy API and UI, and auto-off. If the adaptive row is missing, stale by
+more than 60 seconds, or unreadable, the shared source conservatively reports
+the legacy occupied value but marks occupancy unavailable. This keeps HomeKit
+useful while forcing absence-triggered behavior such as auto-off to stand down.
+The Python sleep-session detector remains independent and continues to process
+its own raw sensor stream.
 
 ## Suggested labeled trial
 

@@ -1,0 +1,36 @@
+[Unit]
+Description=SleepyPod Adaptive Occupancy Shadow Runtime
+Documentation=https://github.com/SFenton/sleepypod-core/blob/dev/docs/occupancy-study.md
+After=sleepypod.service
+
+[Service]
+Type=simple
+User=dac
+SupplementaryGroups=sleepypod
+UMask=0077
+WorkingDirectory=/opt/sleepypod/modules/adaptive-occupancy
+ExecStart=/opt/sleepypod/modules/adaptive-occupancy/.venv/bin/python main.py run
+Restart=on-failure
+RestartSec=15
+
+EnvironmentFile=-/etc/sleepypod/modules/adaptive-occupancy.env
+Environment="BIOMETRICS_DATABASE_URL=file:/persistent/sleepypod-data/biometrics.db"
+Environment="ADAPTIVE_OCCUPANCY_CHECKPOINT=/persistent/sleepypod-data/adaptive-occupancy-checkpoint.json"
+
+MemoryMax=64M
+CPUQuota=20%
+Nice=10
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ReadOnlyPaths=/persistent
+ReadWritePaths=/persistent/sleepypod-data
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

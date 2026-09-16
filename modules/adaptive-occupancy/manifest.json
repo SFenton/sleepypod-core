@@ -1,0 +1,14 @@
+{
+  "name": "adaptive-occupancy",
+  "version": "0.1.0",
+  "description": "Non-controlling adaptive capSense occupancy shadow runtime",
+  "provides": [
+    "adaptive_occupancy_state.load_present",
+    "adaptive_occupancy_state.classification",
+    "adaptive_occupancy_state.person_present"
+  ],
+  "writes": ["adaptive_occupancy_state"],
+  "service": "sleepypod-adaptive-occupancy.service",
+  "language": "python",
+  "minVersion": "1.0.0"
+}

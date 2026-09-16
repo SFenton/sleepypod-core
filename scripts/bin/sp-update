@@ -538,6 +538,10 @@ if [ -d "$INSTALL_DIR/modules" ]; then
     calibrator
     cover-buttons
   )
+  if [ -f /etc/sleepypod/modules/adaptive-occupancy.env ] \
+     || [ -f "$DATA_DIR/adaptive-occupancy-checkpoint.json" ]; then
+    MODULE_CANDIDATES+=(adaptive-occupancy)
+  fi
   if [ -d /persistent/jetstream ] \
      && systemctl cat nats-server.service >/dev/null 2>&1; then
     MODULE_CANDIDATES+=(occupancy-study-recorder)
@@ -555,7 +559,7 @@ if [ -d "$INSTALL_DIR/modules" ]; then
       _uv_sync_args+=(--python-preference only-managed)
     fi
     if ! (cd "$stage" && uv sync "${_uv_sync_args[@]}"); then
-      if [ "$mod" = "occupancy-study-recorder" ]; then
+      if [ "$mod" = "occupancy-study-recorder" ] || [ "$mod" = "adaptive-occupancy" ]; then
         echo "Warning: optional module $mod dependencies failed to build; core update will continue." >&2
         rm -rf "$stage"
         unset _uv_sync_args
@@ -568,7 +572,7 @@ if [ -d "$INSTALL_DIR/modules" ]; then
     unset _uv_sync_args
     chmod -R o+rX "$stage/.venv" 2>/dev/null || true
     MODULE_NAMES+=("$mod")
-    if [ "$mod" = "occupancy-study-recorder" ]; then
+    if [ "$mod" = "occupancy-study-recorder" ] || [ "$mod" = "adaptive-occupancy" ]; then
       OPTIONAL_MODULE_NAMES+=("$mod")
     else
       REQUIRED_MODULE_NAMES+=("$mod")
@@ -632,7 +636,7 @@ if [ -d "$INSTALL_DIR/modules" ]; then
       systemctl enable "$svc" 2>/dev/null || true
     fi
 
-    if [ "$mod" = "occupancy-study-recorder" ]; then
+    if [ "$mod" = "occupancy-study-recorder" ] || [ "$mod" = "adaptive-occupancy" ]; then
       if systemctl restart "$svc"; then
         SWAPPED_MODULES+=("$mod")
         echo "Optional module $mod updated and started."

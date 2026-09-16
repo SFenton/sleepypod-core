@@ -217,7 +217,7 @@ describe('module deployment guards', () => {
     expect(helper.slice(requiredRestart, consumerRestart)).not.toContain('|| true')
   })
 
-  it('keeps the occupancy study recorder outside mandatory module health gates', () => {
+  it('keeps shadow occupancy modules outside mandatory module health gates', () => {
     const install = readFileSync(installScript, 'utf8')
     const update = readFileSync(updateScript, 'utf8')
 
@@ -230,6 +230,14 @@ describe('module deployment guards', () => {
       'Warning: optional module $name dependencies failed to build; core biometrics installation will continue',
     )
     expect(update).toContain('MODULE_CANDIDATES+=(occupancy-study-recorder)')
+    expect(install).toContain('INSTALL_MODULE_CANDIDATES+=(adaptive-occupancy)')
+    expect(update).toContain('MODULE_CANDIDATES+=(adaptive-occupancy)')
+    expect(install).toContain(
+      '[ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ]',
+    )
+    expect(update).toContain(
+      '[ "$mod" = "occupancy-study-recorder" ] || [ "$mod" = "adaptive-occupancy" ]',
+    )
     expect(update).toContain('OPTIONAL_MODULE_NAMES+=("$mod")')
     expect(update).toContain('for mod in "${REQUIRED_MODULE_NAMES[@]}"; do')
     expect(update).toContain(

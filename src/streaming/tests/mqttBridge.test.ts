@@ -16,6 +16,7 @@ const dbMock = vi.hoisted(() => {
     row: any | undefined
     throwOnSelect: boolean
     biometricsRow: any | null
+    adaptiveRows: any[]
     deviceStateRows: any[]
     bedTempRow: any | null
     alarmScheduleRows: any[]
@@ -28,6 +29,7 @@ const dbMock = vi.hoisted(() => {
     row: undefined,
     throwOnSelect: false,
     biometricsRow: null,
+    adaptiveRows: [],
     deviceStateRows: [],
     bedTempRow: null,
     alarmScheduleRows: [],
@@ -55,6 +57,7 @@ const dbMock = vi.hoisted(() => {
     if (name === 'power_schedules') return state.powerScheduleRows
     if (name === 'temperature_schedules') return state.temperatureScheduleRows
     if (name === 'device_state') return state.deviceStateRows
+    if (name === 'adaptive_occupancy_state') return state.adaptiveRows
     return []
   }
 
@@ -190,6 +193,33 @@ vi.mock('@/src/db', () => ({
   biometricsDb: { select: dbMock.select },
 }))
 
+const occupancyMock = vi.hoisted(() => ({
+  getOccupancy: vi.fn((side: 'left' | 'right') => ({
+    occupied: side === 'right',
+    available: true,
+    movement: { active: false, peakScore: 0 },
+    level: {
+      active: side === 'right',
+      deviation: side === 'right' ? 9 : 1,
+      threshold: 6,
+      ageMs: 100,
+    },
+  })),
+  getLegacyOccupancy: vi.fn((side: 'left' | 'right') => ({
+    occupied: side === 'right',
+    available: true,
+    movement: { active: false, peakScore: 0 },
+    level: {
+      active: side === 'right',
+      deviation: side === 'right' ? 9 : 1,
+      threshold: 6,
+      ageMs: 100,
+    },
+  })),
+}))
+
+vi.mock('@/src/lib/occupancy', () => occupancyMock)
+
 // Hoisted device caller mock — lifecycle tests assert that messages route to
 // the right tRPC procedure based on the topic verb.
 const deviceMock = vi.hoisted(() => ({
@@ -285,6 +315,7 @@ beforeEach(() => {
   dbMock.state.row = undefined
   dbMock.state.throwOnSelect = false
   dbMock.state.biometricsRow = null
+  dbMock.state.adaptiveRows = []
   dbMock.state.deviceStateRows = []
   dbMock.state.bedTempRow = null
   dbMock.state.alarmScheduleRows = []
@@ -307,6 +338,8 @@ beforeEach(() => {
   deviceMock.clearAlarm.mockClear()
   deviceMock.snoozeAlarm.mockClear()
   deviceMock.startPriming.mockClear()
+  occupancyMock.getOccupancy.mockClear()
+  occupancyMock.getLegacyOccupancy.mockClear()
   alarmStateMock.getAlarmStatus.mockReset().mockReturnValue({
     state: 'idle',
     active: false,
@@ -1080,6 +1113,81 @@ describe('mqttBridge — HA discovery payload content', () => {
     }
   }
 
+  function occupancyBinaryCfg(
+    side: 'left' | 'right',
+    algorithm: 'primary' | 'legacy' | 'adaptive',
+  ): Record<string, unknown> {
+    const label = side === 'left' ? 'Left' : 'Right'
+    const adaptive = algorithm !== 'legacy'
+    const stateTopic = `sleepypod/testpod/state/occupancy/${side}/${adaptive ? 'adaptive' : 'legacy'}`
+    const common = {
+      name: algorithm === 'primary'
+        ? `${label} occupancy`
+        : `${label} occupancy (${adaptive ? 'adaptive load' : 'legacy'})`,
+      unique_id: algorithm === 'primary'
+        ? `testpod_${side}_occupancy`
+        : `testpod_${side}_occupancy_${algorithm}`,
+      state_topic: stateTopic,
+      value_template: adaptive
+        ? `{{ 'on' if value_json.loadPresent else 'off' }}`
+        : `{{ 'on' if value_json.occupied else 'off' }}`,
+      json_attributes_topic: stateTopic,
+      payload_on: 'on',
+      payload_off: 'off',
+      device_class: 'occupancy',
+      device: DEVICE,
+    }
+    return adaptive
+      ? {
+          ...common,
+          availability: [
+            { topic: AVAILABILITY, payload_available: 'online', payload_not_available: 'offline' },
+            {
+              topic: 'sleepypod/testpod/availability/adaptive-occupancy',
+              payload_available: 'online',
+              payload_not_available: 'offline',
+            },
+          ],
+          availability_mode: 'all',
+        }
+      : {
+          ...common,
+          availability_topic: AVAILABILITY,
+          payload_available: 'online',
+          payload_not_available: 'offline',
+        }
+  }
+
+  function occupancyClassificationCfg(side: 'left' | 'right'): Record<string, unknown> {
+    const label = side === 'left' ? 'Left' : 'Right'
+    const stateTopic = `sleepypod/testpod/state/occupancy/${side}/adaptive`
+    return {
+      name: `${label} occupancy classification`,
+      unique_id: `testpod_${side}_occupancy_classification`,
+      state_topic: stateTopic,
+      value_template: '{{ value_json.classification }}',
+      json_attributes_topic: stateTopic,
+      availability: [
+        { topic: AVAILABILITY, payload_available: 'online', payload_not_available: 'offline' },
+        {
+          topic: 'sleepypod/testpod/availability/adaptive-occupancy',
+          payload_available: 'online',
+          payload_not_available: 'offline',
+        },
+      ],
+      availability_mode: 'all',
+      device_class: 'enum',
+      options: [
+        'empty',
+        'loaded_unconfirmed',
+        'inner_zone_encroachment',
+        'coupled_entry_suppressed',
+      ],
+      icon: 'mdi:bed',
+      device: DEVICE,
+    }
+  }
+
   let configs: Map<string, Record<string, unknown>>
 
   beforeEach(async () => {
@@ -1110,6 +1218,17 @@ describe('mqttBridge — HA discovery payload content', () => {
     expect(configs.get(`homeassistant/sensor/testpod/${side}_alarm_state/config`)).toEqual(alarmStateCfg(side))
     expect(configs.get(`homeassistant/button/testpod/${side}_alarm_snooze/config`)).toEqual(alarmButtonCfg(side, 'snooze'))
     expect(configs.get(`homeassistant/button/testpod/${side}_alarm_stop/config`)).toEqual(alarmButtonCfg(side, 'stop'))
+  })
+
+  it.each(['left', 'right'] as const)('publishes the full %s occupancy entities', (side) => {
+    expect(configs.get(`homeassistant/binary_sensor/testpod/${side}_occupancy/config`))
+      .toEqual(occupancyBinaryCfg(side, 'primary'))
+    expect(configs.get(`homeassistant/binary_sensor/testpod/${side}_occupancy_legacy/config`))
+      .toEqual(occupancyBinaryCfg(side, 'legacy'))
+    expect(configs.get(`homeassistant/binary_sensor/testpod/${side}_occupancy_adaptive/config`))
+      .toEqual(occupancyBinaryCfg(side, 'adaptive'))
+    expect(configs.get(`homeassistant/sensor/testpod/${side}_occupancy_classification/config`))
+      .toEqual(occupancyClassificationCfg(side))
   })
 
   it('publishes the full water_level sensor config', () => {
@@ -2543,6 +2662,74 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
         icon: 'mdi:alarm-off',
         device: DEVICE,
       }
+      const legacyOccupancyTopic = `sleepypod/${ID}/state/occupancy/${side}/legacy`
+      const adaptiveOccupancyTopic = `sleepypod/${ID}/state/occupancy/${side}/adaptive`
+      const adaptiveAvailability = [
+        { topic: AVAIL, payload_available: 'online', payload_not_available: 'offline' },
+        {
+          topic: `sleepypod/${ID}/availability/adaptive-occupancy`,
+          payload_available: 'online',
+          payload_not_available: 'offline',
+        },
+      ]
+      expected[`homeassistant/binary_sensor/${ID}/${side}_occupancy/config`] = {
+        name: `${Side} occupancy`,
+        unique_id: `${ID}_${side}_occupancy`,
+        state_topic: adaptiveOccupancyTopic,
+        value_template: `{{ 'on' if value_json.loadPresent else 'off' }}`,
+        json_attributes_topic: adaptiveOccupancyTopic,
+        payload_on: 'on',
+        payload_off: 'off',
+        device_class: 'occupancy',
+        device: DEVICE,
+        availability: adaptiveAvailability,
+        availability_mode: 'all',
+      }
+      expected[`homeassistant/binary_sensor/${ID}/${side}_occupancy_legacy/config`] = {
+        name: `${Side} occupancy (legacy)`,
+        unique_id: `${ID}_${side}_occupancy_legacy`,
+        availability_topic: AVAIL,
+        payload_available: 'online',
+        payload_not_available: 'offline',
+        state_topic: legacyOccupancyTopic,
+        value_template: `{{ 'on' if value_json.occupied else 'off' }}`,
+        json_attributes_topic: legacyOccupancyTopic,
+        payload_on: 'on',
+        payload_off: 'off',
+        device_class: 'occupancy',
+        device: DEVICE,
+      }
+      expected[`homeassistant/binary_sensor/${ID}/${side}_occupancy_adaptive/config`] = {
+        name: `${Side} occupancy (adaptive load)`,
+        unique_id: `${ID}_${side}_occupancy_adaptive`,
+        state_topic: adaptiveOccupancyTopic,
+        value_template: `{{ 'on' if value_json.loadPresent else 'off' }}`,
+        json_attributes_topic: adaptiveOccupancyTopic,
+        payload_on: 'on',
+        payload_off: 'off',
+        device_class: 'occupancy',
+        device: DEVICE,
+        availability: adaptiveAvailability,
+        availability_mode: 'all',
+      }
+      expected[`homeassistant/sensor/${ID}/${side}_occupancy_classification/config`] = {
+        name: `${Side} occupancy classification`,
+        unique_id: `${ID}_${side}_occupancy_classification`,
+        state_topic: adaptiveOccupancyTopic,
+        value_template: '{{ value_json.classification }}',
+        json_attributes_topic: adaptiveOccupancyTopic,
+        availability: adaptiveAvailability,
+        availability_mode: 'all',
+        device_class: 'enum',
+        options: [
+          'empty',
+          'loaded_unconfirmed',
+          'inner_zone_encroachment',
+          'coupled_entry_suppressed',
+        ],
+        icon: 'mdi:bed',
+        device: DEVICE,
+      }
       expected[`homeassistant/sensor/${ID}/pump_${side}_rpm/config`] = sensorCfg({
         name: `${Side} pump RPM`,
         unique_id: `${ID}_pump_${side}_rpm`,
@@ -2615,11 +2802,52 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
     ]
     dbMock.state.biometricsRow = { side: 'left', timestamp: new Date('2026-04-04T00:00:00Z'), heartRate: 60, hrv: 50, breathingRate: 14 }
     dbMock.state.bedTempRow = { timestamp: new Date('2026-03-03T00:00:00Z'), ambientTemp: 2000, humidity: 5000, leftPumpRpm: 1800, rightPumpRpm: 1900, leftFlowrateCd: 2050, rightFlowrateCd: 2150 }
+    dbMock.state.adaptiveRows = [
+      {
+        side: 'left',
+        sampleTimestamp: new Date(),
+        loadPresent: false,
+        classification: 'empty',
+        personPresent: false,
+        score: 0.5,
+        peakScore: 0.3,
+        loadedChannels: 0,
+        loadVelocityScore: 0.1,
+        unloadVelocityScore: 0.2,
+        entryVelocitySupported: false,
+        reason: 'empty_hold',
+        baseline: [1400, 1100, 1250],
+        lastTransitionAt: new Date('2026-09-13T15:00:00Z'),
+        algorithmVersion: 'adaptive-cap-v3',
+        updatedAt: new Date(),
+      },
+      {
+        side: 'right',
+        sampleTimestamp: new Date(),
+        loadPresent: true,
+        classification: 'loaded_unconfirmed',
+        personPresent: null,
+        score: 8.5,
+        peakScore: 4.2,
+        loadedChannels: 3,
+        loadVelocityScore: 0.4,
+        unloadVelocityScore: 0.1,
+        entryVelocitySupported: true,
+        reason: 'occupied_hold',
+        baseline: [1700, 1550, 2290],
+        lastTransitionAt: new Date('2026-09-13T14:00:00Z'),
+        algorithmVersion: 'adaptive-cap-v3',
+        updatedAt: new Date(),
+      },
+    ]
   }
 
-  async function capture(): Promise<{ fake: FakeClient, map: Record<string, string> }> {
+  async function capture(
+    mutate?: () => void,
+  ): Promise<{ fake: FakeClient, map: Record<string, string> }> {
     process.env.MQTT_DEVICE_ID = ID
     setupData()
+    mutate?.()
     const fake = await startBridgeWithFake({ config: { haDiscovery: false, topicPrefix: 'sleepypod' } })
     fake.connected = true
     fake.emit('connect')
@@ -2650,6 +2878,46 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
     const { map } = await capture()
     const payload = JSON.parse(map[`sleepypod/${ID}/state/water-level`])
     expect(payload.level).toBe('ok')
+    await shutdownMqttBridge()
+  })
+
+  it('publishes legacy and adaptive occupancy as separate retained states', async () => {
+    const { map } = await capture()
+    expect(JSON.parse(map[`sleepypod/${ID}/state/occupancy/left/legacy`])).toEqual({
+      algorithm: 'legacy',
+      occupied: false,
+      available: true,
+      movementActive: false,
+      movementPeakScore: 0,
+      levelActive: false,
+      levelDeviation: 1,
+      levelThreshold: 6,
+      levelAgeMs: 100,
+    })
+    expect(JSON.parse(map[`sleepypod/${ID}/state/occupancy/right/adaptive`])).toMatchObject({
+      algorithm: 'adaptive-cap-v3',
+      loadPresent: true,
+      classification: 'loaded_unconfirmed',
+      personPresent: null,
+      score: 8.5,
+      loadedChannels: 3,
+      reason: 'occupied_hold',
+    })
+    expect(map[`sleepypod/${ID}/availability/adaptive-occupancy`]).toBe('online')
+    expect(occupancyMock.getLegacyOccupancy).toHaveBeenCalledWith('left')
+    expect(occupancyMock.getLegacyOccupancy).toHaveBeenCalledWith('right')
+    await shutdownMqttBridge()
+  })
+
+  it('marks replayed old adaptive samples offline despite a recent database write', async () => {
+    const { map } = await capture(() => {
+      for (const row of dbMock.state.adaptiveRows) {
+        row.sampleTimestamp = new Date(Date.now() - 60_001)
+        row.updatedAt = new Date()
+      }
+    })
+
+    expect(map[`sleepypod/${ID}/availability/adaptive-occupancy`]).toBe('offline')
     await shutdownMqttBridge()
   })
 

@@ -4,7 +4,7 @@
  * Reads from the shared virtual sensor (`src/lib/occupancy.ts`) so this
  * accessory, the web-app PresenceCard, and any future consumer
  * (MQTT/HA/iOS) all reflect the same state. See that module for the
- * movement + level signal combination.
+ * adaptive-load and fail-safe fallback behavior.
  */
 
 import { Service, Characteristic } from 'hap-nodejs'

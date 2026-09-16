@@ -1,32 +1,32 @@
 /**
- * Virtual occupancy sensor — single source of truth shared by the HomeKit
- * OccupancySensor accessory and the web-app PresenceCard.
+ * Virtual occupancy sensor — single source of truth shared by HomeKit,
+ * auto-off, the API, and the web app.
  *
- * Combines two signals via OR:
+ * Fresh adaptive load state is the production signal. The previous
+ * movement-plus-calibrated-level detector remains available as an explicit
+ * legacy signal and as a conservative fallback when the adaptive sidecar is
+ * unavailable. Fallback results are marked unavailable so absence-triggered
+ * consumers stand down.
  *
- *   1. Movement signal (catches an active occupant).
- *      `MAX(movement.total_movement)` over the last MOVEMENT_WINDOW_MS,
- *      compared to RESTLESS_SCORE_MIN. Identical to the original HomeKit logic.
- *
- *   2. Level signal (catches a still occupant — deep sleep, etc.).
- *      Live capSense / capSense2 channel readings vs the matching per-side
- *      calibration baseline from `calibration_profiles`. Named-channel
- *      capSense uses calibrated z-scores; capSense2 keeps its compensated
- *      channel-delta evaluator.
- *
- * Movement alone is blind to a person who is lying perfectly still; level
- * alone is blind to brief presence events that don't sustain a baseline
- * deviation. The OR closes both gaps.
+ * The adaptive detector reports sustained surface load, not confirmed human
+ * presence. Its score is exposed through the existing level diagnostics.
  */
 
 import { and, eq, gt, gte, isNull, or, sql } from 'drizzle-orm'
 import { biometricsDb } from '@/src/db/biometrics'
-import { calibrationProfiles, movement } from '@/src/db/biometrics-schema'
+import {
+  adaptiveOccupancyState,
+  calibrationProfiles,
+  movement,
+} from '@/src/db/biometrics-schema'
 import { getLatestCapSenseSnapshot } from '@/src/streaming/piezoStream'
 import { RESTLESS_SCORE_MIN } from '@/src/lib/movement'
 import type { Side } from '@/src/hardware/types'
 
 const MOVEMENT_WINDOW_MS = 15 * 60_000
+const ADAPTIVE_OCCUPANCY_STALE_MS = 60_000
+const ADAPTIVE_ENTRY_SCORE = 4
+const ADAPTIVE_WARNING_INTERVAL_MS = 60_000
 /** Capacitance frames nominally arrive at ~2 Hz. >30s gap = sensor / stream down. */
 const CAPSENSE_STALE_MS = 30_000
 /** Nominal reference-channel value used when the calibration profile is
@@ -91,6 +91,24 @@ interface CapSenseCalibration {
 }
 
 export function getOccupancy(side: Side): OccupancyResult {
+  const legacy = getLegacyOccupancy(side)
+  const adaptive = readAdaptiveLevelSignal(side)
+  if (!adaptive) {
+    return {
+      ...legacy,
+      available: false,
+    }
+  }
+
+  return {
+    occupied: adaptive.active,
+    movement: legacy.movement,
+    level: adaptive,
+    available: true,
+  }
+}
+
+export function getLegacyOccupancy(side: Side): OccupancyResult {
   const movementSignal = readMovementSignal(side)
   const levelSignal = readLevelSignal(side)
   return {
@@ -98,6 +116,41 @@ export function getOccupancy(side: Side): OccupancyResult {
     movement: movementSignal,
     level: levelSignal,
     available: levelSignal.deviation !== null,
+  }
+}
+
+let lastAdaptiveWarningAt = 0
+
+function readAdaptiveLevelSignal(side: Side): LevelSignal | null {
+  try {
+    const [row] = biometricsDb
+      .select()
+      .from(adaptiveOccupancyState)
+      .where(eq(adaptiveOccupancyState.side, side))
+      .limit(1)
+      .all()
+    if (!row) return null
+
+    const ageMs = Date.now() - row.sampleTimestamp.getTime()
+    if (ageMs < 0 || ageMs > ADAPTIVE_OCCUPANCY_STALE_MS) return null
+
+    return {
+      active: row.loadPresent,
+      deviation: row.score,
+      threshold: ADAPTIVE_ENTRY_SCORE,
+      ageMs,
+    }
+  }
+  catch (error) {
+    const now = Date.now()
+    if (now - lastAdaptiveWarningAt >= ADAPTIVE_WARNING_INTERVAL_MS) {
+      lastAdaptiveWarningAt = now
+      console.warn(
+        '[occupancy] adaptive state read failed:',
+        error instanceof Error ? error.message : error,
+      )
+    }
+    return null
   }
 }
 

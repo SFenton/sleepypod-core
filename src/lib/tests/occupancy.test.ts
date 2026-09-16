@@ -3,9 +3,17 @@ import type { LatestCapSenseSnapshot } from '@/src/streaming/piezoStream'
 
 interface MovementRow { peak: number | null }
 interface CalRow { parameters: unknown }
+interface AdaptiveRow {
+  side: 'left' | 'right'
+  loadPresent: boolean
+  score: number
+  sampleTimestamp: Date
+  updatedAt: Date
+}
 
 let movementRows: MovementRow[] = []
 let calRows: CalRow[] = []
+let adaptiveRows: AdaptiveRow[] = []
 let snapshot: LatestCapSenseSnapshot | null = null
 
 const drizzle = vi.hoisted(() => ({
@@ -22,14 +30,28 @@ vi.mock('drizzle-orm', () => drizzle)
 
 const movementAll = vi.fn<() => MovementRow[]>(() => movementRows)
 const calAll = vi.fn<() => CalRow[]>(() => calRows)
+const adaptiveAll = vi.fn<() => AdaptiveRow[]>(() => adaptiveRows)
+
+const schema = vi.hoisted(() => ({
+  movement: { side: {}, timestamp: {}, totalMovement: {} },
+  adaptiveOccupancyState: { side: {} },
+  calibrationProfiles: {
+    side: {},
+    sensorType: {},
+    status: {},
+    parameters: {},
+    qualityScore: {},
+  },
+}))
 
 vi.mock('@/src/db/biometrics', () => ({
   biometricsDb: {
     select: (cols?: Record<string, unknown>) => ({
-      from: () => ({
+      from: (table: unknown) => ({
         where: () => ({
           limit: () => ({
             all: () => {
+              if (table === schema.adaptiveOccupancyState) return adaptiveAll()
               // Distinguish queries by selected columns: movement uses `peak`,
               // calibration uses `parameters`. Cheap heuristic — no SQL coupling.
               if (cols && 'peak' in cols) return movementAll()
@@ -42,22 +64,13 @@ vi.mock('@/src/db/biometrics', () => ({
   },
 }))
 
-vi.mock('@/src/db/biometrics-schema', () => ({
-  movement: { side: {}, timestamp: {}, totalMovement: {} },
-  calibrationProfiles: {
-    side: {},
-    sensorType: {},
-    status: {},
-    parameters: {},
-    qualityScore: {},
-  },
-}))
+vi.mock('@/src/db/biometrics-schema', () => schema)
 
 vi.mock('@/src/streaming/piezoStream', () => ({
   getLatestCapSenseSnapshot: () => snapshot,
 }))
 
-import { getOccupancy } from '../occupancy'
+import { getLegacyOccupancy, getOccupancy } from '../occupancy'
 
 const FIXED_NOW = 1_778_910_000_000
 const BASELINE_CAL = {
@@ -102,9 +115,119 @@ describe('getOccupancy', () => {
     vi.setSystemTime(new Date(FIXED_NOW))
     movementRows = []
     calRows = []
+    adaptiveRows = []
     snapshot = null
     movementAll.mockClear()
     calAll.mockClear()
+    adaptiveAll.mockClear()
+    drizzle.gte.mockClear()
+    drizzle.gt.mockClear()
+    drizzle.isNull.mockClear()
+    drizzle.or.mockClear()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('uses fresh adaptive load as the production occupancy signal', () => {
+    movementRows = [{ peak: 0 }]
+    adaptiveRows = [{
+      side: 'left',
+      loadPresent: true,
+      score: 8.5,
+      sampleTimestamp: new Date(FIXED_NOW - 500),
+      updatedAt: new Date(FIXED_NOW - 500),
+    }]
+
+    const result = getOccupancy('left')
+
+    expect(result).toEqual({
+      occupied: true,
+      available: true,
+      movement: { active: false, peakScore: 0 },
+      level: { active: true, deviation: 8.5, threshold: 4, ageMs: 500 },
+    })
+  })
+
+  it('lets adaptive empty override active legacy movement and level evidence', () => {
+    movementRows = [{ peak: 350 }]
+    snapshot = makeNamedFrame('right', [1040, 1040, 2060, 2060, 3075, 3075])
+    calRows = [{ parameters: NAMED_CAPSENSE_CAL }]
+    adaptiveRows = [{
+      side: 'right',
+      loadPresent: false,
+      score: 0.4,
+      sampleTimestamp: new Date(FIXED_NOW - 1_000),
+      updatedAt: new Date(FIXED_NOW - 1_000),
+    }]
+
+    const result = getOccupancy('right')
+
+    expect(result.occupied).toBe(false)
+    expect(result.available).toBe(true)
+    expect(result.movement.active).toBe(true)
+    expect(result.level).toEqual({
+      active: false,
+      deviation: 0.4,
+      threshold: 4,
+      ageMs: 1_000,
+    })
+  })
+
+  it('falls back to legacy occupancy but marks stale adaptive state unavailable', () => {
+    movementRows = [{ peak: 350 }]
+    adaptiveRows = [{
+      side: 'left',
+      loadPresent: false,
+      score: 0.2,
+      sampleTimestamp: new Date(FIXED_NOW - 60_001),
+      updatedAt: new Date(FIXED_NOW - 60_001),
+    }]
+
+    const result = getOccupancy('left')
+
+    expect(result.occupied).toBe(true)
+    expect(result.movement.active).toBe(true)
+    expect(result.available).toBe(false)
+  })
+
+  it('treats replayed old samples as stale even when written recently', () => {
+    movementRows = [{ peak: 350 }]
+    adaptiveRows = [{
+      side: 'left',
+      loadPresent: false,
+      score: 0.2,
+      sampleTimestamp: new Date(FIXED_NOW - 60_001),
+      updatedAt: new Date(FIXED_NOW),
+    }]
+
+    const result = getOccupancy('left')
+
+    expect(result.occupied).toBe(true)
+    expect(result.available).toBe(false)
+  })
+
+  it('falls back unavailable when the adaptive state row is missing', () => {
+    movementRows = [{ peak: 0 }]
+
+    const result = getOccupancy('left')
+
+    expect(result.occupied).toBe(false)
+    expect(result.available).toBe(false)
+  })
+})
+
+describe('getLegacyOccupancy', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(FIXED_NOW))
+    movementRows = []
+    calRows = []
+    adaptiveRows = []
+    snapshot = null
+    movementAll.mockClear()
+    calAll.mockClear()
+    adaptiveAll.mockClear()
     drizzle.gte.mockClear()
     drizzle.gt.mockClear()
     drizzle.isNull.mockClear()
@@ -118,7 +241,7 @@ describe('getOccupancy', () => {
     movementRows = [{ peak: 30 }]
     snapshot = makeFrame('left', [14.5, 14.4, 13.7, 13.6, 19.4, 19.2, 1.157, 1.157])
     calRows = [{ parameters: BASELINE_CAL }]
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.occupied).toBe(false)
     expect(r.movement.active).toBe(false)
     expect(r.level.active).toBe(false)
@@ -129,7 +252,7 @@ describe('getOccupancy', () => {
   it('returns occupied=true via the movement signal alone', () => {
     movementRows = [{ peak: 350 }]
     snapshot = null
-    const r = getOccupancy('right')
+    const r = getLegacyOccupancy('right')
     expect(r.movement.active).toBe(true)
     expect(r.movement.peakScore).toBe(350)
     expect(r.level.active).toBe(false)
@@ -140,7 +263,7 @@ describe('getOccupancy', () => {
   it('queries movement from exactly fifteen minutes ago and treats the threshold as active', () => {
     movementRows = [{ peak: 50 }]
 
-    const result = getOccupancy('left')
+    const result = getLegacyOccupancy('left')
 
     expect(drizzle.gte).toHaveBeenCalledOnce()
     expect(drizzle.gte.mock.calls[0]?.[1]).toEqual(new Date(FIXED_NOW - 15 * 60_000))
@@ -153,7 +276,7 @@ describe('getOccupancy', () => {
     movementRows = [{ peak: 5 }]
     snapshot = makeFrame('left', [25.0, 25.0, 23.0, 23.0, 30.0, 30.0, 1.157, 1.157])
     calRows = [{ parameters: BASELINE_CAL }]
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.movement.active).toBe(false)
     expect(r.level.active).toBe(true)
     expect(r.level.deviation).not.toBeNull()
@@ -167,7 +290,7 @@ describe('getOccupancy', () => {
     movementRows = [{ peak: 0 }]
     snapshot = makeFrame('left', [17.45, 17.45, 16.65, 16.65, 22.3, 22.3, 2.157, 2.157])
     calRows = [{ parameters: BASELINE_CAL }]
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.level.active).toBe(false)
     expect(r.level.deviation).toBeCloseTo(6, 10)
     expect(r.level.threshold).toBe(6)
@@ -178,7 +301,7 @@ describe('getOccupancy', () => {
     snapshot = makeFrame('left', [16.45, 16.45, 15.65, 15.65, 21.3, 21.3])
     calRows = [{ parameters: BASELINE_CAL }]
 
-    const result = getOccupancy('left')
+    const result = getLegacyOccupancy('left')
     expect(result.level.deviation).toBeCloseTo(6, 10)
     expect(result.level.active).toBe(false)
   })
@@ -188,7 +311,7 @@ describe('getOccupancy', () => {
     snapshot = makeFrame('left', [15.45, 15.45, 15.65, 15.65, 22.3, 22.3])
     calRows = [{ parameters: BASELINE_CAL }]
 
-    expect(getOccupancy('left').level.deviation).toBeCloseTo(6, 10)
+    expect(getLegacyOccupancy('left').level.deviation).toBeCloseTo(6, 10)
   })
 
   it('ignores stale capSense frames', () => {
@@ -201,7 +324,7 @@ describe('getOccupancy', () => {
       right: [14.45, 14.45, 13.65, 13.65, 19.3, 19.3, 1.157, 1.157],
     }
     calRows = [{ parameters: BASELINE_CAL }]
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.level.active).toBe(false)
     expect(r.level.deviation).toBeNull()
     expect(r.level.ageMs).toBeGreaterThan(30_000)
@@ -216,7 +339,7 @@ describe('getOccupancy', () => {
     }
     calRows = [{ parameters: BASELINE_CAL }]
 
-    const result = getOccupancy('left')
+    const result = getLegacyOccupancy('left')
     expect(result.level.ageMs).toBe(30_000)
     expect(result.level.deviation).not.toBeNull()
     expect(result.available).toBe(true)
@@ -232,7 +355,7 @@ describe('getOccupancy', () => {
       right: 100,
     }
     calRows = [{ parameters: BASELINE_CAL }]
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.level.active).toBe(false)
     expect(r.level.deviation).toBeNull()
     expect(r.level.threshold).toBeNull()
@@ -245,7 +368,7 @@ describe('getOccupancy', () => {
     snapshot = makeNamedFrame('left', [1020, 1040, 2020, 2060, 3025, 3075])
     calRows = [{ parameters: NAMED_CAPSENSE_CAL }]
 
-    const result = getOccupancy('left')
+    const result = getLegacyOccupancy('left')
 
     expect(result.level).toEqual({ active: true, deviation: 7, threshold: 6, ageMs: 500 })
     expect(result.occupied).toBe(true)
@@ -258,7 +381,7 @@ describe('getOccupancy', () => {
     snapshot = makeNamedFrame('right', [1020, 1020, 2040, 2040, 3050, 3050])
     calRows = [{ parameters: { ...NAMED_CAPSENSE_CAL, format: 'capSense' } }]
 
-    const result = getOccupancy('right')
+    const result = getLegacyOccupancy('right')
 
     expect(result.level).toEqual({ active: false, deviation: 6, threshold: 6, ageMs: 500 })
     expect(result.occupied).toBe(false)
@@ -270,7 +393,7 @@ describe('getOccupancy', () => {
     snapshot = makeNamedFrame('left', [970, 970, 1960, 1960, 2950, 2950])
     calRows = [{ parameters: NAMED_CAPSENSE_CAL }]
 
-    const result = getOccupancy('left')
+    const result = getLegacyOccupancy('left')
 
     expect(result.level.deviation).toBe(7)
     expect(result.level.active).toBe(true)
@@ -281,7 +404,7 @@ describe('getOccupancy', () => {
     snapshot = makeNamedFrame('left', [1030, 1030, 2040, 2040, 3050, 3050])
     calRows = [{ parameters: BASELINE_CAL }]
 
-    const result = getOccupancy('left')
+    const result = getLegacyOccupancy('left')
 
     expect(result.level).toMatchObject({ active: false, deviation: null, threshold: null })
     expect(result.available).toBe(false)
@@ -300,7 +423,7 @@ describe('getOccupancy', () => {
       },
     }]
 
-    const result = getOccupancy('left')
+    const result = getLegacyOccupancy('left')
 
     expect(result.level).toMatchObject({ active: false, deviation: null, threshold: null })
     expect(result.available).toBe(false)
@@ -319,7 +442,7 @@ describe('getOccupancy', () => {
       },
     }]
 
-    const result = getOccupancy('left')
+    const result = getLegacyOccupancy('left')
 
     expect(result.level).toMatchObject({ active: false, deviation: null, threshold: null })
     expect(result.available).toBe(false)
@@ -330,7 +453,7 @@ describe('getOccupancy', () => {
     snapshot = makeNamedFrame('left', [1030, 1030, 2040, 2040, 3050, 3050])
     calRows = [{ parameters: { ...NAMED_CAPSENSE_CAL, threshold: Number.NaN } }]
 
-    const result = getOccupancy('left')
+    const result = getLegacyOccupancy('left')
 
     expect(result.level).toMatchObject({ active: false, deviation: null, threshold: null })
     expect(result.available).toBe(false)
@@ -341,7 +464,7 @@ describe('getOccupancy', () => {
     snapshot = makeNamedFrame('left', [Number.NaN, 1000, 2000, 2000, 3000, 3000])
     calRows = [{ parameters: NAMED_CAPSENSE_CAL }]
 
-    const result = getOccupancy('left')
+    const result = getLegacyOccupancy('left')
 
     expect(result.level).toEqual({ active: false, deviation: null, threshold: 6, ageMs: 500 })
     expect(result.available).toBe(false)
@@ -351,7 +474,7 @@ describe('getOccupancy', () => {
     movementRows = [{ peak: 0 }]
     snapshot = makeFrame('left', [25, 25, 23, 23, 30, 30, 1.157, 1.157])
     calRows = []
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.level.active).toBe(false)
     expect(r.level.deviation).toBeNull()
     expect(r.occupied).toBe(false)
@@ -361,7 +484,7 @@ describe('getOccupancy', () => {
     movementRows = [{ peak: 0 }]
     snapshot = makeFrame('left', [25, 25, 23, 23, 30, 30, 1.157, 1.157])
     calRows = [{ parameters: { ...BASELINE_CAL, format: 'capSense' } }]
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.level.active).toBe(false)
   })
 
@@ -370,7 +493,7 @@ describe('getOccupancy', () => {
       throw new Error('db gone')
     })
     snapshot = null
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.movement.peakScore).toBe(0)
     expect(r.occupied).toBe(false)
   })
@@ -379,7 +502,7 @@ describe('getOccupancy', () => {
     movementRows = [{ peak: 0 }]
     snapshot = makeFrame('left', [25, 25, 23])
     calRows = [{ parameters: BASELINE_CAL }]
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.level.active).toBe(false)
     expect(r.level.deviation).toBeNull()
     expect(r.level.threshold).toBe(BASELINE_CAL.threshold)
@@ -390,7 +513,7 @@ describe('getOccupancy', () => {
     movementRows = [{ peak: 0 }]
     snapshot = makeFrame('left', [25, 25, 23, 23, 30, 30])
     calRows = [{ parameters: BASELINE_CAL }]
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.level.active).toBe(true)
     expect(r.level.deviation as number).toBeGreaterThan(BASELINE_CAL.threshold)
   })
@@ -401,7 +524,7 @@ describe('getOccupancy', () => {
     movementRows = [{ peak: 0 }]
     snapshot = makeFrame('left', [25, 25, 23, 23, 30, 30, 1.16, 1.16])
     calRows = [{ parameters: calNoRef }]
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.level.active).toBe(true)
   })
 
@@ -409,7 +532,7 @@ describe('getOccupancy', () => {
     movementRows = [{ peak: 0 }]
     snapshot = makeFrame('left', [25, 25, 23, 23, 30, 30, 1.157, 1.157])
     calRows = [{ parameters: { ...BASELINE_CAL, channels: { A: { mean: 'bad' }, B: { mean: 13.65 }, C: { mean: 19.3 } } } }]
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.level.active).toBe(false)
     expect(r.level.threshold).toBeNull()
   })
@@ -427,7 +550,7 @@ describe('getOccupancy', () => {
       },
     }]
 
-    const result = getOccupancy('left')
+    const result = getLegacyOccupancy('left')
 
     expect(result.level).toMatchObject({ active: false, deviation: null, threshold: null })
   })
@@ -438,7 +561,7 @@ describe('getOccupancy', () => {
     movementRows = [{ peak: 0 }]
     snapshot = makeFrame('left', [25, 25, 23, 23, 30, 30, 1.157, 1.157])
     calRows = [{ parameters: noThreshold }]
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.level.active).toBe(false)
     expect(r.level.threshold).toBeNull()
   })
@@ -446,7 +569,7 @@ describe('getOccupancy', () => {
   it('handles empty movement row (peak=null) without throwing', () => {
     movementRows = [{ peak: null }]
     snapshot = null
-    const r = getOccupancy('right')
+    const r = getLegacyOccupancy('right')
     expect(r.movement.peakScore).toBe(0)
     expect(r.movement.active).toBe(false)
   })
@@ -455,7 +578,7 @@ describe('getOccupancy', () => {
     movementRows = [{ peak: 0 }]
     snapshot = makeFrame('right', [25, 25, 23, 23, 30, 30, 1.157, 1.157])
     calRows = [{ parameters: BASELINE_CAL }]
-    const r = getOccupancy('right')
+    const r = getLegacyOccupancy('right')
     expect(r.level.active).toBe(true)
   })
 
@@ -465,7 +588,7 @@ describe('getOccupancy', () => {
     calAll.mockImplementationOnce(() => {
       throw new Error('cal db gone')
     })
-    const r = getOccupancy('left')
+    const r = getLegacyOccupancy('left')
     expect(r.level.active).toBe(false)
     expect(r.level.threshold).toBeNull()
   })
