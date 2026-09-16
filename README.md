@@ -213,6 +213,9 @@ the bridge resolves config in this order: `device_settings` row > env var > buil
 | `<prefix>/<device-id>/state/<side>/target-level` | pod → broker | `{"level": -10..10, "targetTemperature": <°F>, "isPowered": <boolean>}` |
 | `<prefix>/<device-id>/state/water-level` | pod → broker | `low` / `ok` / `unknown` |
 | `<prefix>/<device-id>/state/biometrics/<side>` | pod → broker | latest HR / HRV / BR |
+| `<prefix>/<device-id>/state/occupancy/<side>/legacy` | pod → broker | previous movement/calibrated-level detector for comparison and fallback evidence |
+| `<prefix>/<device-id>/state/occupancy/<side>/adaptive` | pod → broker | production adaptive load state, classification, and scores |
+| `<prefix>/<device-id>/availability/adaptive-occupancy` | pod → broker | `online` while both adaptive side states are fresh, otherwise `offline` |
 | `<prefix>/<device-id>/state/environment/ambient` | pod → broker | `{"ts": <epoch_ms>, "temperature": <number\|null>, "humidity": <number\|null>}` (°C, %) |
 | `<prefix>/<device-id>/cmd/set-temperature` | broker → pod | `{"side","temperature","duration?"}` |
 | `<prefix>/<device-id>/cmd/set-target-level` | broker → pod | `{"side","level","duration?"}` where level is normalized `-10..10` |

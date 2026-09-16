@@ -22,6 +22,8 @@
  *   <prefix>/<device-id>/state/schedules             — retained alarm schedule mirror
  *   <prefix>/<device-id>/state/water-level           — low | ok | unknown
  *   <prefix>/<device-id>/state/biometrics/<side>     — latest HR/HRV/BR summary
+ *   <prefix>/<device-id>/state/occupancy/<side>/legacy   — previous detector
+ *   <prefix>/<device-id>/state/occupancy/<side>/adaptive — production adaptive load
  *   <prefix>/<device-id>/state/environment/ambient   — ambient temp (°C) + humidity (%)
  *   <prefix>/<device-id>/cmd/set-temperature         — JSON {side, temperature, duration?}
  *   <prefix>/<device-id>/cmd/set-target-level        — JSON {side, level, duration?}
@@ -46,8 +48,9 @@ import mqtt, { type IClientOptions, type IClientPublishOptions, type MqttClient 
 import { eq, desc } from 'drizzle-orm'
 import { db, biometricsDb } from '@/src/db'
 import { alarmSchedules, deviceSettings, deviceState, powerSchedules, temperatureSchedules } from '@/src/db/schema'
-import { bedTemp, flowReadings, vitals } from '@/src/db/biometrics-schema'
+import { adaptiveOccupancyState, bedTemp, flowReadings, vitals } from '@/src/db/biometrics-schema'
 import { getPumpStallNotice } from '@/src/hardware/pumpStallNotification'
+import { getLegacyOccupancy } from '@/src/lib/occupancy'
 import { centiDegreesToC, centiPercentToPercent } from '@/src/lib/tempUtils'
 import { fahrenheitToLevel, levelToFahrenheit, type Side } from '@/src/hardware/types'
 import { triggerHapticConfirm } from '@/src/hardware/sensorHaptics'
@@ -64,6 +67,7 @@ const STATE_PUBLISH_INTERVAL_MS = 30_000
 const RECONNECT_PERIOD_MS = 5_000
 const CONNECT_TIMEOUT_MS = 10_000
 const TEST_CONNECT_TIMEOUT_MS = 5_000
+const ADAPTIVE_OCCUPANCY_STALE_SECONDS = 60
 const USER_TARGET_LEVEL_MIN = -10
 const USER_TARGET_LEVEL_MAX = 10
 const SIDES = ['left', 'right'] as const
@@ -730,6 +734,94 @@ function publishHaDiscovery(): void {
     device: dev,
   })
 
+  const occupancyBinary = (
+    side: ScheduleSide,
+    algorithm: 'primary' | 'legacy' | 'adaptive',
+  ) => {
+    const adaptive = algorithm !== 'legacy'
+    const stateTopic = topic(
+      'state',
+      'occupancy',
+      side,
+      adaptive ? 'adaptive' : 'legacy',
+    )
+    const label = side === 'left' ? 'Left' : 'Right'
+    const common = {
+      name: algorithm === 'primary'
+        ? `${label} occupancy`
+        : `${label} occupancy (${adaptive ? 'adaptive load' : 'legacy'})`,
+      unique_id: algorithm === 'primary'
+        ? `${id}_${side}_occupancy`
+        : `${id}_${side}_occupancy_${algorithm}`,
+      state_topic: stateTopic,
+      value_template: adaptive
+        ? `{{ 'on' if value_json.loadPresent else 'off' }}`
+        : `{{ 'on' if value_json.occupied else 'off' }}`,
+      json_attributes_topic: stateTopic,
+      payload_on: 'on',
+      payload_off: 'off',
+      device_class: 'occupancy',
+      device: dev,
+    }
+    if (!adaptive) {
+      return {
+        ...common,
+        availability_topic: availability,
+        payload_available: 'online',
+        payload_not_available: 'offline',
+      }
+    }
+    return {
+      ...common,
+      availability: [
+        {
+          topic: availability,
+          payload_available: 'online',
+          payload_not_available: 'offline',
+        },
+        {
+          topic: topic('availability', 'adaptive-occupancy'),
+          payload_available: 'online',
+          payload_not_available: 'offline',
+        },
+      ],
+      availability_mode: 'all',
+    }
+  }
+
+  const adaptiveClassification = (side: ScheduleSide) => {
+    const stateTopic = topic('state', 'occupancy', side, 'adaptive')
+    return {
+      name: `${side === 'left' ? 'Left' : 'Right'} occupancy classification`,
+      unique_id: `${id}_${side}_occupancy_classification`,
+      state_topic: stateTopic,
+      value_template: '{{ value_json.classification }}',
+      json_attributes_topic: stateTopic,
+      availability: [
+        {
+          topic: availability,
+          payload_available: 'online',
+          payload_not_available: 'offline',
+        },
+        {
+          topic: topic('availability', 'adaptive-occupancy'),
+          payload_available: 'online',
+          payload_not_available: 'offline',
+        },
+      ],
+      availability_mode: 'all',
+      device_class: 'enum',
+      options: [
+        'empty',
+        'loaded_unconfirmed',
+        'inner_zone_encroachment',
+        'coupled_entry_suppressed',
+      ],
+      icon: 'mdi:bed',
+      device: dev,
+    }
+  }
+
   safePublish(
     `${haPrefix}/climate/${id}/left/config`,
     JSON.stringify(climate('left')),
@@ -770,6 +862,26 @@ function publishHaDiscovery(): void {
     safePublish(
       `${haPrefix}/button/${id}/${side}_alarm_stop/config`,
       JSON.stringify(alarmButton(side, 'stop')),
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      `${haPrefix}/binary_sensor/${id}/${side}_occupancy/config`,
+      JSON.stringify(occupancyBinary(side, 'primary')),
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      `${haPrefix}/binary_sensor/${id}/${side}_occupancy_legacy/config`,
+      JSON.stringify(occupancyBinary(side, 'legacy')),
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      `${haPrefix}/binary_sensor/${id}/${side}_occupancy_adaptive/config`,
+      JSON.stringify(occupancyBinary(side, 'adaptive')),
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      `${haPrefix}/sensor/${id}/${side}_occupancy_classification/config`,
+      JSON.stringify(adaptiveClassification(side)),
       RETAINED_QOS_0,
     )
   }
@@ -906,6 +1018,76 @@ function clearRemovedGestureMqttExposure(): void {
 // State publication
 // ---------------------------------------------------------------------------
 
+async function publishOccupancyState(): Promise<void> {
+  for (const side of SIDES) {
+    const legacy = getLegacyOccupancy(side)
+    safePublish(
+      topic('state', 'occupancy', side, 'legacy'),
+      JSON.stringify({
+        algorithm: 'legacy',
+        occupied: legacy.occupied,
+        available: legacy.available,
+        movementActive: legacy.movement.active,
+        movementPeakScore: legacy.movement.peakScore,
+        levelActive: legacy.level.active,
+        levelDeviation: legacy.level.deviation,
+        levelThreshold: legacy.level.threshold,
+        levelAgeMs: legacy.level.ageMs,
+      }),
+      RETAINED_QOS_0,
+    )
+  }
+
+  const adaptiveAvailability = topic('availability', 'adaptive-occupancy')
+  try {
+    const rows = await biometricsDb.select().from(adaptiveOccupancyState).all()
+    const bySide = new Map(rows.map(row => [row.side, row]))
+    const nowSeconds = Date.now() / 1000
+    const available = SIDES.every((side) => {
+      const row = bySide.get(side)
+      return row !== undefined
+        && nowSeconds - row.sampleTimestamp.getTime() / 1000 <= ADAPTIVE_OCCUPANCY_STALE_SECONDS
+    })
+    safePublish(
+      adaptiveAvailability,
+      available ? 'online' : 'offline',
+      RETAINED_QOS_0,
+    )
+    for (const side of SIDES) {
+      const row = bySide.get(side)
+      if (!row) continue
+      safePublish(
+        topic('state', 'occupancy', side, 'adaptive'),
+        JSON.stringify({
+          algorithm: row.algorithmVersion,
+          loadPresent: row.loadPresent,
+          classification: row.classification,
+          personPresent: row.personPresent,
+          score: row.score,
+          peakScore: row.peakScore,
+          loadedChannels: row.loadedChannels,
+          loadVelocityScore: row.loadVelocityScore,
+          unloadVelocityScore: row.unloadVelocityScore,
+          entryVelocitySupported: row.entryVelocitySupported,
+          reason: row.reason,
+          baseline: row.baseline,
+          sampleTimestamp: row.sampleTimestamp.toISOString(),
+          lastTransitionAt: row.lastTransitionAt?.toISOString() ?? null,
+          updatedAt: row.updatedAt.toISOString(),
+        }),
+        RETAINED_QOS_0,
+      )
+    }
+  }
+  catch (error) {
+    safePublish(adaptiveAvailability, 'offline', RETAINED_QOS_0)
+    console.warn(
+      '[mqtt] adaptive occupancy publish failed:',
+      error instanceof Error ? error.message : error,
+    )
+  }
+}
+
 async function publishSchedulesState(): Promise<void> {
   try {
     const [alarmRows, powerRows, temperatureRows] = await Promise.all([
@@ -1011,6 +1193,8 @@ function publishSideMqttStateFromFrame(frame: Record<string, unknown>, side: Sch
 
 async function publishState(): Promise<void> {
   if (!state.client?.connected) return
+
+  await publishOccupancyState()
 
   const monitor = getDacMonitorIfRunning()
   const status = monitor?.getLastStatus()

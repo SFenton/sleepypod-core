@@ -172,6 +172,30 @@ export const capSenseFrames = sqliteTable('cap_sense_frames', {
   index('idx_cap_sense_frames_timestamp').on(t.timestamp),
 ])
 
+// Current state from the adaptive capSense occupancy runtime.
+// One row per side keeps production reads and MQTT publication cheap; Home
+// Assistant Recorder owns long-term history for the published entities.
+export const adaptiveOccupancyState = sqliteTable('adaptive_occupancy_state', {
+  side: text('side', { enum: ['left', 'right'] }).primaryKey(),
+  sampleTimestamp: integer('sample_timestamp', { mode: 'timestamp' }).notNull(),
+  loadPresent: integer('load_present', { mode: 'boolean' }).notNull(),
+  classification: text('classification', {
+    enum: ['empty', 'loaded_unconfirmed', 'inner_zone_encroachment', 'coupled_entry_suppressed'],
+  }).notNull(),
+  personPresent: integer('person_present', { mode: 'boolean' }),
+  score: real('score').notNull(),
+  peakScore: real('peak_score').notNull(),
+  loadedChannels: integer('loaded_channels').notNull(),
+  loadVelocityScore: real('load_velocity_score').notNull(),
+  unloadVelocityScore: real('unload_velocity_score').notNull(),
+  entryVelocitySupported: integer('entry_velocity_supported', { mode: 'boolean' }).notNull(),
+  reason: text('reason').notNull(),
+  baseline: text('baseline', { mode: 'json' }).notNull(),
+  lastTransitionAt: integer('last_transition_at', { mode: 'timestamp' }),
+  algorithmVersion: text('algorithm_version').notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+})
+
 export const pumpAlerts = sqliteTable('pump_alerts', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   timestamp: integer('timestamp', { mode: 'timestamp' }).notNull(),

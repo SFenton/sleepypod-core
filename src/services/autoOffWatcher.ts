@@ -13,10 +13,10 @@
  * just-powered side off within seconds. See sleepypod-core-64.
  *
  * Fail-safe: auto-off only acts on a POSITIVE, reliable "empty" reading. If the
- * presence signal isn't available for a side (no fresh capacitance frame, or
- * no matching calibration — `getOccupancy().available === false`), the per-side
- * timer stands down entirely. Missing or inconsistent biometrics never trigger
- * a power-off; the global wall-clock cap remains the independent backstop.
+ * adaptive presence signal isn't fresh for a side
+ * (`getOccupancy().available === false`), the per-side timer stands down
+ * entirely. Missing or inconsistent biometrics never trigger a power-off; the
+ * global wall-clock cap remains the independent backstop.
  */
 
 import { eq, and } from 'drizzle-orm'
@@ -166,8 +166,8 @@ function getPoweredOnAtMs(side: Side): number | null {
 
 /**
  * Live presence for a side. Returns:
- *   'occupied'    — someone is in bed (movement or calibrated level signal)
- *   'empty'       — reliably sensed empty (level signal evaluable, not occupied)
+ *   'occupied'    — adaptive sustained load is present
+ *   'empty'       — fresh adaptive state reliably reports no sustained load
  *   'unsensable'  — presence can't be sensed; auto-off must stand down
  */
 function presenceState(side: Side): 'occupied' | 'empty' | 'unsensable' {

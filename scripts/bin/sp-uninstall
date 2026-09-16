@@ -61,6 +61,7 @@ SERVICES=(
   sleepypod-environment-monitor.service
   sleepypod-calibrator.service
   sleepypod-cover-buttons.service
+  sleepypod-adaptive-occupancy.service
   sleepypod-occupancy-study-recorder.service
 )
 for svc in "${SERVICES[@]}"; do

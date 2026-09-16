@@ -665,8 +665,8 @@ export const biometricsRouter = router({
   /**
    * Current bed occupancy for both sides. Single source of truth used by
    * the HomeKit OccupancySensor accessory and the web-app PresenceCard.
-   * Combines the movement-table 15-min window with the live capacitance level
-   * signal vs its matching calibration baseline. See `src/lib/occupancy.ts`.
+   * Uses fresh adaptive sustained-load state with a fail-safe unavailable
+   * legacy fallback. See `src/lib/occupancy.ts`.
    */
   getOccupancy: publicProcedure
     .meta({ openapi: { method: 'GET', path: '/biometrics/occupancy', protect: false, tags: ['Biometrics'] } })
@@ -674,9 +674,8 @@ export const biometricsRouter = router({
     .output(z.object({
       left: z.object({
         occupied: z.boolean(),
-        // True when presence can be sensed reliably enough to act on absence
-        // (fresh capacitance frame + matching calibration). The Settings UI
-        // gates the auto-off toggle on this.
+        // True when adaptive state is fresh enough to act on absence. The
+        // Settings UI gates the auto-off toggle on this.
         available: z.boolean(),
         movement: z.object({ active: z.boolean(), peakScore: z.number() }),
         level: z.object({
@@ -688,9 +687,8 @@ export const biometricsRouter = router({
       }),
       right: z.object({
         occupied: z.boolean(),
-        // True when presence can be sensed reliably enough to act on absence
-        // (fresh capacitance frame + matching calibration). The Settings UI
-        // gates the auto-off toggle on this.
+        // True when adaptive state is fresh enough to act on absence. The
+        // Settings UI gates the auto-off toggle on this.
         available: z.boolean(),
         movement: z.object({ active: z.boolean(), peakScore: z.number() }),
         level: z.object({

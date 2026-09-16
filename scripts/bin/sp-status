@@ -157,7 +157,8 @@ printf ".RAW.gz in archive:            %s\n" "$(count_archive_gz /persistent/bio
 probe_section "sleepypod modules"
 for m in sleepypod-piezo-processor sleepypod-sleep-detector \
          sleepypod-environment-monitor sleepypod-cover-buttons \
-         sleepypod-calibrator sleepypod-occupancy-study-recorder; do
+         sleepypod-calibrator sleepypod-adaptive-occupancy \
+         sleepypod-occupancy-study-recorder; do
   printf "%-40s %s\n" "$m.service" "$(active_or "$m.service")"
 done
 

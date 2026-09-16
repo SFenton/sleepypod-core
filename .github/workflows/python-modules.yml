@@ -81,6 +81,11 @@ jobs:
             target: .
             cov_source: .
             deps: ""
+          - name: adaptive-occupancy
+            workdir: modules/adaptive-occupancy
+            target: .
+            cov_source: .
+            deps: ""
 
     steps:
       - name: Checkout
