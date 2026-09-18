@@ -337,6 +337,7 @@ function mqttAlarmFromRow(row: AlarmScheduleRow) {
     alarmTemperature: row.alarmTemperature,
     duration: row.duration,
     enabled: row.enabled,
+    id: row.id,
     time: row.time,
     vibrationIntensity: row.vibrationIntensity,
     vibrationPattern: row.vibrationPattern,
@@ -368,7 +369,13 @@ function mqttTemperaturesFromRows(rows: TemperatureScheduleRow[]) {
 }
 
 function buildSchedulesPayload(rows: ScheduleRows, ts = Date.now()) {
-  const payload: Record<string, unknown> = { state: 'ready', ts }
+  const payload: Record<string, unknown> = {
+    alarm_day_semantics: 'execution',
+    provider: 'sleepypod',
+    schema_version: 2,
+    state: 'ready',
+    ts,
+  }
   for (const side of SIDES) {
     payload[side] = Object.fromEntries(SCHEDULE_DAYS.map(day => [
       day,
@@ -1675,5 +1682,6 @@ export const __test__ = {
   deviceId,
   slugify,
   parsePayload,
+  buildSchedulesPayload,
   state,
 }

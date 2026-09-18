@@ -393,6 +393,24 @@ async function startBridgeWithFake(opts: {
   return fake
 }
 
+async function publishSchedulesThroughMqtt(): Promise<Record<string, any>> {
+  const fake = await startBridgeWithFake({ config: { haDiscovery: false } })
+  fake.connected = true
+  fake.emit('connect')
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  const schedulePublish = fake.publish.mock.calls.find(([publishedTopic]) =>
+    publishedTopic === `sleepypod/${deviceId()}/state/schedules`,
+  )
+  expect(schedulePublish).toBeDefined()
+  const payload = schedulePublish?.[1]
+  const text = Buffer.isBuffer(payload) ? payload.toString('utf-8') : payload
+  expect(typeof text).toBe('string')
+
+  await shutdownMqttBridge()
+  return JSON.parse(text as string) as Record<string, any>
+}
+
 describe('mqttBridge — resolveConfig source attribution', () => {
   it('returns "default" sources for every field when neither DB nor env is set', async () => {
     const { config, sources } = await resolveConfig()
@@ -958,6 +976,86 @@ describe('mqttBridge — startMqttBridge connect flow', () => {
 
     expect(bridgeState.runState).toBe('starting')
     await shutdownMqttBridge()
+  })
+})
+
+describe('mqttBridge — Wake Light v2 schedules payload', () => {
+  const alarm = (overrides: Record<string, unknown> = {}) => ({
+    id: 10,
+    side: 'left',
+    dayOfWeek: 'monday',
+    time: '07:00',
+    vibrationIntensity: 65,
+    vibrationPattern: 'rise',
+    duration: 45,
+    alarmTemperature: 84,
+    enabled: true,
+    ...overrides,
+  })
+
+  beforeEach(() => {
+    process.env.MQTT_DEVICE_ID = 'wake-test'
+  })
+
+  it('publishes complete v2 metadata, both sides, empty days, and existing alarm fields', async () => {
+    dbMock.state.alarmScheduleRows = [
+      alarm({ id: 10, side: 'left' }),
+      alarm({
+        id: 20,
+        side: 'right',
+        dayOfWeek: 'tuesday',
+        time: '06:30',
+        vibrationIntensity: 80,
+        vibrationPattern: 'double',
+        duration: 30,
+        alarmTemperature: 82,
+        enabled: false,
+      }),
+    ]
+
+    const payload = await publishSchedulesThroughMqtt()
+
+    expect(payload).toMatchObject({
+      schema_version: 2,
+      provider: 'sleepypod',
+      alarm_day_semantics: 'execution',
+      state: 'ready',
+      left: expect.any(Object),
+      right: expect.any(Object),
+    })
+    expect(typeof payload.ts).toBe('number')
+    expect(payload.left.monday.alarms).toEqual([{
+      alarmTemperature: 84,
+      duration: 45,
+      enabled: true,
+      id: 10,
+      time: '07:00',
+      vibrationIntensity: 65,
+      vibrationPattern: 'rise',
+    }])
+    expect(payload.right.tuesday.alarms).toEqual([{
+      alarmTemperature: 82,
+      duration: 30,
+      enabled: false,
+      id: 20,
+      time: '06:30',
+      vibrationIntensity: 80,
+      vibrationPattern: 'double',
+    }])
+    expect(payload.left.sunday.alarms).toEqual([])
+    expect(payload.right.monday.alarms).toEqual([])
+  })
+
+  it('retains stable distinct IDs and time-then-ID ordering for reversed same-time DB rows', async () => {
+    dbMock.state.alarmScheduleRows = [
+      alarm({ id: 20, time: '07:00' }),
+      alarm({ id: 30, time: '06:30' }),
+      alarm({ id: 10, time: '07:00' }),
+    ]
+
+    const payload = await publishSchedulesThroughMqtt()
+
+    expect(payload.left.monday.alarms.map((row: { id: number }) => row.id)).toEqual([30, 10, 20])
   })
 })
 
