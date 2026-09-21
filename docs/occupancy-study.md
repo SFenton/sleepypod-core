@@ -172,6 +172,46 @@ useful while forcing absence-triggered behavior such as auto-off to stand down.
 The Python sleep-session detector remains independent and continues to process
 its own raw sensor stream.
 
+## Fused occupancy shadow
+
+The core also evaluates a non-controlling, versioned fused decision per side.
+It is deliberately separate from the production primary entities and every
+existing consumer while the transition-certified clear logic is validated.
+
+The pure state machine reports:
+
+- `occupied` from fresh adaptive load or a credible same-side return;
+- `clear` from fresh adaptive clear or a maintained exit certificate;
+- `unavailable` when current adaptive evidence cannot support a decision.
+
+The initial certificate seeds are a three-minute robust loaded baseline,
+adaptive score collapse to at most 40% of that baseline, loaded-channel
+collapse to at most one, piezo energy collapse to at most 25% of its baseline,
+both deployed piezo exit features below threshold, and 30 seconds of
+continuous confirmation. Pump-coupled samples, source gaps,
+stale evidence, process restart, material cap rebound, or a new load impulse
+invalidate the candidate or certificate. These values are shadow-study
+parameters, not promoted production thresholds.
+
+The piezo processor records its guarded pump mode on every presence decision,
+including while the existing detector remains in its present hysteresis state,
+so the shadow cannot interpret an active-pump exit window as pump-safe.
+
+MQTT publishes:
+
+- `state/occupancy/<side>/fused-shadow` — plain, non-retained `ON` / `OFF`
+  heartbeat;
+- `availability/occupancy/<side>/fused-shadow` — retained per-side
+  `online` / `offline`;
+- `state/occupancy/<side>/fused-shadow/decision` — retained, low-churn
+  classification, reason, provenance, and certificate diagnostics.
+
+Home Assistant discovery marks both shadow entities diagnostic, disabled, and
+hidden by default. The binary sensor uses `expire_after: 3` with a one-second
+heartbeat and combines the Pod LWT with per-side decision availability. The
+existing primary, adaptive, legacy, HomeKit, API/web, and auto-off contracts
+remain unchanged.
+
 ## Suggested labeled trial
 
 Keep the bed empty for at least five minutes, then label `contact_start`,

@@ -1224,35 +1224,31 @@ class SideProcessor:
         # cardiac band, both sides look "real"). In both, require elevated
         # energy AND strong autocorrelation to enter PRESENT; coupling
         # rarely produces both, only a real person does.
-        pump_mode = None
-        if self._pump_state is not None and self._presence.state == PresenceDetector.ABSENT:
-            symmetric = self._pump_state.is_symmetric_active()
-            asymmetric = self._pump_state.is_asymmetric_for(self.side)
-            if symmetric or asymmetric:
-                pump_mode = "symmetric" if symmetric else "asymmetric"
-                std_threshold = self._presence.enter_threshold * PUMP_COUPLING_STD_FACTOR
-                if not (med_std > std_threshold and acr_qual > PUMP_COUPLING_ACR_THRESHOLD):
-                    log.debug(
-                        "%s: pump-coupling guard suppressed presence "
-                        "(med_std=%.0f, acr=%.2f, mode=%s)",
-                        self.side, med_std, acr_qual,
-                        pump_mode,
-                    )
-                    cap_present, cap_age = (
-                        self._cap_tracker.get(self.side, now)
-                        if self._cap_tracker else (None, None)
-                    )
-                    write_presence_decision(
-                        self.db_holder, self.side, int(now), False,
-                        med_std, acr_qual, self._presence.enter_threshold,
-                        self._presence.exit_threshold, "pump_suppressed",
-                        cap_present, cap_age,
-                        self._other._last_med_std if self._other else None,
-                        self._other._last_acr_qual if self._other else None,
-                        pump_mode,
-                    )
-                    self._last_write = now
-                    return
+        pump_mode = self._pump_mode()
+        if pump_mode is not None and self._presence.state == PresenceDetector.ABSENT:
+            std_threshold = self._presence.enter_threshold * PUMP_COUPLING_STD_FACTOR
+            if not (med_std > std_threshold and acr_qual > PUMP_COUPLING_ACR_THRESHOLD):
+                log.debug(
+                    "%s: pump-coupling guard suppressed presence "
+                    "(med_std=%.0f, acr=%.2f, mode=%s)",
+                    self.side, med_std, acr_qual,
+                    pump_mode,
+                )
+                cap_present, cap_age = (
+                    self._cap_tracker.get(self.side, now)
+                    if self._cap_tracker else (None, None)
+                )
+                write_presence_decision(
+                    self.db_holder, self.side, int(now), False,
+                    med_std, acr_qual, self._presence.enter_threshold,
+                    self._presence.exit_threshold, "pump_suppressed",
+                    cap_present, cap_age,
+                    self._other._last_med_std if self._other else None,
+                    self._other._last_acr_qual if self._other else None,
+                    pump_mode,
+                )
+                self._last_write = now
+                return
 
         previous_state = self._presence.state
         present = self._presence.update(med_std, acr_qual)

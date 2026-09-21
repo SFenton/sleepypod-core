@@ -1269,6 +1269,34 @@ class TestSideProcessorAbsenceThrottle:
         assert time.time() - proc._last_write < VITALS_INTERVAL_S, \
             "absence skip must update _last_write to bound burst processing"
 
+    def test_presence_decision_records_active_pump_mode(self, monkeypatch):
+        import main
+
+        writes = []
+        pump_state = FrzHealthPumpState()
+        pump_state.update({
+            "type": "frzHealth",
+            "left": {"pumpRpm": 1900},
+            "right": {"pumpRpm": 2000},
+        })
+        proc = SideProcessor(
+            "left",
+            db_holder=object(),
+            pump_state=pump_state,
+        )
+        proc._presence.state = PresenceDetector.PRESENT
+        monkeypatch.setattr(proc._presence, "update", lambda *_: False)
+        monkeypatch.setattr(
+            main,
+            "write_presence_decision",
+            lambda *args: writes.append(args) or True,
+        )
+        proc._hr_buf.extend(np.zeros(10 * SAMPLE_RATE, dtype=np.int32))
+
+        proc._maybe_write()
+
+        assert writes[0][13] == "symmetric"
+
 
 class TestIntegration:
     """Verify that pipeline components work together on realistic signals."""
