@@ -17,6 +17,7 @@ const dbMock = vi.hoisted(() => {
     throwOnSelect: boolean
     biometricsRow: any | null
     adaptiveRows: any[]
+    piezoRows: any[]
     deviceStateRows: any[]
     bedTempRow: any | null
     alarmScheduleRows: any[]
@@ -25,11 +26,13 @@ const dbMock = vi.hoisted(() => {
     throwOnBedTemp: false | true | string
     throwOnDeviceState: false | true | string
     throwOnBiometrics: false | true | string
+    throwOnFusedOccupancy: false | true | string
   } = {
     row: undefined,
     throwOnSelect: false,
     biometricsRow: null,
     adaptiveRows: [],
+    piezoRows: [],
     deviceStateRows: [],
     bedTempRow: null,
     alarmScheduleRows: [],
@@ -38,6 +41,7 @@ const dbMock = vi.hoisted(() => {
     throwOnBedTemp: false,
     throwOnDeviceState: false,
     throwOnBiometrics: false,
+    throwOnFusedOccupancy: false,
   }
   // The bridge calls db.select() several ways:
   //   1. .from(deviceSettings).limit(1)         — resolveConfig
@@ -58,6 +62,7 @@ const dbMock = vi.hoisted(() => {
     if (name === 'temperature_schedules') return state.temperatureScheduleRows
     if (name === 'device_state') return state.deviceStateRows
     if (name === 'adaptive_occupancy_state') return state.adaptiveRows
+    if (name === 'piezo_presence_decisions') return state.piezoRows
     return []
   }
 
@@ -73,27 +78,51 @@ const dbMock = vi.hoisted(() => {
         where: vi.fn(() => ({
           all: vi.fn(async () => rowsForTable(name)),
           orderBy: vi.fn(() => ({
-            limit: vi.fn(async () => {
+            limit: vi.fn(async (limit = 1) => {
               if (state.throwOnBiometrics !== false) {
                 throw typeof state.throwOnBiometrics === 'string'
                   ? state.throwOnBiometrics
                   : new Error('biometrics boom')
+              }
+              if (name === 'piezo_presence_decisions') {
+                return rowsForTable(name).slice(0, limit)
               }
               return state.biometricsRow ? [state.biometricsRow] : []
             }),
           })),
         })),
         orderBy: vi.fn(() => ({
-          limit: vi.fn(async () => {
+          limit: vi.fn(async (limit = 1) => {
+            if (
+              name === 'piezo_presence_decisions'
+              && state.throwOnFusedOccupancy !== false
+            ) {
+              throw typeof state.throwOnFusedOccupancy === 'string'
+                ? state.throwOnFusedOccupancy
+                : new Error('fused occupancy boom')
+            }
             if (state.throwOnBedTemp !== false) {
               throw typeof state.throwOnBedTemp === 'string'
                 ? state.throwOnBedTemp
                 : new Error('bed_temp boom')
             }
+            if (name === 'piezo_presence_decisions') {
+              return rowsForTable(name).slice(0, limit)
+            }
             return state.bedTempRow ? [state.bedTempRow] : []
           }),
         })),
-        all: vi.fn(async () => rowsForTable(name)),
+        all: vi.fn(async () => {
+          if (
+            name === 'adaptive_occupancy_state'
+            && state.throwOnFusedOccupancy !== false
+          ) {
+            throw typeof state.throwOnFusedOccupancy === 'string'
+              ? state.throwOnFusedOccupancy
+              : new Error('fused occupancy boom')
+          }
+          return rowsForTable(name)
+        }),
         // Make `.from(deviceState)` itself awaitable so
         // bridge state publishers can iterate rows after `await db.select().from(...)`.
         then: (resolve: (rows: any[]) => any, reject?: (err: unknown) => any) => {
@@ -316,6 +345,7 @@ beforeEach(() => {
   dbMock.state.throwOnSelect = false
   dbMock.state.biometricsRow = null
   dbMock.state.adaptiveRows = []
+  dbMock.state.piezoRows = []
   dbMock.state.deviceStateRows = []
   dbMock.state.bedTempRow = null
   dbMock.state.alarmScheduleRows = []
@@ -324,6 +354,7 @@ beforeEach(() => {
   dbMock.state.throwOnBedTemp = false
   dbMock.state.throwOnDeviceState = false
   dbMock.state.throwOnBiometrics = false
+  dbMock.state.throwOnFusedOccupancy = false
   mqttMock.state.nextClient = null
   mqttMock.state.throwOnConnect = null
   mqttMock.connect.mockClear()
@@ -354,6 +385,7 @@ beforeEach(() => {
   })
   hapticMock.triggerHapticConfirm.mockClear()
   schedulesMock.batchUpdate.mockClear()
+  bridgeState.fusedOccupancyLastWarningAt = 0
 })
 
 afterEach(() => {
@@ -371,6 +403,12 @@ async function startBridgeWithFake(opts: {
   bridgeState.runState = 'stopped'
   bridgeState.lastError = null
   bridgeState.publishTimer = null
+  bridgeState.fusedOccupancyTimer = null
+  bridgeState.fusedOccupancyProvider = null
+  bridgeState.fusedOccupancyPublishInFlight = false
+  bridgeState.fusedOccupancyAvailability = { left: null, right: null }
+  bridgeState.fusedOccupancyDecisionRevision = { left: null, right: null }
+  bridgeState.fusedOccupancyLastWarningAt = 0
   bridgeState.unsubscribeFrame = null
   bridgeState.resolved = null
   bridgeState.messagesPublished = 0
@@ -1286,6 +1324,62 @@ describe('mqttBridge — HA discovery payload content', () => {
     }
   }
 
+  function fusedShadowAvailability(side: 'left' | 'right') {
+    return [
+      { topic: AVAILABILITY, payload_available: 'online', payload_not_available: 'offline' },
+      {
+        topic: `sleepypod/testpod/availability/occupancy/${side}/fused-shadow`,
+        payload_available: 'online',
+        payload_not_available: 'offline',
+      },
+    ]
+  }
+
+  function fusedShadowBinaryCfg(side: 'left' | 'right'): Record<string, unknown> {
+    const label = side === 'left' ? 'Left' : 'Right'
+    return {
+      name: `${label} occupancy (fused shadow)`,
+      unique_id: `testpod_${side}_occupancy_fused_shadow`,
+      state_topic: `sleepypod/testpod/state/occupancy/${side}/fused-shadow`,
+      payload_on: 'ON',
+      payload_off: 'OFF',
+      expire_after: 3,
+      availability: fusedShadowAvailability(side),
+      availability_mode: 'all',
+      device_class: 'occupancy',
+      entity_category: 'diagnostic',
+      enabled_by_default: false,
+      visible_by_default: false,
+      device: DEVICE,
+    }
+  }
+
+  function fusedShadowDecisionCfg(side: 'left' | 'right'): Record<string, unknown> {
+    const label = side === 'left' ? 'Left' : 'Right'
+    const stateTopic = `sleepypod/testpod/state/occupancy/${side}/fused-shadow/decision`
+    return {
+      name: `${label} occupancy decision (fused shadow)`,
+      unique_id: `testpod_${side}_occupancy_fused_shadow_decision`,
+      state_topic: stateTopic,
+      value_template: '{{ value_json.classification }}',
+      json_attributes_topic: stateTopic,
+      availability: fusedShadowAvailability(side),
+      availability_mode: 'all',
+      device_class: 'enum',
+      options: [
+        'occupied_adaptive',
+        'clear_adaptive',
+        'clear_exit_certified',
+        'unavailable',
+      ],
+      icon: 'mdi:bed-clock',
+      entity_category: 'diagnostic',
+      enabled_by_default: false,
+      visible_by_default: false,
+      device: DEVICE,
+    }
+  }
+
   let configs: Map<string, Record<string, unknown>>
 
   beforeEach(async () => {
@@ -1327,6 +1421,10 @@ describe('mqttBridge — HA discovery payload content', () => {
       .toEqual(occupancyBinaryCfg(side, 'adaptive'))
     expect(configs.get(`homeassistant/sensor/testpod/${side}_occupancy_classification/config`))
       .toEqual(occupancyClassificationCfg(side))
+    expect(configs.get(`homeassistant/binary_sensor/testpod/${side}_occupancy_fused_shadow/config`))
+      .toEqual(fusedShadowBinaryCfg(side))
+    expect(configs.get(`homeassistant/sensor/testpod/${side}_occupancy_fused_shadow_decision/config`))
+      .toEqual(fusedShadowDecisionCfg(side))
   })
 
   it('publishes the full water_level sensor config', () => {
@@ -2000,6 +2098,72 @@ describe('mqttBridge — publishState content', () => {
 })
 
 describe('mqttBridge — periodic publish + shutdown edges', () => {
+  function setFreshShadowRows() {
+    const now = new Date(Date.now())
+    dbMock.state.adaptiveRows = [
+      {
+        side: 'left',
+        sampleTimestamp: now,
+        loadPresent: false,
+        classification: 'empty',
+        personPresent: false,
+        score: 1,
+        peakScore: 0.5,
+        loadedChannels: 0,
+        loadVelocityScore: 0,
+        unloadVelocityScore: 0,
+        entryVelocitySupported: false,
+        reason: 'empty_hold',
+        baseline: [1, 1, 1],
+        lastTransitionAt: now,
+        algorithmVersion: 'adaptive-cap-v3',
+        updatedAt: now,
+      },
+      {
+        side: 'right',
+        sampleTimestamp: now,
+        loadPresent: true,
+        classification: 'loaded_unconfirmed',
+        personPresent: null,
+        score: 10,
+        peakScore: 5,
+        loadedChannels: 3,
+        loadVelocityScore: 0,
+        unloadVelocityScore: 0,
+        entryVelocitySupported: false,
+        reason: 'occupied_hold',
+        baseline: [1, 1, 1],
+        lastTransitionAt: now,
+        algorithmVersion: 'adaptive-cap-v3',
+        updatedAt: now,
+      },
+    ]
+    dbMock.state.piezoRows = [
+      {
+        side: 'left',
+        timestamp: now,
+        present: false,
+        medStd: 100_000,
+        autocorrelationQuality: 0.1,
+        enterThreshold: 400_000,
+        exitThreshold: 150_000,
+        decisionReason: 'absent_hold',
+        pumpMode: null,
+      },
+      {
+        side: 'right',
+        timestamp: now,
+        present: true,
+        medStd: 900_000,
+        autocorrelationQuality: 0.6,
+        enterThreshold: 400_000,
+        exitThreshold: 150_000,
+        decisionReason: 'present_hold',
+        pumpMode: null,
+      },
+    ]
+  }
+
   it('re-runs publishState on the 30s interval after start', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] })
     try {
@@ -2018,6 +2182,58 @@ describe('mqttBridge — periodic publish + shutdown edges', () => {
     finally {
       vi.useRealTimers()
     }
+  })
+
+  it('heartbeats fused shadow state every second without republishing unchanged diagnostics', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] })
+    try {
+      setFreshShadowRows()
+      const fake = await startBridgeWithFake()
+      fake.connected = true
+      fake.emit('connect')
+      await vi.advanceTimersByTimeAsync(0)
+
+      const stateTopic = `sleepypod/${deviceId()}/state/occupancy/left/fused-shadow`
+      const decisionTopic = `${stateTopic}/decision`
+      const countTopic = (publishedTopic: string) =>
+        fake.publish.mock.calls.filter(([topic]) => topic === publishedTopic).length
+      const stateBaseline = countTopic(stateTopic)
+      const decisionBaseline = countTopic(decisionTopic)
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(countTopic(stateTopic)).toBeGreaterThan(stateBaseline)
+      expect(countTopic(decisionTopic)).toBe(decisionBaseline)
+      await shutdownMqttBridge()
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('forces fused availability offline before publishing a reconnect decision', async () => {
+    setFreshShadowRows()
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    fake.publish.mockClear()
+
+    fake.emit('connect')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    for (const side of ['left', 'right'] as const) {
+      const availabilityTopic
+        = `sleepypod/${deviceId()}/availability/occupancy/${side}/fused-shadow`
+      const payloads = fake.publish.mock.calls
+        .filter(([publishedTopic]) => publishedTopic === availabilityTopic)
+        .map(([, payload]) => payload)
+      expect(payloads).toEqual(['offline', 'online'])
+    }
+    await shutdownMqttBridge()
   })
 
   it('skips periodic DB reads while the MQTT client is disconnected', async () => {
@@ -2331,11 +2547,14 @@ describe('mqttBridge — shutdownMqttBridge', () => {
     fake.emit('connect')
 
     expect(bridgeState.publishTimer).not.toBeNull()
+    expect(bridgeState.fusedOccupancyTimer).not.toBeNull()
     expect(bridgeState.unsubscribeFrame).not.toBeNull()
 
     await shutdownMqttBridge()
 
     expect(bridgeState.publishTimer).toBeNull()
+    expect(bridgeState.fusedOccupancyTimer).toBeNull()
+    expect(bridgeState.fusedOccupancyProvider).toBeNull()
     expect(bridgeState.unsubscribeFrame).toBeNull()
     expect(bridgeState.runState).toBe('stopped')
     expect(piezoMock.unsubscribe).toHaveBeenCalled()
@@ -2356,6 +2575,18 @@ describe('mqttBridge — shutdownMqttBridge', () => {
       typeof t === 'string' && (t as string).endsWith('/availability') && payload === 'offline',
     )
     expect(offlineCall).toBeDefined()
+    expect(fake.publish.mock.calls).toEqual(expect.arrayContaining([
+      expect.arrayContaining([
+        expect.stringContaining('/availability/occupancy/left/fused-shadow'),
+        'offline',
+        { qos: 0, retain: true },
+      ]),
+      expect.arrayContaining([
+        expect.stringContaining('/availability/occupancy/right/fused-shadow'),
+        'offline',
+        { qos: 0, retain: true },
+      ]),
+    ]))
   })
 
   it('does not publish offline availability when the client is already disconnected', async () => {
@@ -2770,6 +3001,14 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
           payload_not_available: 'offline',
         },
       ]
+      const fusedShadowAvailability = [
+        { topic: AVAIL, payload_available: 'online', payload_not_available: 'offline' },
+        {
+          topic: `sleepypod/${ID}/availability/occupancy/${side}/fused-shadow`,
+          payload_available: 'online',
+          payload_not_available: 'offline',
+        },
+      ]
       expected[`homeassistant/binary_sensor/${ID}/${side}_occupancy/config`] = {
         name: `${Side} occupancy`,
         unique_id: `${ID}_${side}_occupancy`,
@@ -2826,6 +3065,43 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
           'coupled_entry_suppressed',
         ],
         icon: 'mdi:bed',
+        device: DEVICE,
+      }
+      expected[`homeassistant/binary_sensor/${ID}/${side}_occupancy_fused_shadow/config`] = {
+        name: `${Side} occupancy (fused shadow)`,
+        unique_id: `${ID}_${side}_occupancy_fused_shadow`,
+        state_topic: `sleepypod/${ID}/state/occupancy/${side}/fused-shadow`,
+        payload_on: 'ON',
+        payload_off: 'OFF',
+        expire_after: 3,
+        availability: fusedShadowAvailability,
+        availability_mode: 'all',
+        device_class: 'occupancy',
+        entity_category: 'diagnostic',
+        enabled_by_default: false,
+        visible_by_default: false,
+        device: DEVICE,
+      }
+      const fusedDecisionTopic = `sleepypod/${ID}/state/occupancy/${side}/fused-shadow/decision`
+      expected[`homeassistant/sensor/${ID}/${side}_occupancy_fused_shadow_decision/config`] = {
+        name: `${Side} occupancy decision (fused shadow)`,
+        unique_id: `${ID}_${side}_occupancy_fused_shadow_decision`,
+        state_topic: fusedDecisionTopic,
+        value_template: '{{ value_json.classification }}',
+        json_attributes_topic: fusedDecisionTopic,
+        availability: fusedShadowAvailability,
+        availability_mode: 'all',
+        device_class: 'enum',
+        options: [
+          'occupied_adaptive',
+          'clear_adaptive',
+          'clear_exit_certified',
+          'unavailable',
+        ],
+        icon: 'mdi:bed-clock',
+        entity_category: 'diagnostic',
+        enabled_by_default: false,
+        visible_by_default: false,
         device: DEVICE,
       }
       expected[`homeassistant/sensor/${ID}/pump_${side}_rpm/config`] = sensorCfg({
@@ -2938,6 +3214,30 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
         updatedAt: new Date(),
       },
     ]
+    dbMock.state.piezoRows = [
+      {
+        side: 'left',
+        timestamp: new Date(),
+        present: false,
+        medStd: 100_000,
+        autocorrelationQuality: 0.1,
+        enterThreshold: 400_000,
+        exitThreshold: 150_000,
+        decisionReason: 'absent_hold',
+        pumpMode: null,
+      },
+      {
+        side: 'right',
+        timestamp: new Date(),
+        present: true,
+        medStd: 900_000,
+        autocorrelationQuality: 0.6,
+        enterThreshold: 400_000,
+        exitThreshold: 150_000,
+        decisionReason: 'present_hold',
+        pumpMode: null,
+      },
+    ]
   }
 
   async function capture(
@@ -3007,6 +3307,36 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
     await shutdownMqttBridge()
   })
 
+  it('publishes disabled fused shadow occupancy with volatile state and retained diagnostics', async () => {
+    const { fake, map } = await capture()
+
+    expect(map[`sleepypod/${ID}/state/occupancy/left/fused-shadow`]).toBe('OFF')
+    expect(map[`sleepypod/${ID}/state/occupancy/right/fused-shadow`]).toBe('ON')
+    expect(map[`sleepypod/${ID}/availability/occupancy/left/fused-shadow`]).toBe('online')
+    expect(map[`sleepypod/${ID}/availability/occupancy/right/fused-shadow`]).toBe('online')
+    expect(JSON.parse(
+      map[`sleepypod/${ID}/state/occupancy/left/fused-shadow/decision`],
+    )).toMatchObject({
+      state: 'clear',
+      occupied: false,
+      available: true,
+      classification: 'clear_adaptive',
+      reason: 'adaptive_clear',
+      certificatePhase: 'observing',
+    })
+
+    const stateCall = fake.publish.mock.calls.find(([publishedTopic]) =>
+      publishedTopic === `sleepypod/${ID}/state/occupancy/left/fused-shadow`,
+    )
+    expect(stateCall?.[2]).toEqual({ qos: 0, retain: false })
+
+    const decisionCall = fake.publish.mock.calls.find(([publishedTopic]) =>
+      publishedTopic === `sleepypod/${ID}/state/occupancy/left/fused-shadow/decision`,
+    )
+    expect(decisionCall?.[2]).toEqual({ qos: 0, retain: true })
+    await shutdownMqttBridge()
+  })
+
   it('marks replayed old adaptive samples offline despite a recent database write', async () => {
     const { map } = await capture(() => {
       for (const row of dbMock.state.adaptiveRows) {
@@ -3016,6 +3346,33 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
     })
 
     expect(map[`sleepypod/${ID}/availability/adaptive-occupancy`]).toBe('offline')
+    expect(map[`sleepypod/${ID}/availability/occupancy/left/fused-shadow`]).toBe('offline')
+    expect(map[`sleepypod/${ID}/availability/occupancy/right/fused-shadow`]).toBe('offline')
+    await shutdownMqttBridge()
+  })
+
+  it('marks both shadow sides unavailable when an evidence query fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { map } = await capture(() => {
+      dbMock.state.throwOnFusedOccupancy = true
+    })
+
+    for (const side of ['left', 'right'] as const) {
+      const stateTopic = `sleepypod/${ID}/state/occupancy/${side}/fused-shadow`
+      expect(map[`sleepypod/${ID}/availability/occupancy/${side}/fused-shadow`])
+        .toBe('offline')
+      expect(JSON.parse(map[`${stateTopic}/decision`])).toMatchObject({
+        state: 'unavailable',
+        available: false,
+        classification: 'unavailable',
+        reason: 'source_read_failed',
+      })
+    }
+    expect(warn).toHaveBeenCalledWith(
+      '[mqtt] fused occupancy shadow publish failed:',
+      'fused occupancy boom',
+    )
+    warn.mockRestore()
     await shutdownMqttBridge()
   })
 

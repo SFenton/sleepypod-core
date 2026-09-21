@@ -203,7 +203,9 @@ the bridge resolves config in this order: `device_settings` row > env var > buil
 ### Topics
 
 `<prefix>` defaults to `sleepypod`. `<device-id>` is the slugified hostname
-(override with `MQTT_DEVICE_ID`). All state topics are retained.
+(override with `MQTT_DEVICE_ID`). State topics are retained except the fused
+occupancy shadow heartbeat, which is intentionally volatile and expires in
+Home Assistant if publication stalls.
 
 | Topic | Direction | Payload |
 |---|---|---|
@@ -216,6 +218,9 @@ the bridge resolves config in this order: `device_settings` row > env var > buil
 | `<prefix>/<device-id>/state/occupancy/<side>/legacy` | pod → broker | previous movement/calibrated-level detector for comparison and fallback evidence |
 | `<prefix>/<device-id>/state/occupancy/<side>/adaptive` | pod → broker | production adaptive load state, classification, and scores |
 | `<prefix>/<device-id>/availability/adaptive-occupancy` | pod → broker | `online` while both adaptive side states are fresh, otherwise `offline` |
+| `<prefix>/<device-id>/state/occupancy/<side>/fused-shadow` | pod → broker | non-retained shadow `ON` / `OFF`; no production consumer |
+| `<prefix>/<device-id>/availability/occupancy/<side>/fused-shadow` | pod → broker | retained per-side shadow decision availability |
+| `<prefix>/<device-id>/state/occupancy/<side>/fused-shadow/decision` | pod → broker | retained shadow classification, provenance, and certificate diagnostics |
 | `<prefix>/<device-id>/state/environment/ambient` | pod → broker | `{"ts": <epoch_ms>, "temperature": <number\|null>, "humidity": <number\|null>}` (°C, %) |
 | `<prefix>/<device-id>/cmd/set-temperature` | broker → pod | `{"side","temperature","duration?"}` |
 | `<prefix>/<device-id>/cmd/set-target-level` | broker → pod | `{"side","level","duration?"}` where level is normalized `-10..10` |
