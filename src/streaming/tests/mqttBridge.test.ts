@@ -925,14 +925,23 @@ describe('mqttBridge — startMqttBridge connect flow', () => {
     fake.emit('connect')
 
     const haPublishes = fake.publish.mock.calls.filter(([t]) => typeof t === 'string' && (t as string).startsWith('homeassistant/'))
-    expect(haPublishes).toHaveLength(1)
-    expect(haPublishes[0][0]).toMatch(/\/gesture_settings\/config$/)
-    expect(Buffer.isBuffer(haPublishes[0][1]) && (haPublishes[0][1] as Buffer).length === 0).toBe(true)
+    const id = deviceId()
+    expect(haPublishes).toHaveLength(5)
+    expect(haPublishes).toEqual(expect.arrayContaining([
+      expect.arrayContaining([`homeassistant/sensor/${id}/gesture_settings/config`]),
+      expect.arrayContaining([`homeassistant/binary_sensor/${id}/left_occupancy_fused_shadow/config`]),
+      expect.arrayContaining([`homeassistant/sensor/${id}/left_occupancy_fused_shadow_decision/config`]),
+      expect.arrayContaining([`homeassistant/binary_sensor/${id}/right_occupancy_fused_shadow/config`]),
+      expect.arrayContaining([`homeassistant/sensor/${id}/right_occupancy_fused_shadow_decision/config`]),
+    ]))
+    expect(haPublishes.every(([, payload]) =>
+      Buffer.isBuffer(payload) && (payload as Buffer).length === 0,
+    )).toBe(true)
 
     await shutdownMqttBridge()
   })
 
-  it('clears retained gesture MQTT state and HA discovery on connect', async () => {
+  it('clears retained removed MQTT state and HA discovery on connect', async () => {
     process.env.MQTT_DEVICE_ID = 'testpod'
     const fake = await startBridgeWithFake({ config: { haDiscovery: true, topicPrefix: 'sleepypod' } })
     fake.connected = true
@@ -942,6 +951,14 @@ describe('mqttBridge — startMqttBridge connect flow', () => {
     expect(tombstones).toEqual(expect.arrayContaining([
       expect.arrayContaining(['homeassistant/sensor/testpod/gesture_settings/config']),
       expect.arrayContaining(['sleepypod/testpod/state/button-gestures']),
+      expect.arrayContaining(['homeassistant/binary_sensor/testpod/left_occupancy_fused_shadow/config']),
+      expect.arrayContaining(['homeassistant/sensor/testpod/left_occupancy_fused_shadow_decision/config']),
+      expect.arrayContaining(['sleepypod/testpod/availability/occupancy/left/fused-shadow']),
+      expect.arrayContaining(['sleepypod/testpod/state/occupancy/left/fused-shadow/decision']),
+      expect.arrayContaining(['homeassistant/binary_sensor/testpod/right_occupancy_fused_shadow/config']),
+      expect.arrayContaining(['homeassistant/sensor/testpod/right_occupancy_fused_shadow_decision/config']),
+      expect.arrayContaining(['sleepypod/testpod/availability/occupancy/right/fused-shadow']),
+      expect.arrayContaining(['sleepypod/testpod/state/occupancy/right/fused-shadow/decision']),
     ]))
 
     await shutdownMqttBridge()
@@ -1254,15 +1271,26 @@ describe('mqttBridge — HA discovery payload content', () => {
     algorithm: 'primary' | 'legacy' | 'adaptive',
   ): Record<string, unknown> {
     const label = side === 'left' ? 'Left' : 'Right'
-    const adaptive = algorithm !== 'legacy'
+    if (algorithm === 'primary') {
+      return {
+        name: `${label} occupancy`,
+        unique_id: `testpod_${side}_occupancy`,
+        state_topic: `sleepypod/testpod/state/occupancy/${side}`,
+        payload_on: 'ON',
+        payload_off: 'OFF',
+        expire_after: 3,
+        availability: fusedOccupancyAvailability(side),
+        availability_mode: 'all',
+        device_class: 'occupancy',
+        device: DEVICE,
+      }
+    }
+
+    const adaptive = algorithm === 'adaptive'
     const stateTopic = `sleepypod/testpod/state/occupancy/${side}/${adaptive ? 'adaptive' : 'legacy'}`
     const common = {
-      name: algorithm === 'primary'
-        ? `${label} occupancy`
-        : `${label} occupancy (${adaptive ? 'adaptive load' : 'legacy'})`,
-      unique_id: algorithm === 'primary'
-        ? `testpod_${side}_occupancy`
-        : `testpod_${side}_occupancy_${algorithm}`,
+      name: `${label} occupancy (${adaptive ? 'adaptive load' : 'legacy'})`,
+      unique_id: `testpod_${side}_occupancy_${algorithm}`,
       state_topic: stateTopic,
       value_template: adaptive
         ? `{{ 'on' if value_json.loadPresent else 'off' }}`
@@ -1324,46 +1352,27 @@ describe('mqttBridge — HA discovery payload content', () => {
     }
   }
 
-  function fusedShadowAvailability(side: 'left' | 'right') {
+  function fusedOccupancyAvailability(side: 'left' | 'right') {
     return [
       { topic: AVAILABILITY, payload_available: 'online', payload_not_available: 'offline' },
       {
-        topic: `sleepypod/testpod/availability/occupancy/${side}/fused-shadow`,
+        topic: `sleepypod/testpod/availability/occupancy/${side}`,
         payload_available: 'online',
         payload_not_available: 'offline',
       },
     ]
   }
 
-  function fusedShadowBinaryCfg(side: 'left' | 'right'): Record<string, unknown> {
+  function fusedOccupancyDecisionCfg(side: 'left' | 'right'): Record<string, unknown> {
     const label = side === 'left' ? 'Left' : 'Right'
+    const stateTopic = `sleepypod/testpod/state/occupancy/${side}/decision`
     return {
-      name: `${label} occupancy (fused shadow)`,
-      unique_id: `testpod_${side}_occupancy_fused_shadow`,
-      state_topic: `sleepypod/testpod/state/occupancy/${side}/fused-shadow`,
-      payload_on: 'ON',
-      payload_off: 'OFF',
-      expire_after: 3,
-      availability: fusedShadowAvailability(side),
-      availability_mode: 'all',
-      device_class: 'occupancy',
-      entity_category: 'diagnostic',
-      enabled_by_default: false,
-      visible_by_default: false,
-      device: DEVICE,
-    }
-  }
-
-  function fusedShadowDecisionCfg(side: 'left' | 'right'): Record<string, unknown> {
-    const label = side === 'left' ? 'Left' : 'Right'
-    const stateTopic = `sleepypod/testpod/state/occupancy/${side}/fused-shadow/decision`
-    return {
-      name: `${label} occupancy decision (fused shadow)`,
-      unique_id: `testpod_${side}_occupancy_fused_shadow_decision`,
+      name: `${label} occupancy decision`,
+      unique_id: `testpod_${side}_occupancy_decision`,
       state_topic: stateTopic,
       value_template: '{{ value_json.classification }}',
       json_attributes_topic: stateTopic,
-      availability: fusedShadowAvailability(side),
+      availability: fusedOccupancyAvailability(side),
       availability_mode: 'all',
       device_class: 'enum',
       options: [
@@ -1421,10 +1430,12 @@ describe('mqttBridge — HA discovery payload content', () => {
       .toEqual(occupancyBinaryCfg(side, 'adaptive'))
     expect(configs.get(`homeassistant/sensor/testpod/${side}_occupancy_classification/config`))
       .toEqual(occupancyClassificationCfg(side))
-    expect(configs.get(`homeassistant/binary_sensor/testpod/${side}_occupancy_fused_shadow/config`))
-      .toEqual(fusedShadowBinaryCfg(side))
-    expect(configs.get(`homeassistant/sensor/testpod/${side}_occupancy_fused_shadow_decision/config`))
-      .toEqual(fusedShadowDecisionCfg(side))
+    expect(configs.get(`homeassistant/sensor/testpod/${side}_occupancy_decision/config`))
+      .toEqual(fusedOccupancyDecisionCfg(side))
+    expect(configs.has(`homeassistant/binary_sensor/testpod/${side}_occupancy_fused_shadow/config`))
+      .toBe(false)
+    expect(configs.has(`homeassistant/sensor/testpod/${side}_occupancy_fused_shadow_decision/config`))
+      .toBe(false)
   })
 
   it('publishes the full water_level sensor config', () => {
@@ -2098,7 +2109,7 @@ describe('mqttBridge — publishState content', () => {
 })
 
 describe('mqttBridge — periodic publish + shutdown edges', () => {
-  function setFreshShadowRows() {
+  function setFreshFusedRows() {
     const now = new Date(Date.now())
     dbMock.state.adaptiveRows = [
       {
@@ -2184,16 +2195,16 @@ describe('mqttBridge — periodic publish + shutdown edges', () => {
     }
   })
 
-  it('heartbeats fused shadow state every second without republishing unchanged diagnostics', async () => {
+  it('heartbeats primary fused state every second without republishing unchanged diagnostics', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] })
     try {
-      setFreshShadowRows()
+      setFreshFusedRows()
       const fake = await startBridgeWithFake()
       fake.connected = true
       fake.emit('connect')
       await vi.advanceTimersByTimeAsync(0)
 
-      const stateTopic = `sleepypod/${deviceId()}/state/occupancy/left/fused-shadow`
+      const stateTopic = `sleepypod/${deviceId()}/state/occupancy/left`
       const decisionTopic = `${stateTopic}/decision`
       const countTopic = (publishedTopic: string) =>
         fake.publish.mock.calls.filter(([topic]) => topic === publishedTopic).length
@@ -2212,8 +2223,8 @@ describe('mqttBridge — periodic publish + shutdown edges', () => {
     }
   })
 
-  it('forces fused availability offline before publishing a reconnect decision', async () => {
-    setFreshShadowRows()
+  it('forces primary fused availability offline before publishing a reconnect decision', async () => {
+    setFreshFusedRows()
     const fake = await startBridgeWithFake()
     fake.connected = true
     fake.emit('connect')
@@ -2227,7 +2238,7 @@ describe('mqttBridge — periodic publish + shutdown edges', () => {
 
     for (const side of ['left', 'right'] as const) {
       const availabilityTopic
-        = `sleepypod/${deviceId()}/availability/occupancy/${side}/fused-shadow`
+        = `sleepypod/${deviceId()}/availability/occupancy/${side}`
       const payloads = fake.publish.mock.calls
         .filter(([publishedTopic]) => publishedTopic === availabilityTopic)
         .map(([, payload]) => payload)
@@ -2577,12 +2588,12 @@ describe('mqttBridge — shutdownMqttBridge', () => {
     expect(offlineCall).toBeDefined()
     expect(fake.publish.mock.calls).toEqual(expect.arrayContaining([
       expect.arrayContaining([
-        expect.stringContaining('/availability/occupancy/left/fused-shadow'),
+        expect.stringContaining('/availability/occupancy/left'),
         'offline',
         { qos: 0, retain: true },
       ]),
       expect.arrayContaining([
-        expect.stringContaining('/availability/occupancy/right/fused-shadow'),
+        expect.stringContaining('/availability/occupancy/right'),
         'offline',
         { qos: 0, retain: true },
       ]),
@@ -3001,10 +3012,10 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
           payload_not_available: 'offline',
         },
       ]
-      const fusedShadowAvailability = [
+      const fusedOccupancyAvailability = [
         { topic: AVAIL, payload_available: 'online', payload_not_available: 'offline' },
         {
-          topic: `sleepypod/${ID}/availability/occupancy/${side}/fused-shadow`,
+          topic: `sleepypod/${ID}/availability/occupancy/${side}`,
           payload_available: 'online',
           payload_not_available: 'offline',
         },
@@ -3012,14 +3023,13 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
       expected[`homeassistant/binary_sensor/${ID}/${side}_occupancy/config`] = {
         name: `${Side} occupancy`,
         unique_id: `${ID}_${side}_occupancy`,
-        state_topic: adaptiveOccupancyTopic,
-        value_template: `{{ 'on' if value_json.loadPresent else 'off' }}`,
-        json_attributes_topic: adaptiveOccupancyTopic,
-        payload_on: 'on',
-        payload_off: 'off',
+        state_topic: `sleepypod/${ID}/state/occupancy/${side}`,
+        payload_on: 'ON',
+        payload_off: 'OFF',
+        expire_after: 3,
         device_class: 'occupancy',
         device: DEVICE,
-        availability: adaptiveAvailability,
+        availability: fusedOccupancyAvailability,
         availability_mode: 'all',
       }
       expected[`homeassistant/binary_sensor/${ID}/${side}_occupancy_legacy/config`] = {
@@ -3067,29 +3077,14 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
         icon: 'mdi:bed',
         device: DEVICE,
       }
-      expected[`homeassistant/binary_sensor/${ID}/${side}_occupancy_fused_shadow/config`] = {
-        name: `${Side} occupancy (fused shadow)`,
-        unique_id: `${ID}_${side}_occupancy_fused_shadow`,
-        state_topic: `sleepypod/${ID}/state/occupancy/${side}/fused-shadow`,
-        payload_on: 'ON',
-        payload_off: 'OFF',
-        expire_after: 3,
-        availability: fusedShadowAvailability,
-        availability_mode: 'all',
-        device_class: 'occupancy',
-        entity_category: 'diagnostic',
-        enabled_by_default: false,
-        visible_by_default: false,
-        device: DEVICE,
-      }
-      const fusedDecisionTopic = `sleepypod/${ID}/state/occupancy/${side}/fused-shadow/decision`
-      expected[`homeassistant/sensor/${ID}/${side}_occupancy_fused_shadow_decision/config`] = {
-        name: `${Side} occupancy decision (fused shadow)`,
-        unique_id: `${ID}_${side}_occupancy_fused_shadow_decision`,
+      const fusedDecisionTopic = `sleepypod/${ID}/state/occupancy/${side}/decision`
+      expected[`homeassistant/sensor/${ID}/${side}_occupancy_decision/config`] = {
+        name: `${Side} occupancy decision`,
+        unique_id: `${ID}_${side}_occupancy_decision`,
         state_topic: fusedDecisionTopic,
         value_template: '{{ value_json.classification }}',
         json_attributes_topic: fusedDecisionTopic,
-        availability: fusedShadowAvailability,
+        availability: fusedOccupancyAvailability,
         availability_mode: 'all',
         device_class: 'enum',
         options: [
@@ -3307,31 +3302,32 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
     await shutdownMqttBridge()
   })
 
-  it('publishes disabled fused shadow occupancy with volatile state and retained diagnostics', async () => {
+  it('publishes fused occupancy through the primary topics with volatile state and retained diagnostics', async () => {
     const { fake, map } = await capture()
 
-    expect(map[`sleepypod/${ID}/state/occupancy/left/fused-shadow`]).toBe('OFF')
-    expect(map[`sleepypod/${ID}/state/occupancy/right/fused-shadow`]).toBe('ON')
-    expect(map[`sleepypod/${ID}/availability/occupancy/left/fused-shadow`]).toBe('online')
-    expect(map[`sleepypod/${ID}/availability/occupancy/right/fused-shadow`]).toBe('online')
+    expect(map[`sleepypod/${ID}/state/occupancy/left`]).toBe('OFF')
+    expect(map[`sleepypod/${ID}/state/occupancy/right`]).toBe('ON')
+    expect(map[`sleepypod/${ID}/availability/occupancy/left`]).toBe('online')
+    expect(map[`sleepypod/${ID}/availability/occupancy/right`]).toBe('online')
     expect(JSON.parse(
-      map[`sleepypod/${ID}/state/occupancy/left/fused-shadow/decision`],
+      map[`sleepypod/${ID}/state/occupancy/left/decision`],
     )).toMatchObject({
       state: 'clear',
       occupied: false,
       available: true,
+      algorithm: 'fused-occupancy-v1',
       classification: 'clear_adaptive',
       reason: 'adaptive_clear',
       certificatePhase: 'observing',
     })
 
     const stateCall = fake.publish.mock.calls.find(([publishedTopic]) =>
-      publishedTopic === `sleepypod/${ID}/state/occupancy/left/fused-shadow`,
+      publishedTopic === `sleepypod/${ID}/state/occupancy/left`,
     )
     expect(stateCall?.[2]).toEqual({ qos: 0, retain: false })
 
     const decisionCall = fake.publish.mock.calls.find(([publishedTopic]) =>
-      publishedTopic === `sleepypod/${ID}/state/occupancy/left/fused-shadow/decision`,
+      publishedTopic === `sleepypod/${ID}/state/occupancy/left/decision`,
     )
     expect(decisionCall?.[2]).toEqual({ qos: 0, retain: true })
     await shutdownMqttBridge()
@@ -3346,20 +3342,20 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
     })
 
     expect(map[`sleepypod/${ID}/availability/adaptive-occupancy`]).toBe('offline')
-    expect(map[`sleepypod/${ID}/availability/occupancy/left/fused-shadow`]).toBe('offline')
-    expect(map[`sleepypod/${ID}/availability/occupancy/right/fused-shadow`]).toBe('offline')
+    expect(map[`sleepypod/${ID}/availability/occupancy/left`]).toBe('offline')
+    expect(map[`sleepypod/${ID}/availability/occupancy/right`]).toBe('offline')
     await shutdownMqttBridge()
   })
 
-  it('marks both shadow sides unavailable when an evidence query fails', async () => {
+  it('marks both primary sides unavailable when an evidence query fails', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const { map } = await capture(() => {
       dbMock.state.throwOnFusedOccupancy = true
     })
 
     for (const side of ['left', 'right'] as const) {
-      const stateTopic = `sleepypod/${ID}/state/occupancy/${side}/fused-shadow`
-      expect(map[`sleepypod/${ID}/availability/occupancy/${side}/fused-shadow`])
+      const stateTopic = `sleepypod/${ID}/state/occupancy/${side}`
+      expect(map[`sleepypod/${ID}/availability/occupancy/${side}`])
         .toBe('offline')
       expect(JSON.parse(map[`${stateTopic}/decision`])).toMatchObject({
         state: 'unavailable',
@@ -3369,7 +3365,7 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
       })
     }
     expect(warn).toHaveBeenCalledWith(
-      '[mqtt] fused occupancy shadow publish failed:',
+      '[mqtt] fused occupancy publish failed:',
       'fused occupancy boom',
     )
     warn.mockRestore()

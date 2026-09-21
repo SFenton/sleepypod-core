@@ -203,9 +203,9 @@ the bridge resolves config in this order: `device_settings` row > env var > buil
 ### Topics
 
 `<prefix>` defaults to `sleepypod`. `<device-id>` is the slugified hostname
-(override with `MQTT_DEVICE_ID`). State topics are retained except the fused
-occupancy shadow heartbeat, which is intentionally volatile and expires in
-Home Assistant if publication stalls.
+(override with `MQTT_DEVICE_ID`). State topics are retained except the primary
+occupancy heartbeat, which is intentionally volatile and expires in Home
+Assistant if publication stalls.
 
 | Topic | Direction | Payload |
 |---|---|---|
@@ -215,12 +215,12 @@ Home Assistant if publication stalls.
 | `<prefix>/<device-id>/state/<side>/target-level` | pod → broker | `{"level": -10..10, "targetTemperature": <°F>, "isPowered": <boolean>}` |
 | `<prefix>/<device-id>/state/water-level` | pod → broker | `low` / `ok` / `unknown` |
 | `<prefix>/<device-id>/state/biometrics/<side>` | pod → broker | latest HR / HRV / BR |
-| `<prefix>/<device-id>/state/occupancy/<side>/legacy` | pod → broker | previous movement/calibrated-level detector for comparison and fallback evidence |
-| `<prefix>/<device-id>/state/occupancy/<side>/adaptive` | pod → broker | production adaptive load state, classification, and scores |
+| `<prefix>/<device-id>/state/occupancy/<side>` | pod → broker | non-retained primary fused `ON` / `OFF` heartbeat |
+| `<prefix>/<device-id>/availability/occupancy/<side>` | pod → broker | retained per-side primary decision availability |
+| `<prefix>/<device-id>/state/occupancy/<side>/decision` | pod → broker | retained primary classification, provenance, and certificate diagnostics |
+| `<prefix>/<device-id>/state/occupancy/<side>/legacy` | pod → broker | previous movement/calibrated-level detector for comparison and rollback |
+| `<prefix>/<device-id>/state/occupancy/<side>/adaptive` | pod → broker | adaptive load state, classification, and scores for comparison and rollback |
 | `<prefix>/<device-id>/availability/adaptive-occupancy` | pod → broker | `online` while both adaptive side states are fresh, otherwise `offline` |
-| `<prefix>/<device-id>/state/occupancy/<side>/fused-shadow` | pod → broker | non-retained shadow `ON` / `OFF`; no production consumer |
-| `<prefix>/<device-id>/availability/occupancy/<side>/fused-shadow` | pod → broker | retained per-side shadow decision availability |
-| `<prefix>/<device-id>/state/occupancy/<side>/fused-shadow/decision` | pod → broker | retained shadow classification, provenance, and certificate diagnostics |
 | `<prefix>/<device-id>/state/environment/ambient` | pod → broker | `{"ts": <epoch_ms>, "temperature": <number\|null>, "humidity": <number\|null>}` (°C, %) |
 | `<prefix>/<device-id>/cmd/set-temperature` | broker → pod | `{"side","temperature","duration?"}` |
 | `<prefix>/<device-id>/cmd/set-target-level` | broker → pod | `{"side","level","duration?"}` where level is normalized `-10..10` |

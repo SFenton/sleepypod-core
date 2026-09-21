@@ -158,11 +158,10 @@ signals:
 
 Home Assistant discovery creates the primary occupancy binary sensor, a legacy
 comparison binary sensor, an explicitly named adaptive-load comparison sensor,
-and an adaptive classification enum sensor for each side. The primary and
-adaptive binary sensors intentionally share the fresh adaptive-load topic and
-both represent sustained surface load, not confirmed person presence. If that
-topic is stale, both become unavailable rather than publishing a potentially
-misleading absence; the legacy comparison entity remains separate.
+and an adaptive classification enum sensor for each side. The adaptive
+comparison entities retain the fresh adaptive-load topic; the primary entity
+keeps its existing unique ID while consuming the fused decision described
+below.
 
 Fresh adaptive state is also the shared production source used by HomeKit, the
 occupancy API and UI, and auto-off. If the adaptive row is missing, stale by
@@ -172,11 +171,11 @@ useful while forcing absence-triggered behavior such as auto-off to stand down.
 The Python sleep-session detector remains independent and continues to process
 its own raw sensor stream.
 
-## Fused occupancy shadow
+## Fused primary occupancy
 
-The core also evaluates a non-controlling, versioned fused decision per side.
-It is deliberately separate from the production primary entities and every
-existing consumer while the transition-certified clear logic is validated.
+The core evaluates a versioned fused decision per side and publishes it through
+the existing primary Home Assistant occupancy identities. The prior adaptive
+and legacy entities remain available as diagnostics and rollback evidence.
 
 The pure state machine reports:
 
@@ -190,27 +189,33 @@ collapse to at most one, piezo energy collapse to at most 25% of its baseline,
 both deployed piezo exit features below threshold, and 30 seconds of
 continuous confirmation. Pump-coupled samples, source gaps,
 stale evidence, process restart, material cap rebound, or a new load impulse
-invalidate the candidate or certificate. These values are shadow-study
-parameters, not promoted production thresholds.
+invalidate the candidate or certificate. These values were validated in the
+shadow study and are the initial primary thresholds.
 
 The piezo processor records its guarded pump mode on every presence decision,
 including while the existing detector remains in its present hysteresis state,
-so the shadow cannot interpret an active-pump exit window as pump-safe.
+so the fused decision cannot interpret an active-pump exit window as pump-safe.
 
-MQTT publishes:
+MQTT publishes permanent algorithm-neutral topics:
 
-- `state/occupancy/<side>/fused-shadow` — plain, non-retained `ON` / `OFF`
+- `state/occupancy/<side>` — plain, non-retained `ON` / `OFF`
   heartbeat;
-- `availability/occupancy/<side>/fused-shadow` — retained per-side
+- `availability/occupancy/<side>` — retained per-side
   `online` / `offline`;
-- `state/occupancy/<side>/fused-shadow/decision` — retained, low-churn
+- `state/occupancy/<side>/decision` — retained, low-churn
   classification, reason, provenance, and certificate diagnostics.
 
-Home Assistant discovery marks both shadow entities diagnostic, disabled, and
-hidden by default. The binary sensor uses `expire_after: 3` with a one-second
-heartbeat and combines the Pod LWT with per-side decision availability. The
-existing primary, adaptive, legacy, HomeKit, API/web, and auto-off contracts
-remain unchanged.
+Home Assistant discovery updates the existing primary binary sensors in place,
+preserving their unique IDs and entity IDs. Each uses `expire_after: 3` with a
+one-second heartbeat and combines the Pod LWT with per-side decision
+availability. The low-churn decision sensor is diagnostic, disabled, and hidden
+by default. Temporary fused-shadow discovery and retained diagnostic topics are
+tombstoned during the cutover.
+
+This promotion changes the Home Assistant primary MQTT projection used by
+automations. HomeKit, API/web, and auto-off continue to use the adaptive shared
+runtime until their unavailable-state behavior is promoted and validated
+separately.
 
 ## Suggested labeled trial
 
