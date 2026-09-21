@@ -22,10 +22,10 @@
  *   <prefix>/<device-id>/state/schedules             — retained alarm schedule mirror
  *   <prefix>/<device-id>/state/water-level           — low | ok | unknown
  *   <prefix>/<device-id>/state/biometrics/<side>     — latest HR/HRV/BR summary
+ *   <prefix>/<device-id>/state/occupancy/<side>          — volatile primary fused ON/OFF decision
+ *   <prefix>/<device-id>/state/occupancy/<side>/decision — retained primary decision diagnostics
  *   <prefix>/<device-id>/state/occupancy/<side>/legacy   — previous detector
- *   <prefix>/<device-id>/state/occupancy/<side>/adaptive — production adaptive load
- *   <prefix>/<device-id>/state/occupancy/<side>/fused-shadow
- *                                                       — volatile shadow ON/OFF decision
+ *   <prefix>/<device-id>/state/occupancy/<side>/adaptive — adaptive-load comparison
  *   <prefix>/<device-id>/state/environment/ambient   — ambient temp (°C) + humidity (%)
  *   <prefix>/<device-id>/cmd/set-temperature         — JSON {side, temperature, duration?}
  *   <prefix>/<device-id>/cmd/set-target-level        — JSON {side, level, duration?}
@@ -76,8 +76,8 @@ import { getDacMonitorIfRunning } from '@/src/hardware/dacMonitor.instance'
 
 const DEFAULT_TOPIC_PREFIX = 'sleepypod'
 const STATE_PUBLISH_INTERVAL_MS = 30_000
-const FUSED_OCCUPANCY_SHADOW_PUBLISH_INTERVAL_MS = 1_000
-const FUSED_OCCUPANCY_SHADOW_EXPIRE_AFTER_SECONDS = 3
+const FUSED_OCCUPANCY_PUBLISH_INTERVAL_MS = 1_000
+const PRIMARY_OCCUPANCY_EXPIRE_AFTER_SECONDS = 3
 const FUSED_OCCUPANCY_WARNING_INTERVAL_MS = 60_000
 const RECONNECT_PERIOD_MS = 5_000
 const CONNECT_TIMEOUT_MS = 10_000
@@ -768,25 +768,49 @@ function publishHaDiscovery(): void {
     device: dev,
   })
 
+  const fusedOccupancyAvailability = (side: ScheduleSide) => [
+    {
+      topic: availability,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+    },
+    {
+      topic: topic('availability', 'occupancy', side),
+      payload_available: 'online',
+      payload_not_available: 'offline',
+    },
+  ]
+
   const occupancyBinary = (
     side: ScheduleSide,
     algorithm: 'primary' | 'legacy' | 'adaptive',
   ) => {
-    const adaptive = algorithm !== 'legacy'
+    const label = side === 'left' ? 'Left' : 'Right'
+    if (algorithm === 'primary') {
+      return {
+        name: `${label} occupancy`,
+        unique_id: `${id}_${side}_occupancy`,
+        state_topic: topic('state', 'occupancy', side),
+        payload_on: 'ON',
+        payload_off: 'OFF',
+        expire_after: PRIMARY_OCCUPANCY_EXPIRE_AFTER_SECONDS,
+        availability: fusedOccupancyAvailability(side),
+        availability_mode: 'all',
+        device_class: 'occupancy',
+        device: dev,
+      }
+    }
+
+    const adaptive = algorithm === 'adaptive'
     const stateTopic = topic(
       'state',
       'occupancy',
       side,
       adaptive ? 'adaptive' : 'legacy',
     )
-    const label = side === 'left' ? 'Left' : 'Right'
     const common = {
-      name: algorithm === 'primary'
-        ? `${label} occupancy`
-        : `${label} occupancy (${adaptive ? 'adaptive load' : 'legacy'})`,
-      unique_id: algorithm === 'primary'
-        ? `${id}_${side}_occupancy`
-        : `${id}_${side}_occupancy_${algorithm}`,
+      name: `${label} occupancy (${adaptive ? 'adaptive load' : 'legacy'})`,
+      unique_id: `${id}_${side}_occupancy_${algorithm}`,
       state_topic: stateTopic,
       value_template: adaptive
         ? `{{ 'on' if value_json.loadPresent else 'off' }}`
@@ -856,50 +880,20 @@ function publishHaDiscovery(): void {
     }
   }
 
-  const fusedShadowAvailability = (side: ScheduleSide) => [
-    {
-      topic: availability,
-      payload_available: 'online',
-      payload_not_available: 'offline',
-    },
-    {
-      topic: topic('availability', 'occupancy', side, 'fused-shadow'),
-      payload_available: 'online',
-      payload_not_available: 'offline',
-    },
-  ]
-
-  const fusedShadowBinary = (side: ScheduleSide) => ({
-    name: `${side === 'left' ? 'Left' : 'Right'} occupancy (fused shadow)`,
-    unique_id: `${id}_${side}_occupancy_fused_shadow`,
-    state_topic: topic('state', 'occupancy', side, 'fused-shadow'),
-    payload_on: 'ON',
-    payload_off: 'OFF',
-    expire_after: FUSED_OCCUPANCY_SHADOW_EXPIRE_AFTER_SECONDS,
-    availability: fusedShadowAvailability(side),
-    availability_mode: 'all',
-    device_class: 'occupancy',
-    entity_category: 'diagnostic',
-    enabled_by_default: false,
-    visible_by_default: false,
-    device: dev,
-  })
-
-  const fusedShadowDecision = (side: ScheduleSide) => {
+  const fusedOccupancyDecision = (side: ScheduleSide) => {
     const decisionTopic = topic(
       'state',
       'occupancy',
       side,
-      'fused-shadow',
       'decision',
     )
     return {
-      name: `${side === 'left' ? 'Left' : 'Right'} occupancy decision (fused shadow)`,
-      unique_id: `${id}_${side}_occupancy_fused_shadow_decision`,
+      name: `${side === 'left' ? 'Left' : 'Right'} occupancy decision`,
+      unique_id: `${id}_${side}_occupancy_decision`,
       state_topic: decisionTopic,
       value_template: '{{ value_json.classification }}',
       json_attributes_topic: decisionTopic,
-      availability: fusedShadowAvailability(side),
+      availability: fusedOccupancyAvailability(side),
       availability_mode: 'all',
       device_class: 'enum',
       options: [
@@ -979,13 +973,8 @@ function publishHaDiscovery(): void {
       RETAINED_QOS_0,
     )
     safePublish(
-      `${haPrefix}/binary_sensor/${id}/${side}_occupancy_fused_shadow/config`,
-      JSON.stringify(fusedShadowBinary(side)),
-      RETAINED_QOS_0,
-    )
-    safePublish(
-      `${haPrefix}/sensor/${id}/${side}_occupancy_fused_shadow_decision/config`,
-      JSON.stringify(fusedShadowDecision(side)),
+      `${haPrefix}/sensor/${id}/${side}_occupancy_decision/config`,
+      JSON.stringify(fusedOccupancyDecision(side)),
       RETAINED_QOS_0,
     )
   }
@@ -1118,15 +1107,44 @@ function clearRemovedGestureMqttExposure(): void {
   safePublish(topic('state', 'button-gestures'), empty, RETAINED_QOS_0)
 }
 
+function clearRemovedFusedShadowMqttExposure(): void {
+  const id = deviceId()
+  const haPrefix = process.env.MQTT_HA_DISCOVERY_PREFIX || 'homeassistant'
+  const empty = Buffer.alloc(0)
+
+  for (const side of SIDES) {
+    safePublish(
+      `${haPrefix}/binary_sensor/${id}/${side}_occupancy_fused_shadow/config`,
+      empty,
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      `${haPrefix}/sensor/${id}/${side}_occupancy_fused_shadow_decision/config`,
+      empty,
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      topic('availability', 'occupancy', side, 'fused-shadow'),
+      empty,
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      topic('state', 'occupancy', side, 'fused-shadow', 'decision'),
+      empty,
+      RETAINED_QOS_0,
+    )
+  }
+}
+
 // ---------------------------------------------------------------------------
 // State publication
 // ---------------------------------------------------------------------------
 
-function fusedShadowAvailabilityTopic(side: ScheduleSide): string {
-  return topic('availability', 'occupancy', side, 'fused-shadow')
+function fusedOccupancyAvailabilityTopic(side: ScheduleSide): string {
+  return topic('availability', 'occupancy', side)
 }
 
-function publishFusedShadowAvailability(
+function publishFusedOccupancyAvailability(
   side: ScheduleSide,
   availability: 'online' | 'offline',
   force = false,
@@ -1138,16 +1156,16 @@ function publishFusedShadowAvailability(
     return
   }
   safePublish(
-    fusedShadowAvailabilityTopic(side),
+    fusedOccupancyAvailabilityTopic(side),
     availability,
     RETAINED_QOS_0,
   )
   state.fusedOccupancyAvailability[side] = availability
 }
 
-function publishAllFusedShadowOffline(force = false): void {
+function publishAllFusedOccupancyOffline(force = false): void {
   for (const side of SIDES) {
-    publishFusedShadowAvailability(side, 'offline', force)
+    publishFusedOccupancyAvailability(side, 'offline', force)
   }
 }
 
@@ -1155,7 +1173,7 @@ function isoTimestamp(timestampMs: number | null): string | null {
   return timestampMs === null ? null : new Date(timestampMs).toISOString()
 }
 
-function fusedShadowDecisionPayload(
+function fusedOccupancyDecisionPayload(
   decision: FusedOccupancyDecision,
 ): Record<string, unknown> {
   return {
@@ -1187,7 +1205,7 @@ function fusedShadowDecisionPayload(
   }
 }
 
-function publishFusedShadowDecision(
+function publishFusedOccupancyDecision(
   decision: FusedOccupancyDecision,
 ): void {
   if (
@@ -1201,35 +1219,34 @@ function publishFusedShadowDecision(
       'state',
       'occupancy',
       decision.side,
-      'fused-shadow',
       'decision',
     ),
-    JSON.stringify(fusedShadowDecisionPayload(decision)),
+    JSON.stringify(fusedOccupancyDecisionPayload(decision)),
     RETAINED_QOS_0,
   )
   state.fusedOccupancyDecisionRevision[decision.side]
     = decision.semanticRevision
 }
 
-function publishFusedShadowResult(
+function publishFusedOccupancyResult(
   decision: FusedOccupancyDecision,
 ): void {
   if (!decision.available) {
-    publishFusedShadowAvailability(decision.side, 'offline')
-    publishFusedShadowDecision(decision)
+    publishFusedOccupancyAvailability(decision.side, 'offline')
+    publishFusedOccupancyDecision(decision)
     return
   }
 
   safePublish(
-    topic('state', 'occupancy', decision.side, 'fused-shadow'),
+    topic('state', 'occupancy', decision.side),
     decision.occupied ? 'ON' : 'OFF',
     VOLATILE_QOS_0,
   )
-  publishFusedShadowDecision(decision)
-  publishFusedShadowAvailability(decision.side, 'online')
+  publishFusedOccupancyDecision(decision)
+  publishFusedOccupancyAvailability(decision.side, 'online')
 }
 
-async function publishFusedOccupancyShadow(): Promise<void> {
+async function publishFusedOccupancy(): Promise<void> {
   if (
     !state.client?.connected
     || state.fusedOccupancyPublishInFlight
@@ -1267,7 +1284,7 @@ async function publishFusedOccupancyShadow(): Promise<void> {
     for (const side of SIDES) {
       const adaptiveRow = adaptiveBySide.get(side)
       const piezoRow = piezoBySide.get(side)
-      publishFusedShadowResult(provider.update(side, {
+      publishFusedOccupancyResult(provider.update(side, {
         nowMs,
         adaptive: adaptiveRow
           ? {
@@ -1301,7 +1318,7 @@ async function publishFusedOccupancyShadow(): Promise<void> {
   }
   catch (error) {
     for (const side of SIDES) {
-      publishFusedShadowResult(provider.update(side, {
+      publishFusedOccupancyResult(provider.update(side, {
         nowMs,
         adaptive: null,
         piezo: null,
@@ -1314,7 +1331,7 @@ async function publishFusedOccupancyShadow(): Promise<void> {
     ) {
       state.fusedOccupancyLastWarningAt = nowMs
       console.warn(
-        '[mqtt] fused occupancy shadow publish failed:',
+        '[mqtt] fused occupancy publish failed:',
         error instanceof Error ? error.message : error,
       )
     }
@@ -1884,16 +1901,17 @@ export async function startMqttBridge(): Promise<void> {
     state.runState = 'connected'
     state.lastError = null
     console.log(`[mqtt] connected to ${config.url} (deviceId=${id}, prefix=${config.topicPrefix})`)
-    publishAllFusedShadowOffline(true)
+    publishAllFusedOccupancyOffline(true)
     state.fusedOccupancyDecisionRevision = { left: null, right: null }
     safePublish(availabilityTopic, 'online', RETAINED_QOS_0)
     publishHaDiscovery()
     clearRemovedGestureMqttExposure()
+    clearRemovedFusedShadowMqttExposure()
     client.subscribe(topic('cmd', '+'), { qos: 0 }, (err: Error | null) => {
       if (err) console.warn('[mqtt] subscribe cmd/* failed:', err.message)
     })
     void publishState()
-    void publishFusedOccupancyShadow()
+    void publishFusedOccupancy()
   })
 
   client.on('reconnect', () => {
@@ -1924,8 +1942,8 @@ export async function startMqttBridge(): Promise<void> {
     void publishState()
   }, STATE_PUBLISH_INTERVAL_MS)
   state.fusedOccupancyTimer = setInterval(() => {
-    void publishFusedOccupancyShadow()
-  }, FUSED_OCCUPANCY_SHADOW_PUBLISH_INTERVAL_MS)
+    void publishFusedOccupancy()
+  }, FUSED_OCCUPANCY_PUBLISH_INTERVAL_MS)
 
   // React to live status frames so HA sees temperature changes immediately
   // rather than waiting for the periodic re-publish.
@@ -1962,7 +1980,7 @@ export async function shutdownMqttBridge(): Promise<void> {
 
   const c = state.client
   if (c?.connected) {
-    publishAllFusedShadowOffline(true)
+    publishAllFusedOccupancyOffline(true)
   }
   state.client = null
   state.runState = 'stopped'
@@ -2010,6 +2028,6 @@ export const __test__ = {
   slugify,
   parsePayload,
   buildSchedulesPayload,
-  publishFusedOccupancyShadow,
+  publishFusedOccupancy,
   state,
 }

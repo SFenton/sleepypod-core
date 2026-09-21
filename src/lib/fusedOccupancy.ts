@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Side } from '@/src/hardware/types'
 
-export const FUSED_OCCUPANCY_SHADOW_ALGORITHM = 'fused-occupancy-shadow-v1'
+export const FUSED_OCCUPANCY_ALGORITHM = 'fused-occupancy-v1'
 
 export type FusedOccupancyState = 'occupied' | 'clear' | 'unavailable'
 export type FusedOccupancyClassification
@@ -65,7 +65,7 @@ export interface FusedOccupancyDecision {
   available: boolean
   classification: FusedOccupancyClassification
   reason: FusedOccupancyReason
-  algorithm: typeof FUSED_OCCUPANCY_SHADOW_ALGORITHM
+  algorithm: typeof FUSED_OCCUPANCY_ALGORITHM
   semanticRevision: number
   decisionChangedAtMs: number
   stateSinceMs: number
@@ -735,7 +735,7 @@ export class FusedOccupancySide {
       available: core.state !== 'unavailable',
       classification: core.classification,
       reason: core.reason,
-      algorithm: FUSED_OCCUPANCY_SHADOW_ALGORITHM,
+      algorithm: FUSED_OCCUPANCY_ALGORITHM,
       semanticRevision: this.semanticRevision,
       decisionChangedAtMs,
       stateSinceMs,
