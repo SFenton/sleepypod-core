@@ -8,6 +8,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import os from 'node:os'
+import type { FusedOccupancyDecision } from '@/src/lib/fusedOccupancy'
 
 // Hoisted state shared with the @/src/db mock factory — lets each test stub
 // the device_settings row that resolveConfig will read.
@@ -321,7 +322,14 @@ vi.mock('@/src/hardware/dacMonitor.instance', () => ({
 
 const bridgeModule = await import('../mqttBridge')
 const { __test__, getBridgeStatus, publishAlarmState, startMqttBridge, shutdownMqttBridge, testConnection } = bridgeModule
-const { resolveConfig, slugify, deviceId, parsePayload, state: bridgeState } = __test__
+const {
+  resolveConfig,
+  slugify,
+  deviceId,
+  parsePayload,
+  fusedOccupancyDecisionPayload,
+  state: bridgeState,
+} = __test__
 
 const MQTT_ENV_KEYS = [
   'MQTT_ENABLED',
@@ -3315,10 +3323,11 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
       state: 'clear',
       occupied: false,
       available: true,
-      algorithm: 'fused-occupancy-v1',
+      algorithm: 'fused-occupancy-v2',
       classification: 'clear_adaptive',
       reason: 'adaptive_clear',
       certificatePhase: 'observing',
+      shortCycle: null,
     })
 
     const stateCall = fake.publish.mock.calls.find(([publishedTopic]) =>
@@ -3331,6 +3340,77 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
     )
     expect(decisionCall?.[2]).toEqual({ qos: 0, retain: true })
     await shutdownMqttBridge()
+  })
+
+  it('serializes fused certificate provenance and short-cycle progress', () => {
+    const decision: FusedOccupancyDecision = {
+      side: 'left',
+      state: 'occupied',
+      occupied: true,
+      available: true,
+      classification: 'occupied_adaptive',
+      reason: 'adaptive_load',
+      algorithm: 'fused-occupancy-v2',
+      semanticRevision: 4,
+      decisionChangedAtMs: 10_000,
+      stateSinceMs: 5_000,
+      evidenceThroughMs: 12_000,
+      validUntilMs: 15_000,
+      provenanceEpoch: 'test-epoch',
+      certificatePhase: 'confirming',
+      certificate: null,
+      shortCycle: {
+        entryAtMs: 5_000,
+        expiresAtMs: 305_000,
+        adaptivePeakScore: 20,
+        adaptivePeakLoadedChannels: 3,
+        piezoPeakEnergy: 300_000,
+        loadPresentObserved: true,
+        adaptiveCollapseAtMs: 8_000,
+        adaptiveCollapseRatio: 0.15,
+        blockedReason: null,
+      },
+      lastCertificateInvalidationReason: null,
+    }
+
+    expect(fusedOccupancyDecisionPayload(decision)).toMatchObject({
+      shortCycle: {
+        entryAt: '1970-01-01T00:00:05.000Z',
+        expiresAt: '1970-01-01T00:05:05.000Z',
+        adaptiveCollapseAt: '1970-01-01T00:00:08.000Z',
+        adaptiveCollapseRatio: 0.15,
+      },
+    })
+
+    const certified: FusedOccupancyDecision = {
+      ...decision,
+      state: 'clear',
+      occupied: false,
+      classification: 'clear_exit_certified',
+      reason: 'exit_certified',
+      certificatePhase: 'certified',
+      certificate: {
+        id: 'left-test-epoch-9000',
+        basis: 'entry_transition',
+        transitionAtMs: 9_000,
+        confirmedAtMs: 10_000,
+        latestVerifiedAtMs: 12_000,
+        adaptiveBaselineScore: 20,
+        piezoBaselineEnergy: 300_000,
+        piezoBaselineSource: 'entry_window',
+        adaptiveCollapseRatio: 0.15,
+        piezoCollapseRatio: 0.3,
+      },
+      shortCycle: null,
+    }
+    expect(fusedOccupancyDecisionPayload(certified)).toMatchObject({
+      certificate: {
+        basis: 'entry_transition',
+        transitionAt: '1970-01-01T00:00:09.000Z',
+        piezoBaselineSource: 'entry_window',
+      },
+      shortCycle: null,
+    })
   })
 
   it('marks replayed old adaptive samples offline despite a recent database write', async () => {
