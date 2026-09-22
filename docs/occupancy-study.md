@@ -183,14 +183,42 @@ The pure state machine reports:
 - `clear` from fresh adaptive clear or a maintained exit certificate;
 - `unavailable` when current adaptive evidence cannot support a decision.
 
-The initial certificate seeds are a three-minute robust loaded baseline,
-adaptive score collapse to at most 40% of that baseline, loaded-channel
-collapse to at most one, piezo energy collapse to at most 25% of its baseline,
-both deployed piezo exit features below threshold, and 30 seconds of
-continuous confirmation. Pump-coupled samples, source gaps,
-stale evidence, process restart, material cap rebound, or a new load impulse
-invalidate the candidate or certificate. These values were validated in the
-shadow study and are the initial primary thresholds.
+`fused-occupancy-v2` supports two certificate paths:
+
+- The sustained path keeps the three-minute robust loaded baseline, adaptive
+  score collapse to at most 40% of that baseline, loaded-channel collapse to at
+  most one, and 30 seconds of continuous confirmation. A measured pump-safe
+  piezo baseline is preferred. If pumps prevented that baseline, the path may
+  use the configured piezo enter threshold instead, but only after current
+  piezo evidence is pump-free, below its exit threshold, and below the
+  autocorrelation exit threshold.
+- The short-cycle path opens only on a robust capSense load impulse rising from
+  a clear or weak prior sample. The epoch must subsequently observe the
+  adaptive load state, then show a strong unload impulse, score collapse to at
+  most 40% of that visit's peak, at most one loaded channel, and fresh
+  pump-free quiet piezo evidence. It confirms for ten seconds and expires after
+  five minutes if no exit is certified. A qualified capSense collapse is
+  remembered while the detector waits for quiet piezo evidence, but the epoch
+  is discarded without issuing a certificate if the native adaptive detector
+  clears first. Once pump-free quiet piezo starts confirmation, continuing
+  collapsed capSense evidence owns the ten-second dwell; uncorroborated piezo
+  movement alone does not restart it.
+
+Near the piezo noise floor, autocorrelation alone is not allowed to veto an
+exit or revoke a certificate. A short-cycle certificate remains clear through
+sub-threshold residual mattress load and is revoked by a robust capSense
+return, a new load impulse, or a non-noise piezo entry. The sustained
+certificate retains its stricter rebound maintenance. Source gaps, stale
+evidence, and process restart remain fail-closed. Pump-active evidence cannot
+create a certificate, but a later pump cycle does not erase an already
+certified exit while continuous capSense evidence still supports clear.
+
+The v2 thresholds were replayed over 69,156 retained side-samples spanning all
+available capSense history. The only certificates were the labeled September
+21 morning exit and the two operator-labeled staggered short visits. The
+short-cycle visits certified ten seconds after their observed unload
+transitions, while three pump-ambiguous historical collapses remained
+uncertified and later followed the native adaptive clear.
 
 The piezo processor records its guarded pump mode on every presence decision,
 including while the existing detector remains in its present hysteresis state,
@@ -203,7 +231,8 @@ MQTT publishes permanent algorithm-neutral topics:
 - `availability/occupancy/<side>` — retained per-side
   `online` / `offline`;
 - `state/occupancy/<side>/decision` — retained, low-churn
-  classification, reason, provenance, and certificate diagnostics.
+  classification, reason, provenance, certificate basis, baseline source, and
+  short-cycle progress or blocked-gate diagnostics.
 
 Home Assistant discovery updates the existing primary binary sensors in place,
 preserving their unique IDs and entity IDs. Each uses `expire_after: 3` with a

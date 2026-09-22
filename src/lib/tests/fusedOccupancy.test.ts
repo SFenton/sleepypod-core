@@ -2,12 +2,143 @@ import { describe, expect, it } from 'vitest'
 import {
   FusedOccupancySide,
   type AdaptiveOccupancySample,
+  type FusedOccupancyDecision,
   type PiezoOccupancySample,
 } from '../fusedOccupancy'
+import replayFixtureData from './fixtures/fusedOccupancyReplay.json'
 
 const SECOND = 1_000
 const MINUTE = 60 * SECOND
 const BASE = Date.UTC(2026, 8, 21, 14, 26, 0)
+
+type ReplaySide = 'left' | 'right'
+type AdaptiveReplayRow = [
+  timestampSeconds: number,
+  loadPresent: boolean,
+  score: number,
+  loadedChannels: number,
+  loadVelocityScore: number,
+  unloadVelocityScore: number,
+  entryVelocitySupported: boolean,
+]
+type PiezoReplayRow = [
+  timestampSeconds: number,
+  present: boolean,
+  energy: number,
+  autocorrelationQuality: number,
+  decisionReason: string,
+  pumpMode: 'asymmetric' | 'symmetric' | null,
+]
+
+interface ReplayScenario {
+  id: string
+  side: ReplaySide
+  expectation: {
+    certificateMode: 'entry_transition' | 'sustained_baseline' | null
+    clearByMs?: number
+    maintainClearThroughMs?: number
+    mustRemainOccupiedThroughMs?: number
+    occupiedFromMs?: number
+    piezoBaselineSource?:
+      'configured_threshold' | 'entry_window' | 'observed'
+    mustNotCertify?: boolean
+  }
+  adaptive: AdaptiveReplayRow[]
+  piezo: PiezoReplayRow[]
+}
+
+interface ReplayFixture {
+  fixed: {
+    adaptiveAlgorithmVersion: string
+    piezoEnterThreshold: number
+    piezoExitThreshold: number
+  }
+  scenarios: ReplayScenario[]
+}
+
+function replaySide(value: string): ReplaySide {
+  if (value === 'left' || value === 'right') return value
+  throw new Error(`invalid replay side: ${value}`)
+}
+
+function certificateMode(
+  value: string | null,
+): ReplayScenario['expectation']['certificateMode'] {
+  if (
+    value === null
+    || value === 'entry_transition'
+    || value === 'sustained_baseline'
+  ) {
+    return value
+  }
+  throw new Error(`invalid certificate mode: ${value}`)
+}
+
+function piezoBaselineSource(
+  value: string | undefined,
+): ReplayScenario['expectation']['piezoBaselineSource'] {
+  if (
+    value === undefined
+    || value === 'configured_threshold'
+    || value === 'entry_window'
+    || value === 'observed'
+  ) {
+    return value
+  }
+  throw new Error(`invalid piezo baseline source: ${value}`)
+}
+
+const replayFixture: ReplayFixture = {
+  fixed: replayFixtureData.fixed,
+  scenarios: replayFixtureData.scenarios.map(scenario => ({
+    id: scenario.id,
+    side: replaySide(scenario.side),
+    expectation: {
+      ...scenario.expectation,
+      certificateMode: certificateMode(
+        scenario.expectation.certificateMode,
+      ),
+      piezoBaselineSource: piezoBaselineSource(
+        scenario.expectation.piezoBaselineSource,
+      ),
+    },
+    adaptive: scenario.adaptive.map((row): AdaptiveReplayRow => {
+      if (row.length !== 7) {
+        throw new Error(`invalid adaptive replay row in ${scenario.id}`)
+      }
+      return [
+        Number(row[0]),
+        Boolean(row[1]),
+        Number(row[2]),
+        Number(row[3]),
+        Number(row[4]),
+        Number(row[5]),
+        Boolean(row[6]),
+      ]
+    }),
+    piezo: scenario.piezo.map((row): PiezoReplayRow => {
+      if (row.length !== 6) {
+        throw new Error(`invalid piezo replay row in ${scenario.id}`)
+      }
+      const pumpMode = row[5]
+      if (
+        pumpMode !== null
+        && pumpMode !== 'asymmetric'
+        && pumpMode !== 'symmetric'
+      ) {
+        throw new Error(`invalid pump mode in ${scenario.id}`)
+      }
+      return [
+        Number(row[0]),
+        Boolean(row[1]),
+        Number(row[2]),
+        Number(row[3]),
+        String(row[4]),
+        pumpMode,
+      ]
+    }),
+  })),
+}
 
 function adaptive(
   timestampMs: number,
@@ -131,6 +262,133 @@ function maintainCertifiedResidual(
     result = updateAt(throughMs)
   }
   return result
+}
+
+function certifyShortCycle(
+  detector: FusedOccupancySide,
+): ReturnType<FusedOccupancySide['update']> {
+  detector.update({
+    nowMs: BASE,
+    adaptive: adaptive(BASE, {
+      loadPresent: false,
+      classification: 'empty',
+      score: 2,
+      loadedChannels: 0,
+    }),
+    piezo: piezo(BASE, {
+      present: false,
+      energy: 100_000,
+      autocorrelationQuality: 0.1,
+    }),
+  })
+  detector.update({
+    nowMs: BASE + 5 * SECOND,
+    adaptive: adaptive(BASE + 5 * SECOND, {
+      loadPresent: false,
+      score: 12,
+      loadedChannels: 2,
+      loadVelocityScore: 10,
+      entryVelocitySupported: true,
+    }),
+    piezo: piezo(BASE, {
+      present: false,
+      energy: 100_000,
+      autocorrelationQuality: 0.1,
+    }),
+  })
+  detector.update({
+    nowMs: BASE + 15 * SECOND,
+    adaptive: adaptive(BASE + 15 * SECOND, {
+      score: 20,
+      loadedChannels: 3,
+    }),
+    piezo: piezo(BASE, {
+      present: false,
+      energy: 100_000,
+      autocorrelationQuality: 0.1,
+    }),
+  })
+  detector.update({
+    nowMs: BASE + 30 * SECOND,
+    adaptive: adaptive(BASE + 30 * SECOND, {
+      score: 3,
+      loadedChannels: 1,
+      unloadVelocityScore: 17,
+    }),
+    piezo: piezo(BASE, {
+      present: false,
+      energy: 100_000,
+      autocorrelationQuality: 0.1,
+    }),
+  })
+  return detector.update({
+    nowMs: BASE + 40 * SECOND,
+    adaptive: adaptive(BASE + 40 * SECOND, {
+      score: 3,
+      loadedChannels: 1,
+    }),
+    piezo: piezo(BASE, {
+      present: false,
+      energy: 100_000,
+      autocorrelationQuality: 0.1,
+    }),
+  })
+}
+
+function replayScenario(
+  scenario: ReplayScenario,
+): Array<{ nowMs: number, decision: FusedOccupancyDecision }> {
+  const detector = new FusedOccupancySide(scenario.side, {
+    provenanceEpoch: scenario.id,
+  })
+  let piezoIndex = -1
+  return scenario.adaptive.map(([
+    timestampSeconds,
+    loadPresent,
+    score,
+    loadedChannels,
+    loadVelocityScore,
+    unloadVelocityScore,
+    entryVelocitySupported,
+  ]) => {
+    while (
+      piezoIndex + 1 < scenario.piezo.length
+      && scenario.piezo[piezoIndex + 1][0] <= timestampSeconds
+    ) {
+      piezoIndex += 1
+    }
+    const piezoRow = scenario.piezo[piezoIndex]
+    const nowMs = timestampSeconds * SECOND
+    const decision = detector.update({
+      nowMs,
+      adaptive: {
+        side: scenario.side,
+        sampleTimestampMs: nowMs,
+        loadPresent,
+        classification: loadPresent ? 'loaded_unconfirmed' : 'empty',
+        score,
+        loadedChannels,
+        loadVelocityScore,
+        unloadVelocityScore,
+        entryVelocitySupported,
+        algorithmVersion: replayFixture.fixed.adaptiveAlgorithmVersion,
+      },
+      piezo: piezoRow
+        ? {
+            side: scenario.side,
+            sampleTimestampMs: piezoRow[0] * SECOND,
+            present: piezoRow[1],
+            energy: piezoRow[2],
+            autocorrelationQuality: piezoRow[3],
+            enterThreshold: replayFixture.fixed.piezoEnterThreshold,
+            exitThreshold: replayFixture.fixed.piezoExitThreshold,
+            decisionReason: piezoRow[4],
+            pumpMode: piezoRow[5],
+          }
+        : null,
+    })
+    return { nowMs, decision }
+  })
 }
 
 describe('FusedOccupancySide', () => {
@@ -382,9 +640,40 @@ describe('FusedOccupancySide', () => {
 
     expect(result).toMatchObject({
       state: 'occupied',
-      certificatePhase: 'observing',
+      certificatePhase: 'armed',
       certificate: null,
-      lastCertificateInvalidationReason: 'pump_state_unsupported',
+    })
+  })
+
+  it('preserves an established certificate through later pump activity', () => {
+    const detector = new FusedOccupancySide('right', {
+      provenanceEpoch: 'post-certificate-pump',
+    })
+    const certified = certifySeptember21Exit(detector)
+    const confirmedAt = certified.certificate?.confirmedAtMs ?? BASE
+
+    const result = detector.update({
+      nowMs: confirmedAt + 10 * SECOND,
+      adaptive: adaptive(confirmedAt + 10 * SECOND, {
+        score: 4.8,
+        loadedChannels: 2,
+      }),
+      piezo: piezo(confirmedAt + 10 * SECOND, {
+        present: false,
+        energy: 2_000,
+        autocorrelationQuality: 0.8,
+        decisionReason: 'pump_suppressed',
+        pumpMode: 'symmetric',
+      }),
+    })
+
+    expect(result).toMatchObject({
+      state: 'clear',
+      classification: 'clear_exit_certified',
+      certificatePhase: 'certified',
+      certificate: {
+        id: certified.certificate?.id,
+      },
     })
   })
 
@@ -520,5 +809,493 @@ describe('FusedOccupancySide', () => {
       certificate: null,
       provenanceEpoch: 'after-restart',
     })
+  })
+
+  it('does not open a short cycle from movement on an already robustly loaded side', () => {
+    const detector = new FusedOccupancySide('right', {
+      provenanceEpoch: 'robust-movement',
+    })
+    detector.update({
+      nowMs: BASE,
+      adaptive: adaptive(BASE),
+      piezo: piezo(BASE, {
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+    detector.update({
+      nowMs: BASE + 5 * SECOND,
+      adaptive: adaptive(BASE + 5 * SECOND, {
+        score: 30,
+        loadVelocityScore: 6,
+        entryVelocitySupported: true,
+      }),
+      piezo: piezo(BASE, {
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+    detector.update({
+      nowMs: BASE + 10 * SECOND,
+      adaptive: adaptive(BASE + 10 * SECOND, {
+        score: 3,
+        loadedChannels: 1,
+        unloadVelocityScore: 20,
+      }),
+      piezo: piezo(BASE, {
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+    const result = detector.update({
+      nowMs: BASE + 30 * SECOND,
+      adaptive: adaptive(BASE + 30 * SECOND, {
+        score: 3,
+        loadedChannels: 1,
+      }),
+      piezo: piezo(BASE, {
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+
+    expect(result).toMatchObject({
+      state: 'occupied',
+      certificatePhase: 'observing',
+      certificate: null,
+      shortCycle: null,
+    })
+  })
+
+  it('requires the entry epoch to observe adaptive load before certifying', () => {
+    const detector = new FusedOccupancySide('right', {
+      provenanceEpoch: 'transient-entry',
+    })
+    detector.update({
+      nowMs: BASE,
+      adaptive: adaptive(BASE, {
+        loadPresent: false,
+        classification: 'empty',
+        score: 2,
+        loadedChannels: 0,
+      }),
+      piezo: piezo(BASE, {
+        present: false,
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+    detector.update({
+      nowMs: BASE + 5 * SECOND,
+      adaptive: adaptive(BASE + 5 * SECOND, {
+        loadPresent: false,
+        classification: 'empty',
+        score: 12,
+        loadedChannels: 2,
+        loadVelocityScore: 10,
+        entryVelocitySupported: true,
+      }),
+      piezo: piezo(BASE, {
+        present: false,
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+    detector.update({
+      nowMs: BASE + 30 * SECOND,
+      adaptive: adaptive(BASE + 30 * SECOND, {
+        loadPresent: false,
+        classification: 'empty',
+        score: 2,
+        loadedChannels: 0,
+        unloadVelocityScore: 10,
+      }),
+      piezo: piezo(BASE, {
+        present: false,
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+    const result = detector.update({
+      nowMs: BASE + 40 * SECOND,
+      adaptive: adaptive(BASE + 40 * SECOND, {
+        loadPresent: false,
+        classification: 'empty',
+        score: 2,
+        loadedChannels: 0,
+      }),
+      piezo: piezo(BASE, {
+        present: false,
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+
+    expect(result).toMatchObject({
+      state: 'clear',
+      classification: 'clear_adaptive',
+      certificate: null,
+      shortCycle: {
+        loadPresentObserved: false,
+        blockedReason: 'adaptive_load_not_confirmed',
+      },
+    })
+  })
+
+  it('requires a strong adaptive unload impulse to start short-cycle confirmation', () => {
+    const detector = new FusedOccupancySide('right', {
+      provenanceEpoch: 'weak-unload',
+    })
+    detector.update({
+      nowMs: BASE,
+      adaptive: adaptive(BASE, {
+        loadPresent: false,
+        classification: 'empty',
+        score: 2,
+        loadedChannels: 0,
+      }),
+      piezo: piezo(BASE, {
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+    detector.update({
+      nowMs: BASE + 5 * SECOND,
+      adaptive: adaptive(BASE + 5 * SECOND, {
+        loadPresent: false,
+        score: 12,
+        loadedChannels: 2,
+        loadVelocityScore: 10,
+        entryVelocitySupported: true,
+      }),
+      piezo: piezo(BASE, {
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+    detector.update({
+      nowMs: BASE + 15 * SECOND,
+      adaptive: adaptive(BASE + 15 * SECOND, {
+        score: 12,
+        loadedChannels: 2,
+      }),
+      piezo: piezo(BASE, {
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+    const result = detector.update({
+      nowMs: BASE + 30 * SECOND,
+      adaptive: adaptive(BASE + 30 * SECOND, {
+        score: 3,
+        loadedChannels: 1,
+        unloadVelocityScore: 1,
+      }),
+      piezo: piezo(BASE, {
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+
+    expect(result).toMatchObject({
+      state: 'occupied',
+      certificate: null,
+      shortCycle: {
+        blockedReason: 'adaptive_unload_too_weak',
+      },
+    })
+  })
+
+  it('remembers a strong unload while waiting for piezo to become quiet', () => {
+    const detector = new FusedOccupancySide('right', {
+      provenanceEpoch: 'delayed-piezo-quiet',
+    })
+    detector.update({
+      nowMs: BASE,
+      adaptive: adaptive(BASE, {
+        loadPresent: false,
+        classification: 'empty',
+        score: 2,
+        loadedChannels: 0,
+      }),
+      piezo: piezo(BASE, {
+        energy: 300_000,
+        autocorrelationQuality: 0.4,
+      }),
+    })
+    detector.update({
+      nowMs: BASE + 5 * SECOND,
+      adaptive: adaptive(BASE + 5 * SECOND, {
+        loadPresent: false,
+        score: 12,
+        loadedChannels: 2,
+        loadVelocityScore: 10,
+        entryVelocitySupported: true,
+      }),
+      piezo: piezo(BASE, {
+        energy: 300_000,
+        autocorrelationQuality: 0.4,
+      }),
+    })
+    detector.update({
+      nowMs: BASE + 15 * SECOND,
+      adaptive: adaptive(BASE + 15 * SECOND, {
+        score: 20,
+        loadedChannels: 3,
+      }),
+      piezo: piezo(BASE, {
+        energy: 300_000,
+        autocorrelationQuality: 0.4,
+      }),
+    })
+    const waiting = detector.update({
+      nowMs: BASE + 30 * SECOND,
+      adaptive: adaptive(BASE + 30 * SECOND, {
+        score: 3,
+        loadedChannels: 1,
+        unloadVelocityScore: 17,
+      }),
+      piezo: piezo(BASE, {
+        energy: 300_000,
+        autocorrelationQuality: 0.4,
+      }),
+    })
+    expect(waiting).toMatchObject({
+      state: 'occupied',
+      certificate: null,
+      shortCycle: {
+        adaptiveCollapseAtMs: BASE + 30 * SECOND,
+        blockedReason: 'piezo_not_quiet',
+      },
+    })
+
+    detector.update({
+      nowMs: BASE + 60 * SECOND,
+      adaptive: adaptive(BASE + 60 * SECOND, {
+        score: 3,
+        loadedChannels: 1,
+      }),
+      piezo: piezo(BASE + 60 * SECOND, {
+        present: false,
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+    const result = detector.update({
+      nowMs: BASE + 70 * SECOND,
+      adaptive: adaptive(BASE + 70 * SECOND, {
+        score: 3,
+        loadedChannels: 1,
+      }),
+      piezo: piezo(BASE + 70 * SECOND, {
+        present: false,
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+
+    expect(result).toMatchObject({
+      state: 'clear',
+      certificate: {
+        basis: 'entry_transition',
+        transitionAtMs: BASE + 60 * SECOND,
+      },
+    })
+  })
+
+  it('revokes short-cycle clear on a new adaptive entry', () => {
+    const detector = new FusedOccupancySide('right', {
+      provenanceEpoch: 'short-adaptive-return',
+    })
+    expect(certifyShortCycle(detector)).toMatchObject({
+      state: 'clear',
+      certificate: {
+        basis: 'entry_transition',
+      },
+    })
+
+    const result = detector.update({
+      nowMs: BASE + 50 * SECOND,
+      adaptive: adaptive(BASE + 50 * SECOND, {
+        score: 12,
+        loadedChannels: 2,
+        loadVelocityScore: 4,
+        entryVelocitySupported: true,
+      }),
+      piezo: piezo(BASE, {
+        present: false,
+        energy: 100_000,
+        autocorrelationQuality: 0.1,
+      }),
+    })
+
+    expect(result).toMatchObject({
+      state: 'occupied',
+      reason: 'credible_entry',
+      certificate: null,
+      lastCertificateInvalidationReason: 'credible_entry',
+    })
+  })
+
+  it('revokes short-cycle clear on a new piezo entry', () => {
+    const detector = new FusedOccupancySide('right', {
+      provenanceEpoch: 'short-piezo-return',
+    })
+    expect(certifyShortCycle(detector)).toMatchObject({
+      state: 'clear',
+      certificate: {
+        basis: 'entry_transition',
+      },
+    })
+
+    const result = detector.update({
+      nowMs: BASE + 50 * SECOND,
+      adaptive: adaptive(BASE + 50 * SECOND, {
+        score: 3,
+        loadedChannels: 1,
+        entryVelocitySupported: true,
+      }),
+      piezo: piezo(BASE + 50 * SECOND, {
+        present: true,
+        energy: 500_000,
+        autocorrelationQuality: 0.5,
+        decisionReason: 'std_enter',
+      }),
+    })
+
+    expect(result).toMatchObject({
+      state: 'occupied',
+      reason: 'credible_entry',
+      certificate: null,
+      lastCertificateInvalidationReason: 'credible_entry',
+    })
+  })
+
+  it('ignores an uncorroborated cross-side piezo entry after clear', () => {
+    const detector = new FusedOccupancySide('right', {
+      provenanceEpoch: 'cross-side-piezo',
+    })
+    const certified = certifyShortCycle(detector)
+
+    const result = detector.update({
+      nowMs: BASE + 50 * SECOND,
+      adaptive: adaptive(BASE + 50 * SECOND, {
+        score: 5.5,
+        loadedChannels: 3,
+        entryVelocitySupported: false,
+      }),
+      piezo: piezo(BASE + 50 * SECOND, {
+        present: true,
+        energy: 565_000,
+        autocorrelationQuality: 0.265,
+        decisionReason: 'std_enter',
+      }),
+    })
+
+    expect(result).toMatchObject({
+      state: 'clear',
+      certificate: {
+        id: certified.certificate?.id,
+      },
+    })
+  })
+
+  it.each(
+    replayFixture.scenarios.filter(
+      scenario => scenario.expectation.certificateMode === 'entry_transition',
+    ),
+  )('certifies captured short visit $id', (scenario) => {
+    const decisions = replayScenario(scenario)
+    const occupiedFromMs = scenario.expectation.occupiedFromMs
+    const occupiedThroughMs = scenario.expectation.mustRemainOccupiedThroughMs
+    const prematureClear = decisions.find(({ nowMs, decision }) =>
+      occupiedFromMs !== undefined
+      && occupiedThroughMs !== undefined
+      && nowMs >= occupiedFromMs
+      && nowMs <= occupiedThroughMs
+      && decision.state === 'clear')
+    const certified = decisions.find(
+      ({ decision }) => decision.classification === 'clear_exit_certified',
+    )
+
+    expect(prematureClear).toBeUndefined()
+    expect(certified).toBeDefined()
+    expect(certified?.nowMs).toBeLessThanOrEqual(
+      scenario.expectation.clearByMs ?? Number.POSITIVE_INFINITY,
+    )
+    expect(certified?.decision).toMatchObject({
+      certificate: {
+        basis: 'entry_transition',
+        piezoBaselineSource:
+          scenario.expectation.piezoBaselineSource,
+      },
+    })
+    const final = decisions.at(-1)
+    expect(final?.nowMs).toBeGreaterThanOrEqual(
+      scenario.expectation.maintainClearThroughMs ?? 0,
+    )
+    expect(final?.decision).toMatchObject({
+      state: 'clear',
+      certificate: {
+        id: certified?.decision.certificate?.id,
+        basis: 'entry_transition',
+        piezoBaselineSource:
+          scenario.expectation.piezoBaselineSource,
+      },
+    })
+  })
+
+  it.each(
+    replayFixture.scenarios.filter(
+      scenario => scenario.expectation.certificateMode === 'sustained_baseline',
+    ),
+  )('preserves sustained certification for $id', (scenario) => {
+    const decisions = replayScenario(scenario)
+    const occupiedFromMs = scenario.expectation.occupiedFromMs
+    const occupiedThroughMs = scenario.expectation.mustRemainOccupiedThroughMs
+    const prematureClear = decisions.find(({ nowMs, decision }) =>
+      occupiedFromMs !== undefined
+      && occupiedThroughMs !== undefined
+      && nowMs >= occupiedFromMs
+      && nowMs <= occupiedThroughMs
+      && decision.state === 'clear')
+    const certified = decisions.find(
+      ({ decision }) => decision.classification === 'clear_exit_certified',
+    )
+
+    expect(prematureClear).toBeUndefined()
+    expect(certified).toBeDefined()
+    expect(certified?.nowMs).toBeLessThanOrEqual(
+      scenario.expectation.clearByMs ?? Number.POSITIVE_INFINITY,
+    )
+    expect(certified?.decision).toMatchObject({
+      certificate: {
+        basis: 'sustained_baseline',
+        piezoBaselineSource:
+          scenario.expectation.piezoBaselineSource,
+      },
+    })
+    const final = decisions.at(-1)
+    expect(final?.nowMs).toBeGreaterThanOrEqual(
+      scenario.expectation.maintainClearThroughMs ?? 0,
+    )
+    expect(final?.decision).toMatchObject({
+      state: 'clear',
+      certificate: {
+        id: certified?.decision.certificate?.id,
+        basis: 'sustained_baseline',
+      },
+    })
+  })
+
+  it.each(
+    replayFixture.scenarios.filter(
+      scenario => scenario.expectation.mustNotCertify,
+    ),
+  )('does not certify pump-ambiguous replay $id', (scenario) => {
+    const decisions = replayScenario(scenario)
+
+    expect(decisions.every(({ decision }) => decision.certificate === null))
+      .toBe(true)
   })
 })

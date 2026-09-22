@@ -1191,13 +1191,32 @@ function fusedOccupancyDecisionPayload(
     certificate: decision.certificate
       ? {
           id: decision.certificate.id,
+          basis: decision.certificate.basis,
           transitionAt: isoTimestamp(decision.certificate.transitionAtMs),
           confirmedAt: isoTimestamp(decision.certificate.confirmedAtMs),
           adaptiveBaselineScore:
             decision.certificate.adaptiveBaselineScore,
           piezoBaselineEnergy: decision.certificate.piezoBaselineEnergy,
+          piezoBaselineSource:
+            decision.certificate.piezoBaselineSource,
           adaptiveCollapseRatio: decision.certificate.adaptiveCollapseRatio,
           piezoCollapseRatio: decision.certificate.piezoCollapseRatio,
+        }
+      : null,
+    shortCycle: decision.shortCycle
+      ? {
+          entryAt: isoTimestamp(decision.shortCycle.entryAtMs),
+          expiresAt: isoTimestamp(decision.shortCycle.expiresAtMs),
+          adaptivePeakScore: decision.shortCycle.adaptivePeakScore,
+          adaptivePeakLoadedChannels:
+            decision.shortCycle.adaptivePeakLoadedChannels,
+          piezoPeakEnergy: decision.shortCycle.piezoPeakEnergy,
+          loadPresentObserved: decision.shortCycle.loadPresentObserved,
+          adaptiveCollapseAt:
+            isoTimestamp(decision.shortCycle.adaptiveCollapseAtMs),
+          adaptiveCollapseRatio:
+            decision.shortCycle.adaptiveCollapseRatio,
+          blockedReason: decision.shortCycle.blockedReason,
         }
       : null,
     lastCertificateInvalidationReason:
@@ -2028,6 +2047,7 @@ export const __test__ = {
   slugify,
   parsePayload,
   buildSchedulesPayload,
+  fusedOccupancyDecisionPayload,
   publishFusedOccupancy,
   state,
 }
