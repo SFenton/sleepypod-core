@@ -433,3 +433,147 @@ class TestPresenceDebounce:
         assert len(caps) == 2
         assert all("(1 consecutive)" in r.getMessage() for r in caps)
         assert [r for r in caplog.records if "stuck-occupied" in r.getMessage()] == []
+
+
+def _restart(old, now):
+    """Round-trip old's snapshot through JSON into a fresh tracker on the same
+    DB — what a service restart or pod reboot does via the state file."""
+    import json
+    t = main.SessionTracker(side=old.side, db=old.db, calibration=None, pump_gate=None)
+    t.restore(json.loads(json.dumps(old.snapshot())), now)
+    return t
+
+
+def _rows_full(t):
+    return t.db.conn.execute(
+        "SELECT entered_bed_at, left_bed_at, sleep_duration_seconds, times_exited_bed "
+        "FROM sleep_records").fetchall()
+
+
+class TestSessionPersistence:
+    """A reboot or restart mid-session used to drop the open session — it
+    only lived in memory, so the night never reached sleep_records."""
+
+    BASE = 1_777_000_000.0
+
+    def _asleep(self, hours=6):
+        t = _tracker()
+        ts = self.BASE
+        samples = [(ts, True), (ts + 31, True)]
+        while ts < self.BASE + hours * 3600:
+            ts += 60
+            samples.append((ts, True))
+        _feed(t, samples)
+        return t, ts
+
+    def test_reboot_mid_sleep_resumes_one_session(self):
+        t, ts = self._asleep()
+        t = _restart(t, now=ts + 300)          # 5 min reboot, still in bed
+        wake = ts + 300 + 2 * 3600
+        samples = [(ts + 300 + i * 60, True) for i in range(1, 121)]
+        samples += [(wake, False), (wake + 31, False), (wake + 200, False)]
+        _feed(t, samples)
+
+        rows = _rows_full(t)
+        assert len(rows) == 1
+        entered, left_at, duration_s, exits = rows[0]
+        assert entered == int(self.BASE)
+        assert left_at == int(wake)
+        assert exits == 1
+        assert duration_s == int(wake - self.BASE)
+
+    def test_left_bed_during_downtime_closes_at_last_presence(self):
+        t, ts = self._asleep()
+        t = _restart(t, now=ts + 600)          # back up 10 min later, bed empty
+        _feed(t, [(ts + 600, False), (ts + 631, False), (ts + 800, False)])
+
+        rows = _rows_full(t)
+        assert len(rows) == 1
+        _entered, left_at, duration_s, exits = rows[0]
+        # Dated at the last pre-restart presence, not the first sample after.
+        assert left_at == int(ts)
+        assert duration_s == int(ts - self.BASE)
+        assert exits == 1
+
+    def test_stale_saved_session_is_closed_not_resumed(self):
+        t, ts = self._asleep()
+        t = _restart(t, now=ts + main.STATE_MAX_GAP_S + 1)
+
+        rows = _rows_full(t)
+        assert len(rows) == 1
+        assert rows[0][1] == int(ts)           # closed at last presence
+        assert t.snapshot()["session_start"] is None
+        assert t.state_dirty is True
+
+    def test_replayed_samples_are_skipped_after_restore(self):
+        class _NoCal:
+            def get_baselines(self, side):
+                return None
+
+        t, ts = self._asleep(hours=1)
+        t = _restart(t, now=ts + 60)
+        t.calibration = _NoCal()
+        t.pump_gate = main.PumpGateCapSense()
+        rec = {"type": "capSense", "left": {"out": 1, "cen": 1, "in": 1}}
+
+        t.process(ts - 600, rec)               # replay from the RAW file start
+        assert t._last_ts == ts
+        t.process(ts, rec)
+        assert t._last_ts == ts
+        t.process(ts + 1, rec)                 # first genuinely new sample
+        assert t._last_ts == ts + 1
+        assert t._replay_until_ts is None
+
+    def test_idle_tracker_keeps_cap_close_streak_only(self):
+        t = _tracker()
+        t._consecutive_cap_closes = 2
+        t = _restart(t, now=self.BASE)
+        assert t._consecutive_cap_closes == 2
+        assert t.snapshot()["session_start"] is None
+
+    def test_corrupt_saved_session_is_ignored(self):
+        t = _tracker()
+        t.restore({"session_start": "not-a-number"}, now=self.BASE)
+        assert t.snapshot()["session_start"] is None
+        t.restore(None, now=self.BASE)
+        t.restore(["not", "a", "dict"], now=self.BASE)
+        assert _rows(t) == []
+
+    def test_session_start_close_and_exit_mark_state_dirty(self):
+        t = _tracker()
+        _feed(t, [(self.BASE, True), (self.BASE + 31, True)])
+        assert t.state_dirty is True
+        t.state_dirty = False
+        leave = self.BASE + 4000
+        _feed(t, [(leave, False), (leave + 31, False)])
+        assert t.state_dirty is True            # bed-exit
+        t.state_dirty = False
+        _feed(t, [(leave + 200, False)])
+        assert t.state_dirty is True            # session closed
+
+
+class TestStateFile:
+    def test_round_trip(self, tmp_path):
+        t = _tracker()
+        _feed(t, [(1_777_000_000.0, True), (1_777_000_031.0, True)])
+        path = tmp_path / "state.json"
+        assert main.save_state(path, (t,)) is True
+        state = main.load_state(path)
+        assert state["version"] == main.STATE_VERSION
+        assert state["left"]["session_start"] == 1_777_000_000.0
+        assert not (tmp_path / "state.json.tmp").exists()
+
+    def test_missing_file_is_empty(self, tmp_path):
+        assert main.load_state(tmp_path / "nope.json") == {}
+
+    def test_corrupt_or_foreign_file_is_empty(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text("{truncated")
+        assert main.load_state(path) == {}
+        path.write_text('{"version": 999, "left": {}}')
+        assert main.load_state(path) == {}
+        path.write_text("[1, 2]")
+        assert main.load_state(path) == {}
+
+    def test_unwritable_path_reports_failure(self, tmp_path):
+        assert main.save_state(tmp_path / "missing-dir" / "state.json", (_tracker(),)) is False

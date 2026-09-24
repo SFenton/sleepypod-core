@@ -135,6 +135,14 @@ The former z-score check (sum of `|val - mean| / std`, std floored at 5) flagged
 
 A session starts on the first present sample and ends after `ABSENCE_TIMEOUT_S` (120s) of consecutive absence. Sessions shorter than `MIN_SESSION_S` (300s = 5 min) are discarded as false positives.
 
+### Surviving restarts
+
+An open session lives in memory, so it is checkpointed to `sleep-detector-state.json` next to `biometrics.db` (override with `SLEEP_DETECTOR_STATE_PATH`) every `STATE_SAVE_INTERVAL_S` and immediately on session start, bed-exit, and close. The write is tmp + fsync + rename. On startup the detector:
+
+- **resumes** the session when the last saved sample is recent. If the occupant is still in bed the downtime counts as sleep; if absence is committed before any presence is seen, the exit is dated at the last pre-restart presence (they left while the detector was down).
+- **closes** it at the last presence when the gap exceeds `STATE_MAX_GAP_S` (30 min), since the downtime can't be attributed to sleep.
+- **skips replayed samples**: the RAW follower re-reads the current file from offset 0, so samples at or before the saved `last_ts` are ignored.
+
 Session records include:
 - Entry/exit timestamps
 - Duration
@@ -186,6 +194,8 @@ This filters phantom-session flicker (1-3 scattered non-still epochs per bucket)
 | `MOVEMENT_INTERVAL_S` | 60 s | One movement score per minute; matches AASM epoch length |
 | `PRESENCE_THRESHOLD` | 1500 | Fallback for uncalibrated capSense (Pod 3) |
 | `CALIBRATION_RELOAD_S` | 60 s | Poll calibration_profiles for updates |
+| `STATE_SAVE_INTERVAL_S` | 60 s | Checkpoint an open session to the state file |
+| `STATE_MAX_GAP_S` | 30 min | Longer downtime closes a restored session instead of resuming it |
 | Movement scale (capSense2) | 10x | Pod 5 float channels, deltas ~0.05-5.0 |
 | Movement scale (capSense) | 0.5x | Pod 3 int ADC channels, deltas ~1-50 |
 | Movement cap | 1000 | Prevents outlier scores from sensor glitches |

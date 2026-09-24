@@ -110,6 +110,17 @@ MOVEMENT_INTERVAL_S = 60
 PRESENCE_THRESHOLD = 1500
 # How often to reload calibration profiles (seconds)
 CALIBRATION_RELOAD_S = 60
+# In-progress session state survives restarts/reboots via this file. Without
+# it a reboot or service restart mid-session silently dropped the whole night.
+STATE_PATH = Path(os.environ.get(
+    "SLEEP_DETECTOR_STATE_PATH", str(BIOMETRICS_DB.parent / "sleep-detector-state.json")))
+STATE_VERSION = 1
+# How often to checkpoint an open session (seconds). Session start/close and
+# bed-exits checkpoint immediately.
+STATE_SAVE_INTERVAL_S = 60
+# A restored session whose last sample is older than this is closed at the
+# last presence instead of resumed — the downtime can't be attributed to sleep.
+STATE_MAX_GAP_S = 30 * 60
 # Earliest ts considered a valid wall-clock timestamp (2020-01-01 UTC).
 # RAW frames very rarely arrive with a tiny relative ts (e.g. 3s after some
 # synthetic origin) before the firmware has a real wall-clock reference.
@@ -292,6 +303,42 @@ def write_movement(holder: "DBHolder", side: str,
         if _db_write_failures >= _DB_RECONNECT_THRESHOLD:
             _db_write_failures = 0
             _reconnect_db(holder)
+        return False
+
+
+def load_state(path: Path) -> dict:
+    """Read the persisted per-side tracker state; {} when missing or unusable."""
+    try:
+        state = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        log.warning("Ignoring unreadable state file %s: %s", path, e)
+        return {}
+    if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
+        log.warning("Ignoring state file %s with unexpected shape/version", path)
+        return {}
+    return state
+
+
+def save_state(path: Path, trackers) -> bool:
+    """Atomically write every tracker's state. Returns True on success.
+
+    tmp + fsync + rename so a power cut leaves either the previous or the new
+    file, never a truncated one."""
+    state = {"version": STATE_VERSION}
+    for t in trackers:
+        state[t.side] = t.snapshot()
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        log.warning("Could not save state to %s: %s", path, e)
         return False
 
 
@@ -649,8 +696,81 @@ class SessionTracker:
     # (absence-timeout) close. Two in a row means the presence signal never
     # dropped for 32+ hours — a stuck level signal, not a sleeper.
     _consecutive_cap_closes: int = 0
+    # ts of the latest processed sample, persisted so a restore can tell how
+    # long the detector was down.
+    _last_ts: Optional[float] = None
+    # Set by restore() when the occupant was present at shutdown; cleared by
+    # the first present sample afterwards. If absence is committed first, the
+    # occupant left during the downtime, so the exit is dated at the last
+    # pre-restart presence instead of the first post-restart sample.
+    _resumed_last_present: Optional[float] = None
+    # The RAW follower re-reads the current file from offset 0 on startup, so
+    # up to ~15 min of already-processed samples replay after a restore;
+    # samples at or before this ts are skipped.
+    _replay_until_ts: Optional[float] = None
+    # Session start/close or a bed-exit happened since the last checkpoint.
+    state_dirty: bool = False
+
+    def snapshot(self) -> dict:
+        """JSON-serializable state needed to resume after a restart."""
+        return {
+            "session_start": self._session_start.timestamp() if self._session_start else None,
+            "last_present_ts": self._last_present_ts,
+            "present_intervals": self._present_intervals,
+            "absent_intervals": self._absent_intervals,
+            "interval_start": self._interval_start,
+            "was_present": self._was_present,
+            "exit_count": self._exit_count,
+            "debounced_present": self._debounced_present,
+            "state_since": self._state_since,
+            "consecutive_cap_closes": self._consecutive_cap_closes,
+            "last_ts": self._last_ts,
+        }
+
+    def restore(self, state: Optional[dict], now: float) -> None:
+        """Resume an in-progress session saved by snapshot().
+
+        A session whose last sample is older than STATE_MAX_GAP_S is closed at
+        the last presence rather than resumed."""
+        if not isinstance(state, dict):
+            return
+        try:
+            self._consecutive_cap_closes = int(state.get("consecutive_cap_closes") or 0)
+            start = state.get("session_start")
+            if start is None:
+                return
+            self._session_start = datetime.fromtimestamp(float(start), tz=timezone.utc)
+            self._last_present_ts = state.get("last_present_ts")
+            self._present_intervals = list(state.get("present_intervals") or [])
+            self._absent_intervals = list(state.get("absent_intervals") or [])
+            self._interval_start = state.get("interval_start")
+            self._was_present = bool(state.get("was_present"))
+            self._exit_count = int(state.get("exit_count") or 0)
+            self._debounced_present = bool(state.get("debounced_present"))
+            self._state_since = state.get("state_since")
+            self._last_ts = state.get("last_ts")
+            self._replay_until_ts = self._last_ts
+        except (TypeError, ValueError, OverflowError, OSError) as e:
+            log.warning("%s: ignoring corrupt saved session: %s", self.side, e)
+            self._reset_session()
+            return
+
+        last_seen = self._last_ts or self._last_present_ts or float(start)
+        if now - last_seen > STATE_MAX_GAP_S:
+            log.info("%s: saved session stale (down %.0f min) — closing at last presence",
+                     self.side, (now - last_seen) / 60)
+            self._close_session(self._last_present_ts or last_seen)
+            return
+
+        if self._debounced_present:
+            self._resumed_last_present = self._last_present_ts
+        log.info("%s: resumed session started at %s", self.side, self._session_start.isoformat())
 
     def process(self, ts: float, record: dict) -> None:
+        if self._replay_until_ts is not None:
+            if ts <= self._replay_until_ts:
+                return  # already processed before the restart
+            self._replay_until_ts = None
         baselines = self.calibration.get_baselines(self.side)
         rtype = record.get("type", "")
         # Only use baselines if they match the record format
@@ -727,14 +847,22 @@ class SessionTracker:
         return False
 
     def _update(self, ts: float, present: bool, movement: float) -> None:
+        self._last_ts = ts
         self._movement_buf.append(movement)
         self._flush_movement(ts)
+
+        if present:
+            self._resumed_last_present = None
 
         # Debounce raw presence so brief capSense dropouts don't fragment the
         # session or inflate times_exited_bed (pod 88 field debug 2026-06-10).
         changed = self._apply_debounce(ts, present)
         # Timestamp of the true transition when one just committed, else `ts`.
         edge_ts = self._state_since if changed and self._state_since is not None else ts
+        if changed and not self._debounced_present and self._resumed_last_present is not None:
+            # Never seen present since the restart: they left during the downtime.
+            edge_ts = self._resumed_last_present
+            self._resumed_last_present = None
 
         if self._debounced_present:
             if self._session_start is None:
@@ -742,6 +870,7 @@ class SessionTracker:
                 self._session_start = datetime.fromtimestamp(edge_ts, tz=timezone.utc)
                 self._interval_start = edge_ts
                 self._was_present = True
+                self.state_dirty = True
                 log.info("%s: session started at %s", self.side, self._session_start.isoformat())
 
             elif changed and self._interval_start is not None:
@@ -758,6 +887,7 @@ class SessionTracker:
                 self._present_intervals.append([self._interval_start, edge_ts])
                 self._interval_start = edge_ts
                 self._exit_count += 1
+                self.state_dirty = True
 
             self._was_present = False
 
@@ -829,6 +959,10 @@ class SessionTracker:
         if not wrote:
             return
 
+        self._reset_session()
+        self.state_dirty = True
+
+    def _reset_session(self) -> None:
         self._session_start = None
         self._last_present_ts = None
         self._present_intervals = []
@@ -845,6 +979,7 @@ class SessionTracker:
         self._epoch_scores.clear()
         self._median_buf.clear()
         self._pump_gated_samples = 0
+        self._resumed_last_present = None
 
     def _flush_movement(self, ts: float) -> None:
         if ts - self._last_movement_write < MOVEMENT_INTERVAL_S:
@@ -920,6 +1055,11 @@ def main() -> None:
     # side is observed by the other on its next write (no orphaned handles).
     left = SessionTracker(side="left", db=db_holder, calibration=cal_cache, pump_gate=pump_gate)
     right = SessionTracker(side="right", db=db_holder, calibration=cal_cache, pump_gate=pump_gate)
+    trackers = (left, right)
+    saved = load_state(STATE_PATH)
+    for t in trackers:
+        t.restore(saved.get(t.side), time.time())
+    last_save = time.monotonic()
     # Source selected once at startup: NatsFollower on new-firmware pods (NATS
     # reachable), else the unchanged .RAW tailer. Same decoded-record contract.
     follower = create_follower(RAW_DATA_DIR, _shutdown, poll_interval=0.5)
@@ -960,11 +1100,18 @@ def main() -> None:
             left.process(ts, record)
             right.process(ts, record)
 
+            if (left.state_dirty or right.state_dirty
+                    or time.monotonic() - last_save >= STATE_SAVE_INTERVAL_S):
+                if save_state(STATE_PATH, trackers):
+                    left.state_dirty = right.state_dirty = False
+                last_save = time.monotonic()
+
     except Exception as e:
         log.exception("Fatal error in main loop: %s", e)
         report_health("down", str(e))
         sys.exit(1)
     finally:
+        save_state(STATE_PATH, trackers)
         cal_store.close()
         db_holder.conn.close()
         log.info("Shutdown complete")
