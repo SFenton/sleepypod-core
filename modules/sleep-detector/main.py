@@ -11,9 +11,9 @@ Writes to two tables:
 
 Detection logic:
   Each capacitance record contains three channels per side (out, cen, in).
-  Presence is the summed signed raw-unit rise above the calibrated per-channel
-  baseline (a body only adds capacitance), falling back to a fixed sum
-  threshold when no calibration profile is available.
+  Presence is the summed signed raw-unit rise above a self-adjusting
+  per-channel empty-bed baseline (a body only adds capacitance) — see
+  AdaptiveBaseline. Scheduled calibration no longer sets it.
   A session starts on the first present sample and ends after ABSENCE_TIMEOUT_S
   consecutive absent samples.
 
@@ -73,9 +73,11 @@ from common.dialect import (
     warn_unknown_type_once,
 )
 from common.calibration import (
+    CAPSENSE_PRESENCE_THRESHOLD,
     CalibrationStore,
-    is_present_capsense_calibrated,
-    is_present_capsense2_calibrated,
+    capsense_channel_values,
+    capsense_threshold,
+    capsense2_channel_values,
 )
 
 # ---------------------------------------------------------------------------
@@ -106,10 +108,28 @@ PRESENCE_DEBOUNCE_S = 30.0
 MAX_SESSION_S = 16 * 3600
 # How often to write a movement row (seconds)
 MOVEMENT_INTERVAL_S = 60
-# Fallback presence threshold when uncalibrated
-PRESENCE_THRESHOLD = 1500
 # How often to reload calibration profiles (seconds)
 CALIBRATION_RELOAD_S = 60
+# Self-adjusting empty-bed baseline (replaces scheduled capacitance
+# calibration, which could capture a motionless sleeper as "empty").
+# Presence enters above the threshold and exits below this fraction of it,
+# so a reading hovering at the threshold can't flap.
+PRESENCE_EXIT_FRACTION = 0.5
+# While empty and within the exit threshold, the baseline follows slow drift
+# (thermal, bedding) with this time constant (seconds).
+BASELINE_UP_TAU_S = 30 * 60
+# A reading BELOW baseline is always an empty bed (a body only adds
+# capacitance), so a baseline captured with someone in bed drops to the true
+# empty level within minutes of them getting up.
+BASELINE_DOWN_TAU_S = 120
+# Samples further apart than this don't count as tracking time (gaps,
+# restarts), so one sample can't move the baseline all the way.
+BASELINE_MAX_STEP_S = 10.0
+# How often the baseline is written back to calibration_profiles so the app
+# and Node's occupancy check (capSense2) see the same empty-bed level.
+BASELINE_PUBLISH_S = 15 * 60
+# capSense2 profile threshold default (raw float units), as the calibrator.
+CAPSENSE2_PRESENCE_THRESHOLD = 6.0
 # In-progress session state survives restarts/reboots via this file. Without
 # it a reboot or service restart mid-session silently dropped the whole night.
 STATE_PATH = Path(os.environ.get(
@@ -433,20 +453,34 @@ def compute_movement_delta(current: list, previous: list) -> float:
 
 
 class CalibrationCache:
-    """Periodically reloads capacitance calibration profiles for both sides."""
+    """Periodically reloads capacitance calibration profiles for both sides,
+    and writes the self-adjusting baseline back to them."""
 
     def __init__(self, store: CalibrationStore):
         self._store = store
-        self._profiles: Dict[str, Optional[dict]] = {"left": None, "right": None}
+        # side -> (params, created_at) of the active completed profile
+        self._profiles: Dict[str, Optional[tuple]] = {"left": None, "right": None}
         self._last_reload = 0.0
 
-    def get_baselines(self, side: str) -> Optional[dict]:
-        self._maybe_reload()
+    def get_profile(self, side: str, force: bool = False) -> Optional[tuple]:
+        """(params, created_at) of the active capacitance profile, or None."""
+        self._maybe_reload(force)
         return self._profiles.get(side)
 
-    def _maybe_reload(self) -> None:
+    def publish(self, side: str, params: dict, window_start: int,
+                window_end: int, samples: int) -> bool:
+        """Upsert the adaptive baseline as the side's capacitance profile."""
+        try:
+            self._store.upsert_profile(side, "capacitance", params, 1.0,
+                                       window_start, window_end, samples)
+            return True
+        except Exception as e:
+            log.warning("Failed to publish %s baseline: %s", side, e)
+            return False
+
+    def _maybe_reload(self, force: bool = False) -> None:
         now = time.time()
-        if now - self._last_reload < CALIBRATION_RELOAD_S:
+        if not force and now - self._last_reload < CALIBRATION_RELOAD_S:
             return
         self._last_reload = now
         for side in ("left", "right"):
@@ -454,11 +488,164 @@ class CalibrationCache:
                 profile = self._store.get_active(side, "capacitance")
                 if profile:
                     params = profile["parameters"]
-                    self._profiles[side] = json.loads(params) if isinstance(params, str) else params
+                    params = json.loads(params) if isinstance(params, str) else params
+                    self._profiles[side] = (params, profile.get("created_at"))
                 else:
                     self._profiles[side] = None
             except Exception as e:
                 log.warning("Failed to load calibration for %s: %s", side, e)
+
+
+class AdaptiveBaseline:
+    """Self-adjusting empty-bed level for one side's capacitance channels.
+
+    Replaces scheduled capacitance calibration: a fixed snapshot went stale
+    with drift, and a snapshot taken while someone slept (the fixed-UTC-hour
+    fallback can land mid-night) made the empty bed read occupied all day.
+
+    - Presence: summed signed rise over the baseline. Enters above
+      `threshold`, exits below threshold * PRESENCE_EXIT_FRACTION.
+    - Drift: while empty and within the exit threshold, follows the reading
+      with time constant BASELINE_UP_TAU_S.
+    - Contamination: any reading below baseline pulls it down with
+      BASELINE_DOWN_TAU_S — a body only adds capacitance.
+    - Seeding: saved state, else the calibration profile (including a manual
+      recalibration, adopted whenever a newer one appears), else the first
+      sample.
+
+    capSense tracks raw {out, cen, in}; capSense2 tracks ref-compensated
+    pair averages {A, B, C} against a fixed ref_mean.
+    """
+
+    def __init__(self, fmt: str, means: dict, threshold: float,
+                 ref_mean: Optional[float] = None, source: str = "bootstrap",
+                 profile_seen_at: Optional[float] = None):
+        self.fmt = fmt
+        self.means = {ch: float(v) for ch, v in means.items()}
+        self.threshold = float(threshold)
+        self.ref_mean = ref_mean
+        self.source = source
+        # created_at of the newest external profile already adopted or
+        # deliberately skipped, so it isn't re-adopted every reload.
+        self.profile_seen_at = profile_seen_at
+        self._last_track_ts: Optional[float] = None
+
+    @property
+    def exit_threshold(self) -> float:
+        return self.threshold * PRESENCE_EXIT_FRACTION
+
+    @classmethod
+    def from_profile(cls, params: dict, fmt: str, created_at: Optional[float]):
+        """Seed from a calibration profile, or None if it doesn't match fmt."""
+        channels = params.get("channels") or {}
+        if fmt == "capSense2":
+            if params.get("format") != "capSense2":
+                return None
+            names = ("A", "B", "C")
+            threshold = float(params.get("threshold", CAPSENSE2_PRESENCE_THRESHOLD))
+            ref_mean = (params.get("ref") or {}).get("mean")
+        else:
+            if params.get("format") == "capSense2":
+                return None
+            names = ("out", "cen", "in")
+            threshold = capsense_threshold(params)
+            ref_mean = None
+        try:
+            means = {ch: float(channels[ch]["mean"]) for ch in names}
+        except (KeyError, TypeError, ValueError):
+            return None
+        return cls(fmt, means, threshold, ref_mean=ref_mean,
+                   source=params.get("source", "profile"),
+                   profile_seen_at=created_at)
+
+    @classmethod
+    def from_state(cls, state: Optional[dict]):
+        if not isinstance(state, dict):
+            return None
+        try:
+            return cls(str(state["format"]), dict(state["means"]), float(state["threshold"]),
+                       ref_mean=state.get("ref_mean"), source="state",
+                       profile_seen_at=state.get("profile_seen_at"))
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def snapshot(self) -> dict:
+        return {"format": self.fmt, "means": self.means, "threshold": self.threshold,
+                "ref_mean": self.ref_mean, "profile_seen_at": self.profile_seen_at}
+
+    def values(self, record: dict, side: str) -> Optional[dict]:
+        """This format's per-channel values for a frame, or None if unusable."""
+        if self.fmt == "capSense2":
+            return capsense2_channel_values(record, side, self.ref_mean, skip_sentinels=True)
+        return capsense_channel_values(record, side)
+
+    def deviation(self, values: dict) -> float:
+        return sum(v - self.means[ch] for ch, v in values.items())
+
+    def is_present(self, values: dict, currently_present: bool) -> bool:
+        limit = self.exit_threshold if currently_present else self.threshold
+        return self.deviation(values) > limit
+
+    def track(self, ts: float, values: dict, occupied: bool) -> None:
+        """Follow the empty-bed level. Called once per sample after the
+        presence decision; `occupied` is the committed (debounced) state."""
+        dt = 0.0 if self._last_track_ts is None else ts - self._last_track_ts
+        self._last_track_ts = ts
+        dt = max(0.0, min(dt, BASELINE_MAX_STEP_S))
+        if dt == 0.0:
+            return
+        dev = self.deviation(values)
+        if dev < 0:
+            tau = BASELINE_DOWN_TAU_S
+        elif not occupied and dev < self.exit_threshold:
+            tau = BASELINE_UP_TAU_S
+        else:
+            return
+        alpha = dt / tau
+        for ch, v in values.items():
+            self.means[ch] += alpha * (v - self.means[ch])
+
+    def reseed(self, values: dict, source: str) -> None:
+        self.means = {ch: float(v) for ch, v in values.items()}
+        self.source = source
+
+    def to_params(self) -> dict:
+        """Calibration-profile params (the shape the calibrators write)."""
+        if self.fmt == "capSense2":
+            params = {"format": "capSense2", "threshold": self.threshold,
+                      "channels": {ch: {"mean": round(m, 4), "std": 0.05}
+                                   for ch, m in self.means.items()}}
+            if self.ref_mean is not None:
+                params["ref"] = {"mean": round(self.ref_mean, 4), "std": 0.001}
+        else:
+            params = {"format": "capSense", "threshold": self.threshold,
+                      "channels": {ch: {"mean": round(m, 2), "std": 5.0}
+                                   for ch, m in self.means.items()}}
+        params["source"] = "adaptive"
+        return params
+
+
+def bootstrap_baseline(record: dict, side: str) -> Optional[AdaptiveBaseline]:
+    """Seed a baseline from one frame when no state or profile exists. If the
+    bed happens to be occupied, the occupant reads absent until they get up;
+    the reading then falls below baseline and the fast downward track takes
+    it to the true empty level."""
+    fmt = record.get("type")
+    if fmt == "capSense2":
+        data = record.get(side, {})
+        vals = data.get("values") if data else None
+        ref_mean = None
+        if vals and len(vals) >= 8 and CAPSENSE2_SENTINEL not in (vals[6], vals[7]):
+            ref_mean = (vals[6] + vals[7]) / 2.0
+        values = capsense2_channel_values(record, side, ref_mean, skip_sentinels=True)
+        threshold = CAPSENSE2_PRESENCE_THRESHOLD
+    else:
+        ref_mean = None
+        values = capsense_channel_values(record, side)
+        threshold = CAPSENSE_PRESENCE_THRESHOLD
+    if values is None:
+        return None
+    return AdaptiveBaseline(fmt, values, threshold, ref_mean=ref_mean, source="bootstrap")
 
 # ---------------------------------------------------------------------------
 # Numeric helpers (no numpy dependency)
@@ -710,6 +897,11 @@ class SessionTracker:
     _replay_until_ts: Optional[float] = None
     # Session start/close or a bed-exit happened since the last checkpoint.
     state_dirty: bool = False
+    # Self-adjusting empty-bed level (see AdaptiveBaseline).
+    baseline: Optional[AdaptiveBaseline] = None
+    _cap_closed: bool = False
+    _last_publish_ts: Optional[float] = None
+    _tracked_samples: int = 0
 
     def snapshot(self) -> dict:
         """JSON-serializable state needed to resume after a restart."""
@@ -725,6 +917,7 @@ class SessionTracker:
             "state_since": self._state_since,
             "consecutive_cap_closes": self._consecutive_cap_closes,
             "last_ts": self._last_ts,
+            "baseline": self.baseline.snapshot() if self.baseline is not None else None,
         }
 
     def restore(self, state: Optional[dict], now: float) -> None:
@@ -734,6 +927,7 @@ class SessionTracker:
         the last presence rather than resumed."""
         if not isinstance(state, dict):
             return
+        self.baseline = AdaptiveBaseline.from_state(state.get("baseline"))
         try:
             self._consecutive_cap_closes = int(state.get("consecutive_cap_closes") or 0)
             start = state.get("session_start")
@@ -766,25 +960,64 @@ class SessionTracker:
             self._resumed_last_present = self._last_present_ts
         log.info("%s: resumed session started at %s", self.side, self._session_start.isoformat())
 
+    def _sync_baseline(self, record: dict) -> Optional[AdaptiveBaseline]:
+        """The presence baseline for this frame's format. Adopts a calibration
+        profile newer than any already seen (e.g. a manual recalibration),
+        seeds from the first frame when nothing else exists."""
+        fmt = "capSense2" if record.get("type") == "capSense2" else "capSense"
+        b = self.baseline if self.baseline is not None and self.baseline.fmt == fmt else None
+        profile = self.calibration.get_profile(self.side) if self.calibration else None
+        if profile is not None:
+            params, created_at = profile
+            if isinstance(params, dict) and params.get("source") != "adaptive":
+                seen = b.profile_seen_at if b is not None else None
+                if seen is None or (created_at or 0) > seen:
+                    adopted = AdaptiveBaseline.from_profile(params, fmt, created_at)
+                    if adopted is not None:
+                        log.info("%s: presence baseline from calibration profile (created %s)",
+                                 self.side, created_at)
+                        b = adopted
+                    elif b is not None:
+                        b.profile_seen_at = created_at  # wrong format — stop re-checking
+        if b is None:
+            b = bootstrap_baseline(record, self.side)
+            if b is not None:
+                log.info("%s: presence baseline seeded from live %s reading", self.side, fmt)
+        self.baseline = b
+        return b
+
+    def _maybe_publish_baseline(self, ts: float, record: dict) -> None:
+        if self._last_publish_ts is None:
+            self._last_publish_ts = ts
+            return
+        if ts - self._last_publish_ts < BASELINE_PUBLISH_S or self.calibration is None:
+            return
+        self._last_publish_ts = ts
+        # Re-read first: a manual calibration that finished since the last
+        # reload must be adopted, not overwritten.
+        self.calibration.get_profile(self.side, force=True)
+        b = self._sync_baseline(record)
+        if b is not None and self.calibration.publish(
+                self.side, b.to_params(), int(ts - BASELINE_PUBLISH_S), int(ts),
+                self._tracked_samples):
+            self._tracked_samples = 0
+
     def process(self, ts: float, record: dict) -> None:
         if self._replay_until_ts is not None:
             if ts <= self._replay_until_ts:
                 return  # already processed before the restart
             self._replay_until_ts = None
-        baselines = self.calibration.get_baselines(self.side)
         rtype = record.get("type", "")
-        # Only use baselines if they match the record format
-        fmt = baselines.get("format") if baselines else None
-        if rtype == "capSense2":
-            cal = baselines if fmt == "capSense2" else None
-            present = is_present_capsense2_calibrated(
-                record, self.side, cal, fallback_threshold=60.0,
-            )
+        baseline = self._sync_baseline(record)
+        values = baseline.values(record, self.side) if baseline is not None else None
+        if values is None:
+            # Unusable frame (missing side / capSense2 sentinel): no new evidence.
+            present = self._debounced_present
         else:
-            cal = baselines if fmt != "capSense2" else None
-            present = is_present_capsense_calibrated(
-                record, self.side, cal, fallback_threshold=PRESENCE_THRESHOLD,
-            )
+            present = baseline.is_present(values, self._debounced_present)
+        # Movement's capSense2 common-mode rejection uses the baseline's ref.
+        baselines = ({"ref": {"mean": baseline.ref_mean}}
+                     if baseline is not None and baseline.ref_mean is not None else None)
 
         # Set scale factor based on sensor type (Pod 3 int vs Pod 5 float)
         if rtype == "capSense" and self._scale_factor != 0.5:
@@ -812,6 +1045,19 @@ class SessionTracker:
             delta = 0.0
 
         self._update(ts, present, delta)
+
+        if values is not None:
+            if self._cap_closed:
+                # Presence never dropped for MAX_SESSION_S: a load on the bed
+                # that isn't a sleeper. Make it the new empty level.
+                baseline.reseed(values, "cap-reset")
+                log.warning("%s: presence baseline reset to current level after a capped session",
+                            self.side)
+            else:
+                baseline.track(ts, values, self._debounced_present)
+            self._tracked_samples += 1
+            self._maybe_publish_baseline(ts, record)
+        self._cap_closed = False
 
     def _apply_debounce(self, ts: float, raw_present: bool) -> bool:
         """Fold the raw per-sample presence into the committed (debounced)
@@ -913,6 +1159,7 @@ class SessionTracker:
             self._close_session(self._session_start.timestamp() + MAX_SESSION_S)
             if self._session_start is None:  # committed — count it, don't spam retries
                 self._consecutive_cap_closes += 1
+                self._cap_closed = True
                 log.warning(
                     "%s: session force-closed at the %dh cap — presence never dropped (%d consecutive)",
                     self.side, MAX_SESSION_S // 3600, self._consecutive_cap_closes)

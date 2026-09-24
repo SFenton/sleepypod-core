@@ -4,10 +4,12 @@ cbor2 / common.raw_follower / common.health are stubbed before importing main.
 Covers ts sanitization (#327) and DB write resilience (#325).
 """
 
+import importlib.util
 import logging
 import sqlite3
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 # Stub pod-only modules so `import main` works on dev machines.
@@ -17,7 +19,6 @@ _stubs = {
     "common.raw_follower": type(sys)("common.raw_follower"),
     "common.nats_follower": type(sys)("common.nats_follower"),
     "common.dialect": type(sys)("common.dialect"),
-    "common.calibration": type(sys)("common.calibration"),
     "common.health": type(sys)("common.health"),
 }
 _stubs["common.raw_follower"].RawFileFollower = None
@@ -25,9 +26,12 @@ _stubs["common.nats_follower"].create_follower = None
 _stubs["common.dialect"].KNOWN_RECORD_TYPES = frozenset()
 _stubs["common.dialect"].warn_unknown_type_once = lambda *a, **kw: None
 _stubs["common.dialect"].log_capsense_status_once = lambda *a, **kw: None
-_stubs["common.calibration"].CalibrationStore = None
-_stubs["common.calibration"].is_present_capsense_calibrated = lambda *a, **kw: False
-_stubs["common.calibration"].is_present_capsense2_calibrated = lambda *a, **kw: False
+# common.calibration is stdlib-only, so load the real presence math rather
+# than stubbing it — the adaptive baseline tests depend on it.
+_cal_spec = importlib.util.spec_from_file_location(
+    "common.calibration", Path(__file__).resolve().parent.parent / "common" / "calibration.py")
+_stubs["common.calibration"] = importlib.util.module_from_spec(_cal_spec)
+_cal_spec.loader.exec_module(_stubs["common.calibration"])
 _stubs["common.health"].report_health = lambda *a, **kw: None
 sys.modules.update(_stubs)
 
@@ -507,7 +511,7 @@ class TestSessionPersistence:
 
     def test_replayed_samples_are_skipped_after_restore(self):
         class _NoCal:
-            def get_baselines(self, side):
+            def get_profile(self, side, force=False):
                 return None
 
         t, ts = self._asleep(hours=1)
@@ -577,3 +581,227 @@ class TestStateFile:
 
     def test_unwritable_path_reports_failure(self, tmp_path):
         assert main.save_state(tmp_path / "missing-dir" / "state.json", (_tracker(),)) is False
+
+
+# ---------------------------------------------------------------------------
+# Self-adjusting presence baseline
+# ---------------------------------------------------------------------------
+
+# Representative empty-bed channel levels of a Pod 4.
+EMPTY = {"out": 1142, "cen": 1582, "in": 1673}
+
+
+def _cap(rise_per_channel=0.0, side="left", ts=None):
+    rec = {"type": "capSense",
+           side: {ch: int(round(v + rise_per_channel)) for ch, v in EMPTY.items()}}
+    if ts is not None:
+        rec["ts"] = ts
+    return rec
+
+
+class _Cal:
+    """CalibrationCache double: one optional profile, records publishes."""
+
+    def __init__(self, profile=None):
+        self.profile = profile
+        self.published = []
+
+    def get_profile(self, side, force=False):
+        return self.profile
+
+    def publish(self, side, params, window_start, window_end, samples):
+        self.published.append(params)
+        self.profile = (params, window_end)
+        return True
+
+
+def _live_tracker(cal=None):
+    holder = main.DBHolder(_make_db())
+    main._db_write_failures = 0
+    return main.SessionTracker(side="left", db=holder, calibration=cal or _Cal(),
+                               pump_gate=main.PumpGateCapSense())
+
+
+def _run(t, start, seconds, rise, step=5.0):
+    ts = start
+    while ts < start + seconds:
+        t.process(ts, _cap(rise))
+        ts += step
+    return ts
+
+
+def _profile(means, created_at, **extra):
+    params = {"format": "capSense", "threshold": 300.0,
+              "channels": {ch: {"mean": m, "std": 5.0} for ch, m in means.items()}}
+    params.update(extra)
+    return (params, created_at)
+
+
+class TestAdaptiveBaseline:
+    T0 = 1_777_000_000.0
+
+    def test_night_in_bed_records_one_session(self):
+        t = _live_tracker()
+        ts = _run(t, self.T0, 3600, 0)              # empty evening
+        ts = _run(t, ts, 8 * 3600, 600)             # asleep: +600/channel
+        ts = _run(t, ts, 3600, 0)                   # up
+        rows = _rows_full(t)
+        assert len(rows) == 1
+        entered, left_at, duration_s, exits = rows[0]
+        assert abs(entered - (self.T0 + 3600)) <= 10
+        assert abs(left_at - (self.T0 + 9 * 3600)) <= 10
+        assert exits == 1
+
+    def test_slow_drift_is_absorbed_not_occupied(self):
+        # Regression: slow drift and bedding shifts of a few tens of units
+        # used to read as occupied, holding sessions open for many hours.
+        t = _live_tracker()
+        ts = _run(t, self.T0, 600, 0)
+        ts = _run(t, ts, 12 * 3600, 33)
+        assert _rows(t) == []
+        assert t._session_start is None
+        assert abs(t.baseline.means["out"] - (EMPTY["out"] + 33)) < 2
+
+    def test_baseline_taken_while_occupied_recovers_on_exit(self):
+        # A scheduled calibration captured a sleeper as "empty". Once they get
+        # up the reading falls below that level; the fast downward track
+        # must find the real empty level so the next night is detected.
+        occupied = {ch: v + 600 for ch, v in EMPTY.items()}
+        t = _live_tracker(_Cal(_profile(occupied, created_at=self.T0 - 60)))
+        ts = _run(t, self.T0, 3 * 3600, 600)        # asleep, reads "empty"
+        ts = _run(t, ts, 1800, 0)                   # gets up
+        assert abs(t.baseline.means["cen"] - EMPTY["cen"]) < 5
+        ts = _run(t, ts, 8 * 3600, 600)             # next night
+        ts = _run(t, ts, 600, 0)
+        rows = _rows_full(t)
+        assert len(rows) == 1
+        assert rows[0][2] >= 8 * 3600 - 60
+
+    def test_light_load_below_enter_threshold_is_not_absorbed(self):
+        # +80/channel (+240 summed) sits between the exit (150) and enter
+        # (300) thresholds: never occupied, and never learned as empty.
+        t = _live_tracker()
+        ts = _run(t, self.T0, 600, 0)
+        ts = _run(t, ts, 4 * 3600, 80)
+        assert t._session_start is None
+        assert abs(t.baseline.means["out"] - EMPTY["out"]) < 1
+
+    def test_hysteresis_keeps_session_through_partial_dip(self):
+        # Once in bed, dipping to +70/channel (+210 summed, above the 150
+        # exit) must not end the session.
+        t = _live_tracker()
+        ts = _run(t, self.T0, 600, 0)
+        ts = _run(t, ts, 3600, 600)
+        ts = _run(t, ts, 1800, 70)
+        ts = _run(t, ts, 3600, 600)
+        ts = _run(t, ts, 600, 0)
+        rows = _rows_full(t)
+        assert len(rows) == 1
+        assert rows[0][3] == 1
+
+    def test_object_left_on_bed_resets_after_capped_session(self):
+        t = _live_tracker()
+        ts = _run(t, self.T0, 600, 0)
+        ts = _run(t, ts, main.MAX_SESSION_S + 3600, 400, step=30.0)
+        rows = _rows_full(t)
+        assert len(rows) == 1
+        assert rows[0][2] == main.MAX_SESSION_S
+        assert t.baseline.source == "cap-reset"
+        assert t._session_start is None             # object is the new empty
+
+    def test_manual_recalibration_is_adopted(self):
+        cal = _Cal()
+        t = _live_tracker(cal)
+        ts = _run(t, self.T0, 600, 0)
+        assert t.baseline.source == "bootstrap"
+        moved = {ch: v + 40 for ch, v in EMPTY.items()}
+        cal.profile = _profile(moved, created_at=ts)
+        ts = _run(t, ts, 5, 0)
+        assert t.baseline.source == "profile"
+        assert t.baseline.means["in"] == EMPTY["in"] + 40
+
+    def test_own_published_profile_is_not_readopted(self):
+        cal = _Cal()
+        t = _live_tracker(cal)
+        ts = _run(t, self.T0, main.BASELINE_PUBLISH_S + 60, 0)
+        assert len(cal.published) == 1
+        params = cal.published[0]
+        assert params["source"] == "adaptive"
+        assert params["format"] == "capSense"
+        assert set(params["channels"]) == {"out", "cen", "in"}
+        _run(t, ts, 60, 0)
+        assert t.baseline.source == "bootstrap"
+
+    def test_legacy_profile_seeds_with_raw_unit_threshold(self):
+        legacy = ({"threshold": 6.0, "channels": {ch: {"mean": v, "std": 5.0}
+                                                   for ch, v in EMPTY.items()}}, self.T0 - 60)
+        t = _live_tracker(_Cal(legacy))
+        _run(t, self.T0, 60, 0)
+        assert t.baseline.threshold == 300.0
+        assert t.baseline.source == "profile"
+
+    def test_baseline_survives_restart(self):
+        import json
+        t = _live_tracker()
+        ts = _run(t, self.T0, 3 * 3600, 33)
+        t2 = _live_tracker()
+        t2.restore(json.loads(json.dumps(t.snapshot())), now=ts)
+        assert t2.baseline.source == "state"
+        assert t2.baseline.means == t.baseline.means
+
+    def test_gaps_do_not_jump_the_baseline(self):
+        t = _live_tracker()
+        t.process(self.T0, _cap(0))
+        t.process(self.T0 + 7200, _cap(-500))      # 2h gap, one low sample
+        # One step is capped at BASELINE_MAX_STEP_S / BASELINE_DOWN_TAU_S.
+        moved = EMPTY["out"] - t.baseline.means["out"]
+        assert 0 < moved <= 500 * main.BASELINE_MAX_STEP_S / main.BASELINE_DOWN_TAU_S + 1e-6
+
+    def test_unusable_frame_changes_nothing(self):
+        t = _live_tracker()
+        ts = _run(t, self.T0, 600, 0)
+        before = dict(t.baseline.means)
+        t.process(ts, {"type": "capSense", "right": {"out": 1}})
+        assert t.baseline.means == before
+        assert t._session_start is None
+
+
+class TestAdaptiveBaselineCapSense2:
+    T0 = 1_777_000_000.0
+
+    @staticmethod
+    def _rec(a, b, c, ref=None, side="left"):
+        values = [a, a, b, b, c, c] + ([ref, ref] if ref is not None else [])
+        return {"type": "capSense2", side: {"values": values}}
+
+    def test_occupant_detected_and_ref_drift_cancelled(self):
+        t = _live_tracker()
+        ts = self.T0
+        for _ in range(120):                         # empty, ref nominal
+            t.process(ts, self._rec(500.0, 600.0, 700.0, ref=1.16)); ts += 5
+        for _ in range(360):                         # all channels +10 incl. ref
+            t.process(ts, self._rec(510.0, 610.0, 710.0, ref=11.16)); ts += 5
+        assert t._session_start is None
+        for _ in range(720):                         # occupant +5/pair = +15 > 6
+            t.process(ts, self._rec(505.0, 605.0, 705.0, ref=1.16)); ts += 5
+        assert t._session_start is not None
+
+    def test_sentinel_frames_do_not_move_baseline(self):
+        t = _live_tracker()
+        t.process(self.T0, self._rec(500.0, 600.0, 700.0, ref=1.16))
+        before = dict(t.baseline.means)
+        t.process(self.T0 + 5, self._rec(-1.0, 600.0, 700.0, ref=1.16))
+        assert t.baseline.means == before
+
+    def test_published_profile_matches_node_contract(self):
+        cal = _Cal()
+        t = _live_tracker(cal)
+        ts = self.T0
+        while ts < self.T0 + main.BASELINE_PUBLISH_S + 60:
+            t.process(ts, self._rec(500.0, 600.0, 700.0, ref=1.2)); ts += 5
+        params = cal.published[0]
+        # src/lib/occupancy.ts requires format, threshold and A/B/C means.
+        assert params["format"] == "capSense2"
+        assert params["threshold"] == 6.0
+        assert {ch: round(v["mean"]) for ch, v in params["channels"].items()} == {"A": 500, "B": 600, "C": 700}
+        assert params["ref"]["mean"] == 1.2

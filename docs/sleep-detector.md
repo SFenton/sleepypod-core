@@ -127,9 +127,22 @@ The median filter output is clamped to [0, 1000] before writing to the database.
 
 ## Presence Detection
 
-Presence is the summed **signed** raw-unit deviation of the sensing channels from the calibrated per-channel means, compared against the profile threshold in raw units (`CAPSENSE_PRESENCE_THRESHOLD = 300` for capSense, the profile's `threshold` for capSense2). Only a rise counts: a body adds capacitance, so a reading below baseline is an empty bed. Legacy capSense profiles without `format: "capSense"` stored a z-score threshold (6.0) and use the raw-unit default instead. Without any profile the detector falls back to a fixed sum threshold (`PRESENCE_THRESHOLD = 1500` for capSense, `60.0` for capSense2). Calibration profiles are reloaded every 60 seconds.
+Presence is the summed **signed** raw-unit rise of the sensing channels over a per-side empty-bed baseline. A body only adds capacitance, so only a rise counts. Occupancy enters above the threshold (`CAPSENSE_PRESENCE_THRESHOLD = 300` summed over out/cen/in for capSense, the profile threshold, default `6.0`, for capSense2) and exits below `PRESENCE_EXIT_FRACTION` (half) of it, so a reading hovering at the threshold can't flap. capSense2 values are reference-compensated before comparison.
 
 The former z-score check (sum of `|val - mean| / std`, std floored at 5) flagged ~30 raw units of thermal drift in either direction as occupied, holding sessions open until the 16 h cap or the next recalibration.
+
+### Self-adjusting baseline
+
+The baseline is maintained by the detector itself (`AdaptiveBaseline`), not by scheduled calibration — a scheduled snapshot could not tell a motionless sleeper from an empty bed (ADR-0014 amendment).
+
+- **Drift:** while the bed is empty and the reading is within the exit threshold, the baseline follows it with time constant `BASELINE_UP_TAU_S` (30 min). A load between the exit and enter thresholds is never learned as empty.
+- **Contamination:** any reading below baseline pulls it down with `BASELINE_DOWN_TAU_S` (2 min), so a baseline captured with someone in bed recovers minutes after they get up.
+- **Stuck load:** after a session force-closed at `MAX_SESSION_S`, the current level becomes the new empty level.
+- **Seeding:** the saved state file, else the active calibration profile (legacy capSense profiles with a z-score threshold get the raw-unit default), else the first frame. A calibration profile newer than any seen — a manual recalibration — is adopted as a reseed.
+- **Publishing:** every `BASELINE_PUBLISH_S` (15 min) the baseline is upserted to `calibration_profiles` with `source: "adaptive"`, in the calibrators' shape, so Node's occupancy check and the UI see the same level. Profiles marked adaptive are never re-adopted.
+- Per-sample tracking time is capped at `BASELINE_MAX_STEP_S`, so a gap or restart can't move the baseline in one step. Frames with a missing side or capSense2 sentinels are ignored.
+
+Replaying recorded capSense data starting from a baseline captured with the sleeper in bed, the baseline recovers within minutes of them getting up, sessions end at the real wake time rather than at the next recalibration, and a bedding shift of a few tens of units per channel produces no session.
 
 ## Sleep Sessions
 
@@ -192,7 +205,11 @@ This filters phantom-session flicker (1-3 scattered non-still epochs per bucket)
 | `ABSENCE_TIMEOUT_S` | 120 s | Bathroom trips < 2 min don't split sessions |
 | `MIN_SESSION_S` | 300 s | Shorter periods are likely false positives |
 | `MOVEMENT_INTERVAL_S` | 60 s | One movement score per minute; matches AASM epoch length |
-| `PRESENCE_THRESHOLD` | 1500 | Fallback for uncalibrated capSense (Pod 3) |
+| `CAPSENSE_PRESENCE_THRESHOLD` | 300 | Raw-unit rise (summed) that means occupied, capSense |
+| `PRESENCE_EXIT_FRACTION` | 0.5 | Exit threshold as a fraction of the enter threshold |
+| `BASELINE_UP_TAU_S` | 30 min | Empty-bed drift tracking time constant |
+| `BASELINE_DOWN_TAU_S` | 2 min | Recovery when the reading falls below baseline |
+| `BASELINE_PUBLISH_S` | 15 min | Baseline written back to calibration_profiles |
 | `CALIBRATION_RELOAD_S` | 60 s | Poll calibration_profiles for updates |
 | `STATE_SAVE_INTERVAL_S` | 60 s | Checkpoint an open session to the state file |
 | `STATE_MAX_GAP_S` | 30 min | Longer downtime closes a restored session instead of resuming it |
@@ -236,4 +253,4 @@ This filters phantom-session flicker (1-3 scattered non-still epochs per bucket)
 
 8. **Median filter smoothing behavior.** The 3-epoch median filter is causal (trailing window), so it does not depend on future epochs. It may still soften abrupt transitions, which is acceptable since movement data is not used for real-time alerting.
 
-9. **Calibrator RAW path coupling (Pod 5).** The calibrator reads RAW files from `RAW_DATA_DIR`, which must match the tmpfs path created by `sleepypod-tmpfs-prep` (`/persistent/biometrics`, per ADR-0018). A mismatch causes every daily run to fail with "No capSense records available" and the detector silently falls back to `PRESENCE_THRESHOLD = 60.0`, producing severe presence chatter (`times_exited_bed` > 100 per session). The calibrator unit file declares `RequiresMountsFor=/persistent/biometrics` to surface this as a startup failure rather than a silent runtime degradation.
+9. **Calibrator RAW path coupling (Pod 5).** The calibrator reads RAW files from `RAW_DATA_DIR`, which must match the tmpfs path created by `sleepypod-tmpfs-prep` (`/persistent/biometrics`, per ADR-0018). A mismatch makes every reader see an empty directory, so the detector (and piezo/temperature calibration) receives no frames at all. The calibrator unit file declares `RequiresMountsFor=/persistent/biometrics` to surface this as a startup failure rather than a silent runtime degradation.
