@@ -252,7 +252,7 @@ class CapCalibrator:
 
         # Compute baselines from best window
         window_end = min(best_start + window_samples, len(timestamps))
-        baseline = {"channels": {}, "threshold": 6.0}
+        baseline = {"channels": {}, "threshold": CAPSENSE_PRESENCE_THRESHOLD, "format": "capSense"}
 
         for ch in self.CHANNELS:
             segment = channels[ch][best_start:window_end]
@@ -701,11 +701,55 @@ class HRValidator:
 
 # ── Presence detection helpers ──
 
+# Presence threshold for Pod 3/4 capSense, in RAW units summed over the three
+# channels. On Pod 4 hardware, empty-bed drift and bedding shifts stay within
+# a few tens of units per channel (~+100 summed), while an occupant raises the
+# level by at least ~+150/channel (+450 summed), typically ~+600/channel.
+CAPSENSE_PRESENCE_THRESHOLD = 300.0
+CAPSENSE_CHANNELS = ("out", "cen", "in")
+
+
+def capsense_threshold(baselines: dict) -> float:
+    """Raw-unit presence threshold for a capSense profile.
+
+    Profiles written before the raw-unit check carry `threshold: 6.0` as a
+    z-score and have no `format` key. Reading that as raw units would make
+    presence 50x more sensitive, so legacy profiles use the default instead.
+    """
+    if baselines.get("format") == "capSense":
+        return float(baselines.get("threshold", CAPSENSE_PRESENCE_THRESHOLD))
+    return CAPSENSE_PRESENCE_THRESHOLD
+
+
+def capsense_deviation(record: dict, side: str, baselines: dict) -> Optional[float]:
+    """Summed SIGNED raw-unit deviation of a capSense frame from the baseline
+    channel means, or None when the frame has no data for `side`."""
+    data = record.get(side, {})
+    if not data:
+        return None
+    channels = baselines.get("channels", {})
+    return sum(
+        int(data.get(ch, 0)) - float(channels.get(ch, {}).get("mean", 0))
+        for ch in CAPSENSE_CHANNELS
+    )
+
+
 def is_present_capsense_calibrated(
     record: dict, side: str, baselines: Optional[dict],
     fallback_threshold: int = 1500,
 ) -> bool:
-    """Z-score based presence detection using calibrated baselines.
+    """Presence detection for Pod 3/4 capSense (named int channels).
+
+    Occupied only when the summed signed deviation from the calibrated
+    channel means RISES above the raw-unit threshold. A body only ever adds
+    capacitance, so a reading below baseline is an empty bed.
+
+    History: this used to be a z-score check (sum of |val-mean|/std, std
+    floored at 5, threshold 6). A quiet calibration window puts std at the
+    floor, so ~30 raw units of thermal drift — in either direction — read as
+    occupied: sessions stuck open until the MAX_SESSION_S cap or the next
+    recalibration. Same failure and fix as
+    is_present_capsense2_calibrated.
 
     Falls back to simple sum threshold if no calibration available.
     """
@@ -714,21 +758,10 @@ def is_present_capsense_calibrated(
         return False
 
     if baselines is None:
-        total = int(data.get("out", 0)) + int(data.get("cen", 0)) + int(data.get("in", 0))
+        total = sum(int(data.get(ch, 0)) for ch in CAPSENSE_CHANNELS)
         return total > fallback_threshold
 
-    z_sum = 0.0
-    channels = baselines.get("channels", {})
-    for ch in ("out", "cen", "in"):
-        val = int(data.get(ch, 0))
-        ch_cal = channels.get(ch, {})
-        std = ch_cal.get("std", 1)
-        mean = ch_cal.get("mean", 0)
-        if std > 0:
-            z_sum += abs((val - mean) / std)
-
-    threshold = baselines.get("threshold", 6.0)
-    return z_sum > threshold
+    return capsense_deviation(record, side, baselines) > capsense_threshold(baselines)
 
 
 # Nominal capSense2 reference-channel value used when a profile predates the

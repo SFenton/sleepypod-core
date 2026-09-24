@@ -13,7 +13,7 @@ flowchart TD
     TypeFilter -->|"frzHealth/frzTherm"| PumpState["Update PumpGateCapSense\n(track pump RPM per side)"]
     TypeFilter -->|"capSense/capSense2"| Extract["Extract channel values\n(sentinel filter, ref compensation)"]
     TypeFilter -->|Other| Skip[Skip]
-    Extract --> Presence["Presence detection\n(calibrated z-score or fallback)"]
+    Extract --> Presence["Presence detection\n(raw-unit rise over baseline or fallback)"]
     Extract --> PumpGate{"Pump gate active?\n(RPM > 0 OR guard OR ref anomaly)"}
     PumpGate -->|Yes| ZeroDelta["delta = 0\n(suppress artifact)"]
     PumpGate -->|No| Delta["Movement delta\n(|current - previous| per channel)"]
@@ -127,7 +127,9 @@ The median filter output is clamped to [0, 1000] before writing to the database.
 
 ## Presence Detection
 
-Presence uses calibrated z-score thresholds from `calibration_profiles` when available, falling back to a fixed sum threshold (`PRESENCE_THRESHOLD = 1500` for capSense, `60.0` for capSense2). Calibration profiles are reloaded every 60 seconds.
+Presence is the summed **signed** raw-unit deviation of the sensing channels from the calibrated per-channel means, compared against the profile threshold in raw units (`CAPSENSE_PRESENCE_THRESHOLD = 300` for capSense, the profile's `threshold` for capSense2). Only a rise counts: a body adds capacitance, so a reading below baseline is an empty bed. Legacy capSense profiles without `format: "capSense"` stored a z-score threshold (6.0) and use the raw-unit default instead. Without any profile the detector falls back to a fixed sum threshold (`PRESENCE_THRESHOLD = 1500` for capSense, `60.0` for capSense2). Calibration profiles are reloaded every 60 seconds.
+
+The former z-score check (sum of `|val - mean| / std`, std floored at 5) flagged ~30 raw units of thermal drift in either direction as occupied, holding sessions open until the 16 h cap or the next recalibration.
 
 ## Sleep Sessions
 

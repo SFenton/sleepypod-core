@@ -11,8 +11,9 @@ Writes to two tables:
 
 Detection logic:
   Each capacitance record contains three channels per side (out, cen, in).
-  Presence is determined via calibrated z-score thresholds when a calibration
-  profile is available, falling back to a fixed sum threshold otherwise.
+  Presence is the summed signed raw-unit rise above the calibrated per-channel
+  baseline (a body only adds capacitance), falling back to a fixed sum
+  threshold when no calibration profile is available.
   A session starts on the first present sample and ends after ABSENCE_TIMEOUT_S
   consecutive absent samples.
 
