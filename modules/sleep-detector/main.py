@@ -67,6 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cbor2
 from common.nats_follower import create_follower
+from common.side_mode import SingleSleeperMode
 from common.dialect import (
     KNOWN_RECORD_TYPES,
     log_capsense_status_once,
@@ -852,6 +853,16 @@ class PumpGateCapSense:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class SideObservation:
+    """One side's reading of one frame (SessionTracker.observe)."""
+    ts: float
+    present: Optional[bool]  # None: unusable frame, no new evidence
+    delta: float
+    values: Optional[dict]
+    record: dict
+
+
+@dataclass
 class SessionTracker:
     side: str
     db: "DBHolder"
@@ -900,6 +911,9 @@ class SessionTracker:
     # Self-adjusting empty-bed level (see AdaptiveBaseline).
     baseline: Optional[AdaptiveBaseline] = None
     _cap_closed: bool = False
+    # Per-sample level decision (with hysteresis), independent of sessions —
+    # kept current even while this side's readings are merged into the other.
+    _level_present: bool = False
     _last_publish_ts: Optional[float] = None
     _tracked_samples: int = 0
 
@@ -1002,19 +1016,22 @@ class SessionTracker:
                 self._tracked_samples):
             self._tracked_samples = 0
 
-    def process(self, ts: float, record: dict) -> None:
+    def observe(self, ts: float, record: dict) -> Optional["SideObservation"]:
+        """Read one frame for this side: presence evidence, movement delta and
+        the channel values the baseline tracks. None for a replayed frame.
+        Does not touch the session — see commit()."""
         if self._replay_until_ts is not None:
             if ts <= self._replay_until_ts:
-                return  # already processed before the restart
+                return None  # already processed before the restart
             self._replay_until_ts = None
+        self._last_ts = ts
         rtype = record.get("type", "")
         baseline = self._sync_baseline(record)
         values = baseline.values(record, self.side) if baseline is not None else None
-        if values is None:
-            # Unusable frame (missing side / capSense2 sentinel): no new evidence.
-            present = self._debounced_present
-        else:
-            present = baseline.is_present(values, self._debounced_present)
+        present: Optional[bool] = None  # unusable frame: no new evidence
+        if values is not None:
+            present = baseline.is_present(values, self._level_present)
+            self._level_present = present
         # Movement's capSense2 common-mode rejection uses the baseline's ref.
         baselines = ({"ref": {"mean": baseline.ref_mean}}
                      if baseline is not None and baseline.ref_mean is not None else None)
@@ -1043,21 +1060,36 @@ class SessionTracker:
         else:
             # Sentinel or invalid — skip delta, keep previous (zero-order hold)
             delta = 0.0
+        return SideObservation(ts, present, delta, values, record)
 
-        self._update(ts, present, delta)
+    def commit(self, ts: float, present: Optional[bool], delta: float) -> bool:
+        """Advance the session with one sample's presence and movement.
+        Returns True if the session was just force-closed at MAX_SESSION_S."""
+        self._update(ts, self._debounced_present if present is None else present, delta)
+        capped, self._cap_closed = self._cap_closed, False
+        return capped
 
-        if values is not None:
-            if self._cap_closed:
-                # Presence never dropped for MAX_SESSION_S: a load on the bed
-                # that isn't a sleeper. Make it the new empty level.
-                baseline.reseed(values, "cap-reset")
-                log.warning("%s: presence baseline reset to current level after a capped session",
-                            self.side)
-            else:
-                baseline.track(ts, values, self._debounced_present)
-            self._tracked_samples += 1
-            self._maybe_publish_baseline(ts, record)
-        self._cap_closed = False
+    def settle(self, obs: "SideObservation", reset: bool = False) -> None:
+        """Baseline upkeep after the session step. `reset` makes the current
+        level the new empty level: presence never dropped for MAX_SESSION_S,
+        so the load on the bed isn't a sleeper."""
+        if obs.values is None or self.baseline is None:
+            return
+        if reset:
+            self.baseline.reseed(obs.values, "cap-reset")
+            log.warning("%s: presence baseline reset to current level after a capped session",
+                        self.side)
+        else:
+            self.baseline.track(obs.ts, obs.values, self._level_present)
+        self._tracked_samples += 1
+        self._maybe_publish_baseline(obs.ts, obs.record)
+
+    def process(self, ts: float, record: dict) -> None:
+        obs = self.observe(ts, record)
+        if obs is None:
+            return
+        capped = self.commit(ts, obs.present, obs.delta)
+        self.settle(obs, reset=capped)
 
     def _apply_debounce(self, ts: float, raw_present: bool) -> bool:
         """Fold the raw per-sample presence into the committed (debounced)
@@ -1282,6 +1314,34 @@ class SessionTracker:
             self._last_movement_write = ts
 
 
+def process_single_sleeper(home: SessionTracker, away: SessionTracker,
+                           ts: float, record: dict) -> None:
+    """One frame in single-sleeper mode (the other side is in away mode).
+
+    The sleeper is in bed while EITHER side reads occupied — rolling over or
+    a leg on the away side keeps one home-side session going instead of
+    opening a phantom one there. Movement from both sides is summed into the
+    home side's epochs. The away side keeps tracking its own baseline but
+    never records a session.
+    """
+    h = home.observe(ts, record)
+    a = away.observe(ts, record)
+    if h is None and a is None:
+        return
+    if away._session_start is not None:
+        # Away mode switched on mid-session: end that side's session where
+        # its occupant was last seen; from now on its readings are merged.
+        away._close_session(away._last_present_ts or ts)
+    evidence = [o.present for o in (h, a) if o is not None and o.present is not None]
+    present = any(evidence) if evidence else None
+    delta = sum(o.delta for o in (h, a) if o is not None)
+    capped = home.commit(ts, present, delta)
+    # A capped session in merged mode may be held open by either side's load.
+    for tracker, obs in ((home, h), (away, a)):
+        if obs is not None:
+            tracker.settle(obs, reset=capped)
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -1303,6 +1363,9 @@ def main() -> None:
     left = SessionTracker(side="left", db=db_holder, calibration=cal_cache, pump_gate=pump_gate)
     right = SessionTracker(side="right", db=db_holder, calibration=cal_cache, pump_gate=pump_gate)
     trackers = (left, right)
+    # One side in away mode: a single sleeper, whose rollovers onto the away
+    # side merge into their own session.
+    bed_mode = SingleSleeperMode(SLEEPYPOD_DB)
     saved = load_state(STATE_PATH)
     for t in trackers:
         t.restore(saved.get(t.side), time.time())
@@ -1344,8 +1407,14 @@ def main() -> None:
             log_capsense_status_once(record, "sleep-detector")
 
             ts = sanitize_ts(record.get("ts"))
-            left.process(ts, record)
-            right.process(ts, record)
+            home_side = bed_mode.home_side()
+            if home_side is None:
+                left.process(ts, record)
+                right.process(ts, record)
+            elif home_side == "left":
+                process_single_sleeper(left, right, ts, record)
+            else:
+                process_single_sleeper(right, left, ts, record)
 
             if (left.state_dirty or right.state_dirty
                     or time.monotonic() - last_save >= STATE_SAVE_INTERVAL_S):

@@ -26,12 +26,14 @@ _stubs["common.nats_follower"].create_follower = None
 _stubs["common.dialect"].KNOWN_RECORD_TYPES = frozenset()
 _stubs["common.dialect"].warn_unknown_type_once = lambda *a, **kw: None
 _stubs["common.dialect"].log_capsense_status_once = lambda *a, **kw: None
-# common.calibration is stdlib-only, so load the real presence math rather
-# than stubbing it — the adaptive baseline tests depend on it.
-_cal_spec = importlib.util.spec_from_file_location(
-    "common.calibration", Path(__file__).resolve().parent.parent / "common" / "calibration.py")
-_stubs["common.calibration"] = importlib.util.module_from_spec(_cal_spec)
-_cal_spec.loader.exec_module(_stubs["common.calibration"])
+# common.calibration and common.side_mode are stdlib-only, so load the real
+# modules rather than stubbing them — the baseline and single-sleeper tests
+# depend on their behaviour.
+for _name in ("calibration", "side_mode"):
+    _spec = importlib.util.spec_from_file_location(
+        f"common.{_name}", Path(__file__).resolve().parent.parent / "common" / f"{_name}.py")
+    _stubs[f"common.{_name}"] = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_stubs[f"common.{_name}"])
 _stubs["common.health"].report_health = lambda *a, **kw: None
 sys.modules.update(_stubs)
 
@@ -805,3 +807,107 @@ class TestAdaptiveBaselineCapSense2:
         assert params["threshold"] == 6.0
         assert {ch: round(v["mean"]) for ch, v in params["channels"].items()} == {"A": 500, "B": 600, "C": 700}
         assert params["ref"]["mean"] == 1.2
+
+
+class TestSingleSleeper:
+    """A solo sleeper on the left who rolls onto the empty right side used
+    to open phantom right-side sessions while the left kept reading
+    occupied. With the right side in away mode those readings belong to the
+    left sleeper's one session."""
+
+    T0 = 1_777_000_000.0
+
+    @staticmethod
+    def _pair():
+        holder = main.DBHolder(_make_db())
+        main._db_write_failures = 0
+        mk = lambda side: main.SessionTracker(side=side, db=holder, calibration=_Cal(),
+                                              pump_gate=main.PumpGateCapSense(),
+                                              # epochs are due relative to sample ts
+                                              _last_movement_write=0.0)
+        return mk("left"), mk("right")
+
+    @staticmethod
+    def _frame(left_rise, right_rise):
+        return {"type": "capSense",
+                "left": {ch: int(v + left_rise) for ch, v in EMPTY.items()},
+                "right": {ch: int(v + right_rise) for ch, v in EMPTY.items()}}
+
+    def _run(self, left, right, start, seconds, lr, rr, merged=True):
+        ts = start
+        while ts < start + seconds:
+            frame = self._frame(lr, rr)
+            if merged:
+                main.process_single_sleeper(left, right, ts, frame)
+            else:
+                left.process(ts, frame)
+                right.process(ts, frame)
+            ts += 5.0
+        return ts
+
+    @staticmethod
+    def _sessions(t):
+        return t.db.conn.execute(
+            "SELECT side, entered_bed_at, left_bed_at, times_exited_bed FROM sleep_records"
+        ).fetchall()
+
+    def _night(self, merged):
+        left, right = self._pair()
+        ts = self._run(left, right, self.T0, 600, 0, 0, merged)
+        ts = self._run(left, right, ts, 3 * 3600, 600, 0, merged)   # asleep on the left
+        ts = self._run(left, right, ts, 3600, 300, 250, merged)     # straddling the middle
+        ts = self._run(left, right, ts, 3600, 0, 600, merged)       # fully rolled over
+        ts = self._run(left, right, ts, 3600, 600, 0, merged)       # back on the left
+        ts = self._run(left, right, ts, 600, 0, 0, merged)          # up
+        return left, right, ts
+
+    def test_without_away_mode_the_rollover_opens_a_right_session(self):
+        left, _right, _ = self._night(merged=False)
+        assert {row[0] for row in self._sessions(left)} == {"left", "right"}
+
+    def test_rollover_merges_into_one_home_session(self):
+        left, right, _ = self._night(merged=True)
+        rows = self._sessions(left)
+        assert len(rows) == 1
+        side, entered, left_at, exits = rows[0]
+        assert side == "left"
+        assert abs(entered - (self.T0 + 600)) <= 10
+        assert abs(left_at - (self.T0 + 600 + 6 * 3600)) <= 10
+        assert exits == 1                        # only the real morning exit
+        assert right._session_start is None
+
+    def test_movement_is_written_to_home_side_only(self):
+        left, _right, _ = self._night(merged=True)
+        sides = {r[0] for r in left.db.conn.execute("SELECT DISTINCT side FROM movement")}
+        assert sides == {"left"}
+
+    def test_session_can_start_on_the_away_side(self):
+        left, right = self._pair()
+        ts = self._run(left, right, self.T0, 600, 0, 0)
+        ts = self._run(left, right, ts, 2 * 3600, 0, 600)            # got in on the right
+        ts = self._run(left, right, ts, 600, 0, 0)
+        rows = self._sessions(left)
+        assert [r[0] for r in rows] == ["left"]
+
+    def test_away_side_baseline_keeps_tracking(self):
+        left, right = self._pair()
+        self._run(left, right, self.T0, 6 * 3600, 0, 33)             # bedding step on the right
+        assert abs(right.baseline.means["out"] - (EMPTY["out"] + 33)) < 2
+        assert self._sessions(left) == []
+
+    def test_open_away_side_session_is_closed_when_mode_switches_on(self):
+        left, right = self._pair()
+        ts = self._run(left, right, self.T0, 600, 0, 0, merged=False)
+        ts = self._run(left, right, ts, 3600, 0, 600, merged=False)  # right occupant, per-side
+        assert right._session_start is not None
+        self._run(left, right, ts, 60, 0, 0, merged=True)             # right set to away
+        assert right._session_start is None
+        assert [r[0] for r in self._sessions(left)] == ["right"]
+
+    def test_capped_merged_session_resets_both_baselines(self):
+        left, right = self._pair()
+        ts = self._run(left, right, self.T0, 600, 0, 0)
+        ts = self._run(left, right, ts, main.MAX_SESSION_S + 3600, 0, 400)  # load on the away side
+        assert right.baseline.source == "cap-reset"
+        assert left.baseline.source == "cap-reset"
+        assert left._session_start is None

@@ -144,6 +144,21 @@ The baseline is maintained by the detector itself (`AdaptiveBaseline`), not by s
 
 Replaying recorded capSense data starting from a baseline captured with the sleeper in bed, the baseline recovers within minutes of them getting up, sessions end at the real wake time rather than at the next recalibration, and a bedding shift of a few tens of units per channel produces no session.
 
+## Single-Sleeper Mode
+
+Exactly one side in **away mode** (`side_settings.away_mode`) means one person sleeps in the bed, on the other ("home") side. A solo sleeper who rolls over or puts a leg on the empty side loads that side's sensors too — its capSense level rises and its piezo reports the same heartbeat — which used to open phantom sessions there. `common/side_mode.py` reads the flag read-only every 60 s; both sides away, or neither, is ordinary per-side operation.
+
+In this mode (`process_single_sleeper`):
+
+- The sleeper is in bed while **either** side reads occupied, so migrating across the bed stays one home-side session with no extra bed-exits; a session can also start on the away side.
+- Movement deltas from both sides are summed into the home side's epochs. The away side writes no sessions or movement.
+- The away side still tracks its own baseline. A session capped at `MAX_SESSION_S` resets both sides' baselines, since either side's load could be holding it open.
+- If away mode is switched on while the away side has an open session, that session is closed at its last presence.
+
+The piezo-processor applies the same mode to vitals (`SingleSleeperVitals`): each cycle's candidates from the two sides are paired, only the higher-quality one is written, under the home side, and an away-side reading with no partner (fully rolled over) is written as the home side.
+
+A night where the sleeper rolls onto the away side yields one home-side session with a single morning exit, instead of several short sessions on the away side.
+
 ## Sleep Sessions
 
 A session starts on the first present sample and ends after `ABSENCE_TIMEOUT_S` (120s) of consecutive absence. Sessions shorter than `MIN_SESSION_S` (300s = 5 min) are discarded as false positives.
