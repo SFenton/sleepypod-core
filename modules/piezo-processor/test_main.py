@@ -1426,3 +1426,54 @@ class TestSingleSleeperVitals:
             proc.ingest(signal)
         assert len(seen) == 1 and seen[0].side == "right"
         assert self._rows(conn) == []
+
+
+class TestSingleSleeperVitalsRetry:
+    """A held (accepted) candidate must survive a failed write and be
+    retried, not dropped."""
+
+    def _flaky(self, monkeypatch, fails):
+        import main
+        real = main.write_vitals
+        state = {"fails": fails}
+
+        def flaky(*a, **kw):
+            if state["fails"] > 0:
+                state["fails"] -= 1
+                return False
+            return real(*a, **kw)
+        monkeypatch.setattr(main, "write_vitals", flaky)
+
+    def test_flush_failure_keeps_candidate_for_retry(self, monkeypatch):
+        t = TestSingleSleeperVitals()
+        router, conn, clock = t._router()
+        self._flaky(monkeypatch, fails=1)
+        router.submit(t._cand("right", 58.0, 0.6))
+        clock.t += 60
+        router.tick()                                   # write fails
+        assert t._rows(conn) == []
+        clock.t += 60
+        router.tick()                                   # retried
+        assert t._rows(conn) == [("left", 58.0, 0.6)]
+
+    def test_paired_write_failure_keeps_best_for_retry(self, monkeypatch):
+        t = TestSingleSleeperVitals()
+        router, conn, clock = t._router()
+        self._flaky(monkeypatch, fails=1)
+        router.submit(t._cand("left", 63.0, 0.3))
+        assert router.submit(t._cand("right", 62.0, 0.7)) is True   # accepted, held
+        assert t._rows(conn) == []
+        clock.t += 60
+        router.tick()
+        assert t._rows(conn) == [("left", 62.0, 0.7)]
+
+    def test_same_side_repeat_is_refused_while_older_is_unwritten(self, monkeypatch):
+        t = TestSingleSleeperVitals()
+        router, conn, clock = t._router()
+        self._flaky(monkeypatch, fails=1)
+        router.submit(t._cand("right", 58.0, 0.6, minute=0))
+        # Flushing the older held row fails: refuse the new one so the
+        # side keeps it and resubmits, instead of dropping the older row.
+        assert router.submit(t._cand("right", 59.0, 0.6, minute=1)) is False
+        assert router.submit(t._cand("right", 59.0, 0.6, minute=1)) is True
+        assert t._rows(conn) == [("left", 58.0, 0.6)]

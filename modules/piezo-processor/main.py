@@ -248,7 +248,8 @@ class SingleSleeperVitals:
 
     def submit(self, cand: VitalsCandidate) -> bool:
         """Accept one side's candidate. True means the side may advance its
-        write cursor (written now, or held for pairing)."""
+        write cursor: the row was written, or is held (for pairing or a
+        write retry). A held candidate is only dropped once written."""
         home = self._mode.home_side()
         if home is None:
             self.flush()
@@ -256,9 +257,17 @@ class SingleSleeperVitals:
         pending = self._pending
         if pending is not None and pending.side != cand.side and self._pending_home == home:
             best = cand if cand.quality_score > pending.quality_score else pending
-            self._pending = None
-            return best.write(self._holder, side=home)
-        self.flush()  # a same-side repeat means its partner never arrived
+            if best.write(self._holder, side=home):
+                self._pending = None
+            else:
+                # Keep the better reading and retry it on a later tick.
+                self._pending, self._pending_at = best, self._clock()
+            return True
+        # A same-side repeat means its partner never arrived: write the
+        # older one first. If that fails, refuse the new candidate so its
+        # side keeps it and resubmits, rather than dropping the older row.
+        if not self.flush():
+            return False
         self._pending, self._pending_home, self._pending_at = cand, home, self._clock()
         return True
 
@@ -267,10 +276,17 @@ class SingleSleeperVitals:
         if self._pending is not None and self._clock() - self._pending_at >= VITALS_INTERVAL_S:
             self.flush()
 
-    def flush(self) -> None:
-        pending, self._pending = self._pending, None
-        if pending is not None:
-            pending.write(self._holder, side=self._pending_home)
+    def flush(self) -> bool:
+        """Write the held candidate, if any. On failure it stays held and
+        the next retry waits another VITALS_INTERVAL_S. True when nothing
+        is left held."""
+        if self._pending is None:
+            return True
+        if self._pending.write(self._holder, side=self._pending_home):
+            self._pending = None
+            return True
+        self._pending_at = self._clock()
+        return False
 
 
 def report_health(status: str, message: str) -> None:
