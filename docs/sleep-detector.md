@@ -138,8 +138,8 @@ The baseline is maintained by the detector itself (`AdaptiveBaseline`), not by s
 - **Drift:** while the bed is empty and the reading is within the exit threshold, the baseline follows it with time constant `BASELINE_UP_TAU_S` (30 min). A load between the exit and enter thresholds is never learned as empty.
 - **Contamination:** any reading below baseline pulls it down with `BASELINE_DOWN_TAU_S` (2 min), so a baseline captured with someone in bed recovers minutes after they get up.
 - **Stuck load:** after a session force-closed at `MAX_SESSION_S`, the current level becomes the new empty level.
-- **Seeding:** the saved state file, else the active calibration profile (legacy capSense profiles with a z-score threshold get the raw-unit default), else the first frame. A calibration profile newer than any seen — a manual recalibration — is adopted as a reseed.
-- **Publishing:** every `BASELINE_PUBLISH_S` (15 min) the baseline is upserted to `calibration_profiles` with `source: "adaptive"`, in the calibrators' shape, so Node's occupancy check and the UI see the same level. Profiles marked adaptive are never re-adopted.
+- **Seeding:** the saved state file, else the active calibration profile — including this detector's own published baseline when the state file is lost (legacy capSense profiles with a z-score threshold get the raw-unit default) — else the first frame. A calibration profile newer than any seen — a manual recalibration — is adopted as a reseed.
+- **Publishing:** every `BASELINE_PUBLISH_S` (15 min) the baseline is upserted to `calibration_profiles` with `source: "adaptive"`, in the calibrators' shape, so Node's occupancy check and the UI see the same level. Profiles marked adaptive never replace a live baseline; they only seed one when there is none.
 - Per-sample tracking time is capped at `BASELINE_MAX_STEP_S`, so a gap or restart can't move the baseline in one step. Frames with a missing side or capSense2 sentinels are ignored.
 
 Replaying recorded capSense data starting from a baseline captured with the sleeper in bed, the baseline recovers within minutes of them getting up, sessions end at the real wake time rather than at the next recalibration, and a bedding shift of a few tens of units per channel produces no session.
@@ -169,7 +169,7 @@ An open session lives in memory, so it is checkpointed to `sleep-detector-state.
 
 - **resumes** the session when the last saved sample is recent. If the occupant is still in bed the downtime counts as sleep; if absence is committed before any presence is seen, the exit is dated at the last pre-restart presence (they left while the detector was down).
 - **closes** it at the last presence when the gap exceeds `STATE_MAX_GAP_S` (30 min), since the downtime can't be attributed to sleep.
-- **skips replayed samples**: the RAW follower re-reads the current file from offset 0, so samples at or before the saved `last_ts` are ignored.
+- **skips replayed samples**: the RAW follower re-reads the current file from offset 0, so samples at or before the saved `last_ts` are ignored — for every side, with or without an open session. The presence hysteresis latch is restored too, so a reading between the exit and enter thresholds keeps its state.
 
 Session records include:
 - Entry/exit timestamps

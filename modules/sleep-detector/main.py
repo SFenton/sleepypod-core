@@ -985,14 +985,17 @@ class SessionTracker:
 
     def _sync_baseline(self, record: dict) -> Optional[AdaptiveBaseline]:
         """The presence baseline for this frame's format. Adopts a calibration
-        profile newer than any already seen (e.g. a manual recalibration),
-        seeds from the first frame when nothing else exists."""
+        profile newer than any already seen (e.g. a manual recalibration).
+        With no baseline at all (state file missing), this detector's own
+        published baseline is a better seed than the first frame, which may
+        be occupied. Seeds from the first frame only when nothing else exists."""
         fmt = "capSense2" if record.get("type") == "capSense2" else "capSense"
         b = self.baseline if self.baseline is not None and self.baseline.fmt == fmt else None
         profile = self.calibration.get_profile(self.side) if self.calibration else None
         if profile is not None:
             params, created_at = profile
-            if isinstance(params, dict) and params.get("source") != "adaptive":
+            own = isinstance(params, dict) and params.get("source") == "adaptive"
+            if isinstance(params, dict) and (not own or b is None):
                 seen = b.profile_seen_at if b is not None else None
                 if seen is None or (created_at or 0) > seen:
                     adopted = AdaptiveBaseline.from_profile(params, fmt, created_at)

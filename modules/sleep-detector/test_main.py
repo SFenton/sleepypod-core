@@ -986,3 +986,27 @@ class TestRestartHysteresis:
         t2 = _live_tracker()
         t2.restore(json.loads(json.dumps(t.snapshot())), now=self.T0)
         assert t2._level_present is True
+
+
+class TestAdaptiveProfileSeed:
+    T0 = 1_777_000_000.0
+
+    def test_own_published_baseline_seeds_when_state_is_lost(self):
+        # State file missing, a published adaptive baseline exists, and the
+        # first frame is already occupied: seed from the profile, not the frame.
+        adaptive = _profile(EMPTY, created_at=self.T0 - 600, source="adaptive")
+        t = _live_tracker(_Cal(adaptive))
+        ts = _run(t, self.T0, 2 * 3600, 600)
+        assert t.baseline.source == "adaptive"
+        assert t.baseline.means["out"] == EMPTY["out"]
+        assert t._session_start is not None      # the occupant is detected
+
+    def test_own_published_baseline_does_not_override_live_one(self):
+        cal = _Cal()
+        t = _live_tracker(cal)
+        ts = _run(t, self.T0, 600, 0)
+        before = dict(t.baseline.means)
+        cal.profile = _profile({ch: v + 200 for ch, v in EMPTY.items()},
+                               created_at=ts, source="adaptive")
+        _run(t, ts, 60, 0)
+        assert t.baseline.means == before
