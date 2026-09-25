@@ -931,6 +931,7 @@ class SessionTracker:
             "state_since": self._state_since,
             "consecutive_cap_closes": self._consecutive_cap_closes,
             "last_ts": self._last_ts,
+            "level_present": self._level_present,
             "baseline": self.baseline.snapshot() if self.baseline is not None else None,
         }
 
@@ -950,6 +951,10 @@ class SessionTracker:
             last_ts = state.get("last_ts")
             self._last_ts = float(last_ts) if last_ts is not None else None
             self._replay_until_ts = self._last_ts
+            # Hysteresis latch: a reading between the exit and enter
+            # thresholds is occupied only if it already was — resetting it
+            # on restart would close a session that is still going.
+            self._level_present = bool(state.get("level_present"))
             start = state.get("session_start")
             if start is None:
                 return

@@ -956,3 +956,33 @@ class TestRestartReplay:
         t2.process(last - 300, _cap(600))
         assert t2._last_ts == last
         assert t2._session_start is None
+
+
+class TestRestartHysteresis:
+    """The per-side occupied latch (exit below half the enter threshold) must
+    survive a restart: a reading between the thresholds is occupied only
+    because it was already occupied."""
+
+    T0 = 1_777_000_000.0
+
+    def test_between_thresholds_stays_occupied_across_restart(self):
+        import json
+        t = _live_tracker()
+        ts = _run(t, self.T0, 600, 0)
+        ts = _run(t, ts, 3600, 600)               # in bed
+        ts = _run(t, ts, 1800, 70)                # +210 summed: between exit and enter
+        assert t._session_start is not None
+        t2 = _live_tracker()
+        t2.db = t.db
+        t2.restore(json.loads(json.dumps(t.snapshot())), now=ts + 30)
+        ts = _run(t2, ts + 30, 3600, 70)          # still there after the restart
+        assert t2._session_start is not None
+        assert _rows(t2) == []
+
+    def test_latch_restored_for_sessionless_side(self):
+        import json
+        t = _live_tracker()
+        t._level_present = True
+        t2 = _live_tracker()
+        t2.restore(json.loads(json.dumps(t.snapshot())), now=self.T0)
+        assert t2._level_present is True
