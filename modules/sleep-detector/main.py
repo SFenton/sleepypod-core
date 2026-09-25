@@ -944,6 +944,12 @@ class SessionTracker:
         self.baseline = AdaptiveBaseline.from_state(state.get("baseline"))
         try:
             self._consecutive_cap_closes = int(state.get("consecutive_cap_closes") or 0)
+            # The replay watermark applies whether or not a session is open: a
+            # sessionless side (the away side in single-sleeper mode) still
+            # feeds sessions, and must not replay frames it already processed.
+            last_ts = state.get("last_ts")
+            self._last_ts = float(last_ts) if last_ts is not None else None
+            self._replay_until_ts = self._last_ts
             start = state.get("session_start")
             if start is None:
                 return
@@ -956,8 +962,6 @@ class SessionTracker:
             self._exit_count = int(state.get("exit_count") or 0)
             self._debounced_present = bool(state.get("debounced_present"))
             self._state_since = state.get("state_since")
-            self._last_ts = state.get("last_ts")
-            self._replay_until_ts = self._last_ts
         except (TypeError, ValueError, OverflowError, OSError) as e:
             log.warning("%s: ignoring corrupt saved session: %s", self.side, e)
             self._reset_session()
@@ -1326,7 +1330,9 @@ def process_single_sleeper(home: SessionTracker, away: SessionTracker,
     """
     h = home.observe(ts, record)
     a = away.observe(ts, record)
-    if h is None and a is None:
+    if h is None:
+        # The home session already covered this frame (restart replay);
+        # the away side's reading of it must not re-enter the session.
         return
     if away._session_start is not None:
         # Away mode switched on mid-session: end that side's session where
@@ -1334,12 +1340,12 @@ def process_single_sleeper(home: SessionTracker, away: SessionTracker,
         away._close_session(away._last_present_ts or ts)
     evidence = [o.present for o in (h, a) if o is not None and o.present is not None]
     present = any(evidence) if evidence else None
-    delta = sum(o.delta for o in (h, a) if o is not None)
+    delta = h.delta + (a.delta if a is not None else 0.0)
     capped = home.commit(ts, present, delta)
     # A capped session in merged mode may be held open by either side's load.
-    for tracker, obs in ((home, h), (away, a)):
-        if obs is not None:
-            tracker.settle(obs, reset=capped)
+    home.settle(h, reset=capped)
+    if a is not None:
+        away.settle(a, reset=capped)
 
 
 # ---------------------------------------------------------------------------

@@ -911,3 +911,48 @@ class TestSingleSleeper:
         assert right.baseline.source == "cap-reset"
         assert left.baseline.source == "cap-reset"
         assert left._session_start is None
+
+
+class TestRestartReplay:
+    """After a restart the RAW follower replays the current file from offset
+    0. Every side must skip what it already processed — including a side
+    with no open session, whose frames feed the home session in
+    single-sleeper mode."""
+
+    T0 = 1_777_000_000.0
+
+    def _restart_pair(self, left, right, now):
+        import json
+        holder = left.db
+        fresh = []
+        for old in (left, right):
+            t = main.SessionTracker(side=old.side, db=holder, calibration=_Cal(),
+                                    pump_gate=main.PumpGateCapSense(), _last_movement_write=0.0)
+            t.restore(json.loads(json.dumps(old.snapshot())), now)
+            fresh.append(t)
+        return fresh
+
+    def test_single_sleeper_replay_does_not_split_the_night(self):
+        s = TestSingleSleeper()
+        left, right = s._pair()
+        ts = s._run(left, right, self.T0, 600, 0, 0)
+        ts = s._run(left, right, ts, 2 * 3600, 600, 0)          # asleep on the home side
+        assert right._session_start is None                     # away side: no session
+        left, right = self._restart_pair(left, right, now=ts + 60)
+        s._run(left, right, ts - 600, 600, 0, 0)                # replay: already-processed timestamps
+        ts = s._run(left, right, ts + 60, 3600, 600, 0)         # still asleep
+        ts = s._run(left, right, ts, 600, 0, 0)                 # up
+        rows = s._sessions(left)
+        assert len(rows) == 1
+        assert rows[0][3] == 1                                   # only the real morning exit
+
+    def test_sessionless_tracker_skips_replayed_frames(self):
+        import json
+        t = _live_tracker()
+        _run(t, self.T0, 600, 0)
+        last = t._last_ts
+        t2 = _live_tracker()
+        t2.restore(json.loads(json.dumps(t.snapshot())), now=last + 30)
+        t2.process(last - 300, _cap(600))
+        assert t2._last_ts == last
+        assert t2._session_start is None
