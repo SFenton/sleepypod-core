@@ -7,6 +7,7 @@ on:
       - 'modules/**/*.py'
       - 'modules/**/pyproject.toml'
       - 'modules/**/uv.lock'
+      - 'modules/.coveragerc'
       - '.github/workflows/python-modules.yml'
   pull_request:
     types: [opened, synchronize, reopened]
@@ -14,6 +15,7 @@ on:
       - 'modules/**/*.py'
       - 'modules/**/pyproject.toml'
       - 'modules/**/uv.lock'
+      - 'modules/.coveragerc'
       - '.github/workflows/python-modules.yml'
   workflow_dispatch:
 
@@ -84,7 +86,7 @@ jobs:
         with:
           # Pod runtime is pinned to 3.10 by every module's pyproject
           # (`requires-python = ">=3.9,<3.11"`). Match it in CI.
-          python-version: '3.10'
+          python-version: '3.14'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -110,6 +112,7 @@ jobs:
           # shellcheck source=/dev/null
           . .venv/bin/activate
           pytest ${{ matrix.module.target }} \
+            --cov-config=${{ github.workspace }}/modules/.coveragerc \
             --cov=${{ matrix.module.cov_source }} \
             --cov-report=xml:coverage.xml \
             --junit-xml=junit.xml \
