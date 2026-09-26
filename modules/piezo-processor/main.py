@@ -243,6 +243,8 @@ class SingleSleeperVitals:
         self._mode = mode
         self._clock = clock
         self._pending: Optional[VitalsCandidate] = None
+        self._retry: Optional[VitalsCandidate] = None
+        self._retry_home: Optional[str] = None
         self._pending_home: Optional[str] = None
         self._pending_at = 0.0
 
@@ -250,18 +252,19 @@ class SingleSleeperVitals:
         """Accept one side's candidate. True means the side may advance its
         write cursor: the row was written, or is held (for pairing or a
         write retry). A held candidate is only dropped once written."""
+        # Completed intervals must never pair with a later candidate.
+        if self._retry is not None and not self.flush():
+            return False
         home = self._mode.home_side()
         if home is None:
-            self.flush()
+            if not self.flush():
+                return False
             return cand.write(self._holder)
         pending = self._pending
         if pending is not None and pending.side != cand.side and self._pending_home == home:
             best = cand if cand.quality_score > pending.quality_score else pending
-            if best.write(self._holder, side=home):
-                self._pending = None
-            else:
-                # Keep the better reading and retry it on a later tick.
-                self._pending, self._pending_at = best, self._clock()
+            self._pending = best
+            self.flush()
             return True
         # A same-side repeat means its partner never arrived: write the
         # older one first. If that fails, refuse the new candidate so its
@@ -273,17 +276,21 @@ class SingleSleeperVitals:
 
     def tick(self) -> None:
         """Write a held candidate whose partner didn't arrive in time."""
-        if self._pending is not None and self._clock() - self._pending_at >= VITALS_INTERVAL_S:
+        held = self._pending is not None or self._retry is not None
+        if held and self._clock() - self._pending_at >= VITALS_INTERVAL_S:
             self.flush()
 
     def flush(self) -> bool:
         """Write the held candidate, if any. On failure it stays held and
-        the next retry waits another VITALS_INTERVAL_S. True when nothing
-        is left held."""
-        if self._pending is None:
-            return True
-        if self._pending.write(self._holder, side=self._pending_home):
+        idle retries wait VITALS_INTERVAL_S; a new submission retries first.
+        True when nothing is left held."""
+        if self._retry is None:
+            self._retry, self._retry_home = self._pending, self._pending_home
             self._pending = None
+        if self._retry is None:
+            return True
+        if self._retry.write(self._holder, side=self._retry_home):
+            self._retry = None
             return True
         self._pending_at = self._clock()
         return False
@@ -1075,7 +1082,7 @@ def main() -> None:
     report_health("healthy", "piezo-processor v2 started")
 
     try:
-        for record in follower.read_records():
+        for record in follower.read_records(on_poll=vitals_router.tick):
             rtype = record.get("type")
 
             # Surface genuinely-new firmware types once (blanketReadings, log,
@@ -1108,7 +1115,6 @@ def main() -> None:
 
             left.ingest(l_samples)
             right.ingest(r_samples)
-            vitals_router.tick()
 
     except Exception as e:
         log.exception("Fatal error in main loop: %s", e)

@@ -1477,3 +1477,68 @@ class TestSingleSleeperVitalsRetry:
         assert router.submit(t._cand("right", 59.0, 0.6, minute=1)) is False
         assert router.submit(t._cand("right", 59.0, 0.6, minute=1)) is True
         assert t._rows(conn) == [("left", 58.0, 0.6)]
+
+    @pytest.mark.parametrize("next_quality", [0.2, 0.9])
+    def test_failed_pair_is_not_paired_with_next_interval(self, monkeypatch, next_quality):
+        t = TestSingleSleeperVitals()
+        router, conn, clock = t._router()
+        self._flaky(monkeypatch, fails=1)
+        router.submit(t._cand("left", 63.0, 0.3))
+        router.submit(t._cand("right", 62.0, 0.7))  # completed pair fails
+        clock.t += 60
+        assert router.submit(t._cand("left", 70.0, next_quality, minute=1))
+        router.flush()
+        assert t._rows(conn) == [("left", 62.0, 0.7), ("left", 70.0, next_quality)]
+
+    def test_failed_retry_refuses_next_interval(self, monkeypatch):
+        t = TestSingleSleeperVitals()
+        router, conn, clock = t._router()
+        self._flaky(monkeypatch, fails=2)
+        router.submit(t._cand("left", 63.0, 0.3))
+        router.submit(t._cand("right", 62.0, 0.7))
+        newer = t._cand("left", 70.0, 0.9, minute=1)
+        assert router.submit(newer) is False
+        assert t._rows(conn) == []
+        assert router.submit(newer) is True
+        router.flush()
+        assert t._rows(conn) == [("left", 62.0, 0.7), ("left", 70.0, 0.9)]
+
+    def test_failed_timeout_is_not_repaired_with_late_partner(self, monkeypatch):
+        t = TestSingleSleeperVitals()
+        router, conn, clock = t._router()
+        self._flaky(monkeypatch, fails=1)
+        router.submit(t._cand("right", 62.0, 0.7))
+        clock.t += 60
+        router.tick()
+        router.submit(t._cand("left", 70.0, 0.9, minute=1))
+        router.flush()
+        assert t._rows(conn) == [("left", 62.0, 0.7), ("left", 70.0, 0.9)]
+
+
+@pytest.mark.parametrize("pump_gated", [False, True])
+def test_main_flushes_pending_vitals_during_idle_poll(monkeypatch, tmp_path, pump_gated):
+    """The follower can flush a lone row without yielding another record."""
+    import main
+    t = TestSingleSleeperVitals()
+    router, conn, clock = t._router()
+    router.submit(t._cand("right", 62.0, 0.7))
+    monkeypatch.setattr(main, "BIOMETRICS_DB", tmp_path / "biometrics.db")
+    monkeypatch.setattr(main, "open_biometrics_db", lambda: conn)
+    monkeypatch.setattr(main, "SingleSleeperVitals", lambda *args: router)
+    monkeypatch.setattr(main, "report_health", lambda *args: None)
+
+    monkeypatch.setattr(main, "KNOWN_RECORD_TYPES", {"piezo-dual"})
+    monkeypatch.setattr(main.PumpGate, "check", lambda *args: True)
+
+    class IdleFollower:
+        def read_records(self, on_poll):
+            if pump_gated:
+                on_poll()
+                yield {"type": "piezo-dual", "left1": b"\x00" * 4, "right1": b"\x00" * 4}
+            clock.t += 60
+            on_poll()
+            # Assert before main's shutdown flush can mask missing idle work.
+            assert t._rows(conn) == [("left", 62.0, 0.7)]
+
+    monkeypatch.setattr(main, "create_follower", lambda *a, **kw: IdleFollower())
+    main.main()
