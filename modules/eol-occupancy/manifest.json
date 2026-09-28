@@ -1,0 +1,14 @@
+{
+  "name": "eol-occupancy",
+  "version": "0.1.0",
+  "description": "Evidence-of-life side occupancy from raw capSense and piezo streams",
+  "provides": [
+    "eol_occupancy_state.state",
+    "eol_occupancy_state.confirmed",
+    "eol_occupancy_state.degraded"
+  ],
+  "writes": ["eol_occupancy_state"],
+  "service": "sleepypod-eol-occupancy.service",
+  "language": "python",
+  "minVersion": "1.0.0"
+}

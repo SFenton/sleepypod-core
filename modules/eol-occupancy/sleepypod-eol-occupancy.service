@@ -1,0 +1,39 @@
+[Unit]
+Description=SleepyPod Evidence-of-Life Occupancy
+Documentation=https://github.com/SFenton/sleepypod-core/blob/dev/docs/occupancy-study.md
+# Order after nats-server on new-firmware pods; a no-op ordering where that
+# unit is absent (older pods keep the .RAW path).
+After=network.target sleepypod.service nats-server.service
+
+[Service]
+Type=simple
+User=dac
+SupplementaryGroups=sleepypod
+UMask=0077
+WorkingDirectory=/opt/sleepypod/modules/eol-occupancy
+ExecStart=/opt/sleepypod/modules/eol-occupancy/.venv/bin/python main.py run
+Restart=always
+RestartSec=10
+
+EnvironmentFile=-/etc/sleepypod/modules/eol-occupancy.env
+Environment="RAW_DATA_DIR=/persistent/biometrics"
+Environment="BIOMETRICS_DATABASE_URL=file:/persistent/sleepypod-data/biometrics.db"
+Environment="EOL_OCCUPANCY_CHECKPOINT=/persistent/sleepypod-data/eol-occupancy-checkpoint.json"
+
+MemoryMax=96M
+CPUQuota=25%
+Nice=5
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ReadOnlyPaths=/persistent
+ReadWritePaths=/persistent/sleepypod-data
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

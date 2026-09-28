@@ -160,8 +160,8 @@ Home Assistant discovery creates the primary occupancy binary sensor, a legacy
 comparison binary sensor, an explicitly named adaptive-load comparison sensor,
 and an adaptive classification enum sensor for each side. The adaptive
 comparison entities retain the fresh adaptive-load topic; the primary entity
-keeps its existing unique ID while consuming the fused decision described
-below.
+keeps its existing unique ID while consuming the evidence-of-life decision
+described below.
 
 Fresh adaptive state is also the shared production source used by HomeKit, the
 occupancy API and UI, and auto-off. If the adaptive row is missing, stale by
@@ -171,11 +171,12 @@ useful while forcing absence-triggered behavior such as auto-off to stand down.
 The Python sleep-session detector remains independent and continues to process
 its own raw sensor stream.
 
-## Fused primary occupancy
+## Fused occupancy (comparison)
 
-The core evaluates a versioned fused decision per side and publishes it through
-the existing primary Home Assistant occupancy identities. The prior adaptive
-and legacy entities remain available as diagnostics and rollback evidence.
+`fused-occupancy-v2` drove the primary Home Assistant occupancy entities from
+2026-09-21 until evidence-of-life replaced it. The core still evaluates it per
+side and publishes it on its own comparison topics and entities (below) as
+rollback evidence, alongside the adaptive and legacy entities.
 
 The pure state machine reports:
 
@@ -224,27 +225,20 @@ The piezo processor records its guarded pump mode on every presence decision,
 including while the existing detector remains in its present hysteresis state,
 so the fused decision cannot interpret an active-pump exit window as pump-safe.
 
-MQTT publishes permanent algorithm-neutral topics:
+Fused comparison topics mirror the primary layout under a `fused` suffix:
 
-- `state/occupancy/<side>` — plain, non-retained `ON` / `OFF`
-  heartbeat;
-- `availability/occupancy/<side>` — retained per-side
+- `state/occupancy/<side>/fused` — plain, non-retained `ON` / `OFF`
+  heartbeat (`<side>_occupancy_fused` binary sensor, `expire_after: 3`);
+- `availability/occupancy/<side>/fused` — retained per-side
   `online` / `offline`;
-- `state/occupancy/<side>/decision` — retained, low-churn
+- `state/occupancy/<side>/fused/decision` — retained, low-churn
   classification, reason, provenance, certificate basis, baseline source, and
-  short-cycle progress or blocked-gate diagnostics.
+  short-cycle progress or blocked-gate diagnostics
+  (`<side>_occupancy_fused_decision`, diagnostic, disabled and hidden by
+  default).
 
-Home Assistant discovery updates the existing primary binary sensors in place,
-preserving their unique IDs and entity IDs. Each uses `expire_after: 3` with a
-one-second heartbeat and combines the Pod LWT with per-side decision
-availability. The low-churn decision sensor is diagnostic, disabled, and hidden
-by default. Temporary fused-shadow discovery and retained diagnostic topics are
-tombstoned during the cutover.
-
-This promotion changes the Home Assistant primary MQTT projection used by
-automations. HomeKit, API/web, and auto-off continue to use the adaptive shared
-runtime until their unavailable-state behavior is promoted and validated
-separately.
+Temporary fused-shadow discovery and retained diagnostic topics from the
+original fused rollout remain tombstoned on every connect.
 
 ## Suggested labeled trial
 
@@ -259,3 +253,76 @@ For a time-bounded field study, set `OCCUPANCY_STUDY_END_AT` in
 `/etc/sleepypod/modules/occupancy-study-recorder.env` to an ISO-8601 timestamp.
 The service exits successfully at that time and remains stopped because its
 restart policy is `on-failure`.
+
+## Evidence-of-life primary occupancy
+
+`eol-occupancy-v4` (`modules/common/eol_occupancy.py`) drives the primary Home
+Assistant occupancy entities. Its question is whether a living body is on the
+side, not whether something loads the surface relative to a baseline.
+
+- capSense is the side-local body signal: an abrupt load step plus
+  breathing-scale micro-motion (median absolute one-second change of the
+  center channel).
+- Piezo 1–10 Hz energy separates people (roughly 60k–1M) from objects and an
+  empty bed (roughly 1–2k) and supplies side-dominant movement bursts. A still
+  sleeper couples almost equally into both piezo channels, so piezo is never
+  used to localize a quiet person.
+- Entry: a load step with an own-side burst is `provisional`, then `occupied`
+  once sustained load plus life evidence holds for 15 seconds after the first
+  20 (about 35 seconds after entry). Otherwise it is revoked after 150 seconds
+  (objects, edge sits, a partner reaching across). A sustained loaded side
+  with micro-motion also enters after three minutes.
+- Exit: an unload step back near the empty reference with own vitals collapsed
+  to the partner-coupling level and a quiet capSense window clears both the
+  fast and confirmed signals together, typically 7–60 seconds after the
+  person leaves. Slow paths clear an unloaded quiet side after three minutes,
+  or a still-loaded side after ten minutes without vitals anywhere in the bed.
+- The empty reference adapts only while the side is verified empty; it
+  qualifies transitions but never holds a side occupied.
+
+`modules/eol-occupancy` follows the raw capSense and piezo streams (NATS on
+current firmware, `*.RAW` files otherwise), upserts one `eol_occupancy_state`
+row per side on every state change and at least every five seconds, and
+checkpoints the detector to `eol-occupancy-checkpoint.json` so restarts keep
+the empty reference and state. The drizzle migration owns the table; the
+module never creates it, because `sp-update` starts modules before the app
+migrates. Timestamps are the module's receipt time, forced strictly
+increasing; a backward wall-clock step of more than a minute rebases the
+rolling windows while keeping each side's state and reference.
+
+MQTT publishes the permanent algorithm-neutral primary topics:
+
+- `state/occupancy/<side>` — plain, non-retained `ON` / `OFF` heartbeat of the
+  confirmed state (a provisional entry stays `OFF`);
+- `availability/occupancy/<side>` — retained per-side `online` / `offline`;
+- `state/occupancy/<side>/decision` — retained, low-churn decision: the
+  `classification` (`empty`, `provisional`, `occupied`, or why the primary is
+  unavailable), fast and confirmed flags, last event, state age, and the
+  evidence diagnostics at the last change.
+
+The primary side is unavailable when its row is missing, older than 30
+seconds, unreadable, or degraded. Degraded means recent piezo energy is
+missing on either side: capSense-only exits replayed at 88.6% on the night
+core and can clear a very still sleeper, so absence-triggered automations must
+not see a degraded `OFF`. The decision sensor uses Pod availability only, so
+it stays visible with the reason (`degraded`, `stale`, `no_data`,
+`source_error`) while the primary is unavailable.
+
+Home Assistant discovery updates the existing primary binary sensors in place,
+preserving their unique IDs and entity IDs (`expire_after: 3`, one-second
+heartbeat). HomeKit, API/web, and auto-off continue to use the adaptive shared
+runtime.
+
+Validation (2026-09-13 → 09-28 raw archive, labels from operator statements
+and independent Home Assistant evidence only): confirmed occupancy scored
+99.74% on occupied time and 100% on empty time with no false clears during
+sleep, against 100% / 36.9% for fused-v2. Over the final 24 hours it was never
+occupied while the bed was verifiably empty (both piezo channels below 20k),
+while fused-v2 held each side occupied for about seven such hours. The
+streaming port agrees with the offline reference on 99.96–99.97% of seconds,
+and replaying raw recorder CBOR on the Pod reproduced the reference events
+while using under 1% of one core.
+
+Replay archived study chunks with
+`python -m common.eol_replay --raw-dir DIR --from ISO --to ISO --out FILE`
+from `modules/` (requires `cbor2`).

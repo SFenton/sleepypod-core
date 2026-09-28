@@ -232,6 +232,14 @@ describe('module deployment guards', () => {
     expect(update).toContain('MODULE_CANDIDATES+=(occupancy-study-recorder)')
     expect(install).toContain('INSTALL_MODULE_CANDIDATES+=(adaptive-occupancy)')
     expect(update).toContain('MODULE_CANDIDATES+=(adaptive-occupancy)')
+    expect(install).toContain('INSTALL_MODULE_CANDIDATES+=(eol-occupancy)')
+    expect(update).toContain('MODULE_CANDIDATES+=(eol-occupancy)')
+    expect(install).toContain(
+      '[ "$name" = "adaptive-occupancy" ] || [ "$name" = "eol-occupancy" ]',
+    )
+    expect(update).toContain(
+      '[ "$mod" = "adaptive-occupancy" ] || [ "$mod" = "eol-occupancy" ]',
+    )
     expect(install).toContain(
       '[ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ]',
     )

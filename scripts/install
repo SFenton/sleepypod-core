@@ -1755,6 +1755,8 @@ else
      || [ -f "$DATA_DIR/adaptive-occupancy-checkpoint.json" ]; then
     INSTALL_MODULE_CANDIDATES+=(adaptive-occupancy)
   fi
+  # Evidence-of-life occupancy drives the primary MQTT occupancy entities.
+  INSTALL_MODULE_CANDIDATES+=(eol-occupancy)
   if [ -d /persistent/jetstream ] \
      && systemctl cat nats-server.service >/dev/null 2>&1; then
     INSTALL_MODULE_CANDIDATES+=(occupancy-study-recorder)
@@ -1775,7 +1777,7 @@ else
       _uv_sync_args+=(--python-preference only-managed)
     fi
     if ! (cd "$stage" && uv sync "${_uv_sync_args[@]}"); then
-      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ]; then
+      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ] || [ "$name" = "eol-occupancy" ]; then
         echo "Warning: optional module $name dependencies failed to build; core biometrics installation will continue" >&2
         rm -rf "$stage"
         unset _uv_sync_args
@@ -1788,7 +1790,7 @@ else
     unset _uv_sync_args
     chmod -R o+rX "$stage/.venv" 2>/dev/null || true
     INSTALL_MODULE_NAMES+=("$name")
-    if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ]; then
+    if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ] || [ "$name" = "eol-occupancy" ]; then
       INSTALL_OPTIONAL_MODULE_NAMES+=("$name")
     else
       INSTALL_REQUIRED_MODULE_NAMES+=("$name")
@@ -1830,7 +1832,7 @@ else
       chmod 0644 "/etc/systemd/system/$service"
       unset _data_dir_sed
       systemctl daemon-reload
-      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ]; then
+      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ] || [ "$name" = "eol-occupancy" ]; then
         if systemctl enable "$service" && systemctl restart "$service"; then
           INSTALL_SWAPPED_MODULES+=("$name")
           echo "Optional module $name installed and started"
@@ -1845,7 +1847,7 @@ else
         echo "Module $name installed and started"
       fi
     else
-      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ]; then
+      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ] || [ "$name" = "eol-occupancy" ]; then
         restore_optional_install_module "$name"
         echo "Warning: optional module $name has no service file; core biometrics installation will continue" >&2
       else
