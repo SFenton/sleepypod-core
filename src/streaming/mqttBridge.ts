@@ -22,8 +22,10 @@
  *   <prefix>/<device-id>/state/schedules             — retained alarm schedule mirror
  *   <prefix>/<device-id>/state/water-level           — low | ok | unknown
  *   <prefix>/<device-id>/state/biometrics/<side>     — latest HR/HRV/BR summary
- *   <prefix>/<device-id>/state/occupancy/<side>          — volatile primary fused ON/OFF decision
+ *   <prefix>/<device-id>/state/occupancy/<side>          — volatile primary evidence-of-life ON/OFF (confirmed)
  *   <prefix>/<device-id>/state/occupancy/<side>/decision — retained primary decision diagnostics
+ *   <prefix>/<device-id>/state/occupancy/<side>/fused    — volatile fused-v2 comparison ON/OFF
+ *   <prefix>/<device-id>/state/occupancy/<side>/fused/decision — retained fused-v2 diagnostics
  *   <prefix>/<device-id>/state/occupancy/<side>/legacy   — previous detector
  *   <prefix>/<device-id>/state/occupancy/<side>/adaptive — adaptive-load comparison
  *   <prefix>/<device-id>/state/environment/ambient   — ambient temp (°C) + humidity (%)
@@ -53,6 +55,7 @@ import { alarmSchedules, deviceSettings, deviceState, powerSchedules, temperatur
 import {
   adaptiveOccupancyState,
   bedTemp,
+  eolOccupancyState,
   flowReadings,
   piezoPresenceDecisions,
   vitals,
@@ -76,9 +79,12 @@ import { getDacMonitorIfRunning } from '@/src/hardware/dacMonitor.instance'
 
 const DEFAULT_TOPIC_PREFIX = 'sleepypod'
 const STATE_PUBLISH_INTERVAL_MS = 30_000
-const FUSED_OCCUPANCY_PUBLISH_INTERVAL_MS = 1_000
+const OCCUPANCY_PUBLISH_INTERVAL_MS = 1_000
 const PRIMARY_OCCUPANCY_EXPIRE_AFTER_SECONDS = 3
 const FUSED_OCCUPANCY_WARNING_INTERVAL_MS = 60_000
+// modules/eol-occupancy upserts at least every 5 s while raw streams flow.
+const EOL_OCCUPANCY_STALE_SECONDS = 30
+const EOL_OCCUPANCY_WARNING_INTERVAL_MS = 60_000
 const RECONNECT_PERIOD_MS = 5_000
 const CONNECT_TIMEOUT_MS = 10_000
 const TEST_CONNECT_TIMEOUT_MS = 5_000
@@ -216,7 +222,11 @@ interface BridgeState {
   runState: BridgeRunState
   lastError: string | null
   publishTimer: ReturnType<typeof setInterval> | null
-  fusedOccupancyTimer: ReturnType<typeof setInterval> | null
+  occupancyTimer: ReturnType<typeof setInterval> | null
+  eolOccupancyPublishInFlight: boolean
+  eolOccupancyAvailability: Record<ScheduleSide, 'online' | 'offline' | null>
+  eolOccupancyDecisionKey: Record<ScheduleSide, string | null>
+  eolOccupancyLastWarningAt: number
   fusedOccupancyProvider: FusedOccupancyProvider | null
   fusedOccupancyPublishInFlight: boolean
   fusedOccupancyAvailability: Record<ScheduleSide, 'online' | 'offline' | null>
@@ -233,7 +243,11 @@ const state: BridgeState = {
   runState: 'stopped',
   lastError: null,
   publishTimer: null,
-  fusedOccupancyTimer: null,
+  occupancyTimer: null,
+  eolOccupancyPublishInFlight: false,
+  eolOccupancyAvailability: { left: null, right: null },
+  eolOccupancyDecisionKey: { left: null, right: null },
+  eolOccupancyLastWarningAt: 0,
   fusedOccupancyProvider: null,
   fusedOccupancyPublishInFlight: false,
   fusedOccupancyAvailability: { left: null, right: null },
@@ -768,7 +782,7 @@ function publishHaDiscovery(): void {
     device: dev,
   })
 
-  const fusedOccupancyAvailability = (side: ScheduleSide) => [
+  const primaryOccupancyAvailability = (side: ScheduleSide) => [
     {
       topic: availability,
       payload_available: 'online',
@@ -781,9 +795,22 @@ function publishHaDiscovery(): void {
     },
   ]
 
+  const fusedOccupancyAvailability = (side: ScheduleSide) => [
+    {
+      topic: availability,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+    },
+    {
+      topic: fusedOccupancyAvailabilityTopic(side),
+      payload_available: 'online',
+      payload_not_available: 'offline',
+    },
+  ]
+
   const occupancyBinary = (
     side: ScheduleSide,
-    algorithm: 'primary' | 'legacy' | 'adaptive',
+    algorithm: 'primary' | 'fused' | 'legacy' | 'adaptive',
   ) => {
     const label = side === 'left' ? 'Left' : 'Right'
     if (algorithm === 'primary') {
@@ -791,6 +818,20 @@ function publishHaDiscovery(): void {
         name: `${label} occupancy`,
         unique_id: `${id}_${side}_occupancy`,
         state_topic: topic('state', 'occupancy', side),
+        payload_on: 'ON',
+        payload_off: 'OFF',
+        expire_after: PRIMARY_OCCUPANCY_EXPIRE_AFTER_SECONDS,
+        availability: primaryOccupancyAvailability(side),
+        availability_mode: 'all',
+        device_class: 'occupancy',
+        device: dev,
+      }
+    }
+    if (algorithm === 'fused') {
+      return {
+        name: `${label} occupancy (fused)`,
+        unique_id: `${id}_${side}_occupancy_fused`,
+        state_topic: topic('state', 'occupancy', side, 'fused'),
         payload_on: 'ON',
         payload_off: 'OFF',
         expire_after: PRIMARY_OCCUPANCY_EXPIRE_AFTER_SECONDS,
@@ -880,16 +921,38 @@ function publishHaDiscovery(): void {
     }
   }
 
+  const eolOccupancyDecisionConfig = (side: ScheduleSide) => {
+    const decisionTopic = topic('state', 'occupancy', side, 'decision')
+    return {
+      name: `${side === 'left' ? 'Left' : 'Right'} occupancy decision`,
+      unique_id: `${id}_${side}_occupancy_decision`,
+      state_topic: decisionTopic,
+      value_template: '{{ value_json.classification }}',
+      json_attributes_topic: decisionTopic,
+      // Device availability only: the decision stays visible (with its
+      // reason) while the primary binary sensor is unavailable.
+      availability_topic: availability,
+      payload_available: 'online',
+      payload_not_available: 'offline',
+      device_class: 'enum',
+      options: [...EOL_DECISION_CLASSIFICATIONS],
+      icon: 'mdi:bed-clock',
+      entity_category: 'diagnostic',
+      device: dev,
+    }
+  }
+
   const fusedOccupancyDecision = (side: ScheduleSide) => {
     const decisionTopic = topic(
       'state',
       'occupancy',
       side,
+      'fused',
       'decision',
     )
     return {
-      name: `${side === 'left' ? 'Left' : 'Right'} occupancy decision`,
-      unique_id: `${id}_${side}_occupancy_decision`,
+      name: `${side === 'left' ? 'Left' : 'Right'} occupancy decision (fused)`,
+      unique_id: `${id}_${side}_occupancy_fused_decision`,
       state_topic: decisionTopic,
       value_template: '{{ value_json.classification }}',
       json_attributes_topic: decisionTopic,
@@ -958,6 +1021,11 @@ function publishHaDiscovery(): void {
       RETAINED_QOS_0,
     )
     safePublish(
+      `${haPrefix}/binary_sensor/${id}/${side}_occupancy_fused/config`,
+      JSON.stringify(occupancyBinary(side, 'fused')),
+      RETAINED_QOS_0,
+    )
+    safePublish(
       `${haPrefix}/binary_sensor/${id}/${side}_occupancy_legacy/config`,
       JSON.stringify(occupancyBinary(side, 'legacy')),
       RETAINED_QOS_0,
@@ -974,6 +1042,11 @@ function publishHaDiscovery(): void {
     )
     safePublish(
       `${haPrefix}/sensor/${id}/${side}_occupancy_decision/config`,
+      JSON.stringify(eolOccupancyDecisionConfig(side)),
+      RETAINED_QOS_0,
+    )
+    safePublish(
+      `${haPrefix}/sensor/${id}/${side}_occupancy_fused_decision/config`,
       JSON.stringify(fusedOccupancyDecision(side)),
       RETAINED_QOS_0,
     )
@@ -1141,7 +1214,7 @@ function clearRemovedFusedShadowMqttExposure(): void {
 // ---------------------------------------------------------------------------
 
 function fusedOccupancyAvailabilityTopic(side: ScheduleSide): string {
-  return topic('availability', 'occupancy', side)
+  return topic('availability', 'occupancy', side, 'fused')
 }
 
 function publishFusedOccupancyAvailability(
@@ -1238,6 +1311,7 @@ function publishFusedOccupancyDecision(
       'state',
       'occupancy',
       decision.side,
+      'fused',
       'decision',
     ),
     JSON.stringify(fusedOccupancyDecisionPayload(decision)),
@@ -1257,7 +1331,7 @@ function publishFusedOccupancyResult(
   }
 
   safePublish(
-    topic('state', 'occupancy', decision.side),
+    topic('state', 'occupancy', decision.side, 'fused'),
     decision.occupied ? 'ON' : 'OFF',
     VOLATILE_QOS_0,
   )
@@ -1357,6 +1431,183 @@ async function publishFusedOccupancy(): Promise<void> {
   }
   finally {
     state.fusedOccupancyPublishInFlight = false
+  }
+}
+
+const EOL_DECISION_CLASSIFICATIONS = [
+  'empty',
+  'provisional',
+  'occupied',
+  'degraded',
+  'stale',
+  'no_data',
+  'source_error',
+] as const
+
+type EolUnavailableReason = 'degraded' | 'stale' | 'no_data' | 'source_error'
+type EolOccupancyRow = typeof eolOccupancyState.$inferSelect
+
+export interface EolOccupancyDecision {
+  side: ScheduleSide
+  available: boolean
+  /** Primary ON/OFF: the confirmed evidence-of-life state. */
+  occupied: boolean
+  classification: typeof EOL_DECISION_CLASSIFICATIONS[number]
+  reason: EolUnavailableReason | null
+  row: EolOccupancyRow | null
+}
+
+function secondsIso(value: Date | null | undefined): string | null {
+  return value ? value.toISOString() : null
+}
+
+export function eolOccupancyDecision(
+  side: ScheduleSide,
+  row: EolOccupancyRow | null,
+  nowMs: number,
+): EolOccupancyDecision {
+  const unavailable = (reason: EolUnavailableReason): EolOccupancyDecision => ({
+    side,
+    available: false,
+    occupied: false,
+    classification: reason,
+    reason,
+    row,
+  })
+  if (!row) return unavailable('no_data')
+  if (nowMs - row.sampleTimestamp.getTime() > EOL_OCCUPANCY_STALE_SECONDS * 1000) {
+    return unavailable('stale')
+  }
+  // Without piezo the detector can clear a very still sleeper, so absence
+  // consumers must not see a degraded OFF as a real exit.
+  if (row.degraded) return unavailable('degraded')
+  return {
+    side,
+    available: true,
+    occupied: row.confirmed,
+    classification: row.state,
+    reason: null,
+    row,
+  }
+}
+
+export function eolOccupancyDecisionPayload(
+  decision: EolOccupancyDecision,
+): Record<string, unknown> {
+  const row = decision.row
+  return {
+    algorithm: row?.algorithmVersion ?? null,
+    classification: decision.classification,
+    state: row?.state ?? null,
+    occupied: decision.occupied,
+    available: decision.available,
+    reason: decision.reason,
+    fastOccupied: row?.occupied ?? null,
+    confirmed: row?.confirmed ?? null,
+    degraded: row?.degraded ?? null,
+    stateSince: secondsIso(row?.stateSince),
+    lastEvent: row?.lastEvent ?? null,
+    lastEventAt: secondsIso(row?.lastEventAt),
+    sampleTimestamp: secondsIso(row?.sampleTimestamp),
+    diagnostics: row
+      ? {
+          loadAboveReference: row.loadAboveReference,
+          mv60: row.mv60,
+          e20Own: row.e20Own,
+          e20Partner: row.e20Partner,
+        }
+      : null,
+  }
+}
+
+function eolOccupancyAvailabilityTopic(side: ScheduleSide): string {
+  return topic('availability', 'occupancy', side)
+}
+
+function publishEolOccupancyAvailability(
+  side: ScheduleSide,
+  availability: 'online' | 'offline',
+  force = false,
+): void {
+  if (!force && state.eolOccupancyAvailability[side] === availability) return
+  safePublish(eolOccupancyAvailabilityTopic(side), availability, RETAINED_QOS_0)
+  state.eolOccupancyAvailability[side] = availability
+}
+
+function resetEolOccupancyState(): void {
+  state.eolOccupancyPublishInFlight = false
+  state.eolOccupancyAvailability = { left: null, right: null }
+  state.eolOccupancyDecisionKey = { left: null, right: null }
+}
+
+function publishAllEolOccupancyOffline(force = false): void {
+  for (const side of SIDES) {
+    publishEolOccupancyAvailability(side, 'offline', force)
+  }
+}
+
+function publishEolOccupancyDecision(decision: EolOccupancyDecision): void {
+  const payload = eolOccupancyDecisionPayload(decision)
+  // Retain on semantic change only; the per-second sample time and
+  // diagnostics ride along with the next change.
+  const key = JSON.stringify({ ...payload, sampleTimestamp: null, diagnostics: null })
+  if (state.eolOccupancyDecisionKey[decision.side] === key) return
+  safePublish(
+    topic('state', 'occupancy', decision.side, 'decision'),
+    JSON.stringify(payload),
+    RETAINED_QOS_0,
+  )
+  state.eolOccupancyDecisionKey[decision.side] = key
+}
+
+function publishEolOccupancyResult(decision: EolOccupancyDecision): void {
+  publishEolOccupancyDecision(decision)
+  if (!decision.available) {
+    publishEolOccupancyAvailability(decision.side, 'offline')
+    return
+  }
+  safePublish(
+    topic('state', 'occupancy', decision.side),
+    decision.occupied ? 'ON' : 'OFF',
+    VOLATILE_QOS_0,
+  )
+  publishEolOccupancyAvailability(decision.side, 'online')
+}
+
+async function publishEolOccupancy(): Promise<void> {
+  if (!state.client?.connected || state.eolOccupancyPublishInFlight) return
+  state.eolOccupancyPublishInFlight = true
+  const nowMs = Date.now()
+  try {
+    const rows = await biometricsDb.select().from(eolOccupancyState).all()
+    const bySide = new Map(rows.map(row => [row.side, row]))
+    for (const side of SIDES) {
+      publishEolOccupancyResult(
+        eolOccupancyDecision(side, bySide.get(side) ?? null, nowMs),
+      )
+    }
+  }
+  catch (error) {
+    for (const side of SIDES) {
+      publishEolOccupancyResult({
+        side,
+        available: false,
+        occupied: false,
+        classification: 'source_error',
+        reason: 'source_error',
+        row: null,
+      })
+    }
+    if (nowMs - state.eolOccupancyLastWarningAt >= EOL_OCCUPANCY_WARNING_INTERVAL_MS) {
+      state.eolOccupancyLastWarningAt = nowMs
+      console.warn(
+        '[mqtt] eol occupancy publish failed:',
+        error instanceof Error ? error.message : error,
+      )
+    }
+  }
+  finally {
+    state.eolOccupancyPublishInFlight = false
   }
 }
 
@@ -1891,6 +2142,7 @@ export async function startMqttBridge(): Promise<void> {
   state.fusedOccupancyAvailability = { left: null, right: null }
   state.fusedOccupancyDecisionRevision = { left: null, right: null }
   state.fusedOccupancyPublishInFlight = false
+  resetEolOccupancyState()
 
   const id = deviceId()
   const availabilityTopic = topic('availability')
@@ -1920,6 +2172,8 @@ export async function startMqttBridge(): Promise<void> {
     state.runState = 'connected'
     state.lastError = null
     console.log(`[mqtt] connected to ${config.url} (deviceId=${id}, prefix=${config.topicPrefix})`)
+    publishAllEolOccupancyOffline(true)
+    state.eolOccupancyDecisionKey = { left: null, right: null }
     publishAllFusedOccupancyOffline(true)
     state.fusedOccupancyDecisionRevision = { left: null, right: null }
     safePublish(availabilityTopic, 'online', RETAINED_QOS_0)
@@ -1930,6 +2184,7 @@ export async function startMqttBridge(): Promise<void> {
       if (err) console.warn('[mqtt] subscribe cmd/* failed:', err.message)
     })
     void publishState()
+    void publishEolOccupancy()
     void publishFusedOccupancy()
   })
 
@@ -1960,9 +2215,10 @@ export async function startMqttBridge(): Promise<void> {
   state.publishTimer = setInterval(() => {
     void publishState()
   }, STATE_PUBLISH_INTERVAL_MS)
-  state.fusedOccupancyTimer = setInterval(() => {
+  state.occupancyTimer = setInterval(() => {
+    void publishEolOccupancy()
     void publishFusedOccupancy()
-  }, FUSED_OCCUPANCY_PUBLISH_INTERVAL_MS)
+  }, OCCUPANCY_PUBLISH_INTERVAL_MS)
 
   // React to live status frames so HA sees temperature changes immediately
   // rather than waiting for the periodic re-publish.
@@ -1985,9 +2241,9 @@ export async function shutdownMqttBridge(): Promise<void> {
     clearInterval(state.publishTimer)
     state.publishTimer = null
   }
-  if (state.fusedOccupancyTimer) {
-    clearInterval(state.fusedOccupancyTimer)
-    state.fusedOccupancyTimer = null
+  if (state.occupancyTimer) {
+    clearInterval(state.occupancyTimer)
+    state.occupancyTimer = null
   }
   if (state.unsubscribeFrame) {
     try {
@@ -1999,11 +2255,13 @@ export async function shutdownMqttBridge(): Promise<void> {
 
   const c = state.client
   if (c?.connected) {
+    publishAllEolOccupancyOffline(true)
     publishAllFusedOccupancyOffline(true)
   }
   state.client = null
   state.runState = 'stopped'
   if (!c) {
+    resetEolOccupancyState()
     state.fusedOccupancyProvider = null
     state.fusedOccupancyPublishInFlight = false
     state.fusedOccupancyAvailability = { left: null, right: null }
@@ -2031,6 +2289,7 @@ export async function shutdownMqttBridge(): Promise<void> {
       resolve()
     }
   })
+  resetEolOccupancyState()
   state.fusedOccupancyProvider = null
   state.fusedOccupancyPublishInFlight = false
   state.fusedOccupancyAvailability = { left: null, right: null }
@@ -2047,7 +2306,10 @@ export const __test__ = {
   slugify,
   parsePayload,
   buildSchedulesPayload,
+  eolOccupancyDecision,
+  eolOccupancyDecisionPayload,
   fusedOccupancyDecisionPayload,
+  publishEolOccupancy,
   publishFusedOccupancy,
   state,
 }

@@ -196,6 +196,26 @@ export const adaptiveOccupancyState = sqliteTable('adaptive_occupancy_state', {
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 })
 
+// Written by modules/eol-occupancy; one row per side, upserted on every state
+// change and at least every few seconds while the raw streams flow.
+export const eolOccupancyState = sqliteTable('eol_occupancy_state', {
+  side: text('side', { enum: ['left', 'right'] }).primaryKey(),
+  sampleTimestamp: integer('sample_timestamp', { mode: 'timestamp' }).notNull(),
+  state: text('state', { enum: ['empty', 'provisional', 'occupied'] }).notNull(),
+  occupied: integer('occupied', { mode: 'boolean' }).notNull(),
+  confirmed: integer('confirmed', { mode: 'boolean' }).notNull(),
+  degraded: integer('degraded', { mode: 'boolean' }).notNull(),
+  stateSince: integer('state_since', { mode: 'timestamp' }),
+  lastEvent: text('last_event'),
+  lastEventAt: integer('last_event_at', { mode: 'timestamp' }),
+  loadAboveReference: real('load_above_reference'),
+  mv60: real('mv60'),
+  e20Own: real('e20_own'),
+  e20Partner: real('e20_partner'),
+  algorithmVersion: text('algorithm_version').notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+})
+
 export const pumpAlerts = sqliteTable('pump_alerts', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   timestamp: integer('timestamp', { mode: 'timestamp' }).notNull(),

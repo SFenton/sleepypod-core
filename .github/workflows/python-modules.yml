@@ -86,6 +86,11 @@ jobs:
             target: .
             cov_source: .
             deps: ""
+          - name: eol-occupancy
+            workdir: modules/eol-occupancy
+            target: .
+            cov_source: .
+            deps: ""
 
     steps:
       - name: Checkout

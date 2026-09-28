@@ -215,9 +215,12 @@ Assistant if publication stalls.
 | `<prefix>/<device-id>/state/<side>/target-level` | pod → broker | `{"level": -10..10, "targetTemperature": <°F>, "isPowered": <boolean>}` |
 | `<prefix>/<device-id>/state/water-level` | pod → broker | `low` / `ok` / `unknown` |
 | `<prefix>/<device-id>/state/biometrics/<side>` | pod → broker | latest HR / HRV / BR |
-| `<prefix>/<device-id>/state/occupancy/<side>` | pod → broker | non-retained primary fused `ON` / `OFF` heartbeat |
-| `<prefix>/<device-id>/availability/occupancy/<side>` | pod → broker | retained per-side primary decision availability |
-| `<prefix>/<device-id>/state/occupancy/<side>/decision` | pod → broker | retained primary classification, provenance, and certificate diagnostics |
+| `<prefix>/<device-id>/state/occupancy/<side>` | pod → broker | non-retained primary evidence-of-life `ON` / `OFF` heartbeat (confirmed occupancy) |
+| `<prefix>/<device-id>/availability/occupancy/<side>` | pod → broker | retained per-side primary availability (`offline` when stale or degraded) |
+| `<prefix>/<device-id>/state/occupancy/<side>/decision` | pod → broker | retained primary classification, last event, and evidence diagnostics |
+| `<prefix>/<device-id>/state/occupancy/<side>/fused` | pod → broker | non-retained fused-v2 `ON` / `OFF` comparison heartbeat |
+| `<prefix>/<device-id>/availability/occupancy/<side>/fused` | pod → broker | retained per-side fused-v2 availability |
+| `<prefix>/<device-id>/state/occupancy/<side>/fused/decision` | pod → broker | retained fused-v2 classification, provenance, and certificate diagnostics |
 | `<prefix>/<device-id>/state/occupancy/<side>/legacy` | pod → broker | previous movement/calibrated-level detector for comparison and rollback |
 | `<prefix>/<device-id>/state/occupancy/<side>/adaptive` | pod → broker | adaptive load state, classification, and scores for comparison and rollback |
 | `<prefix>/<device-id>/availability/adaptive-occupancy` | pod → broker | `online` while both adaptive side states are fresh, otherwise `offline` |
