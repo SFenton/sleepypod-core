@@ -1,3 +1,4 @@
+import { getTemperatureController } from '@/src/temperature/instance'
 import { Scheduler } from './scheduler'
 import { JobType } from './types'
 import { db } from '@/src/db'
@@ -13,7 +14,7 @@ import {
 import { and, eq, gt } from 'drizzle-orm'
 import { getSharedHardwareClient } from '@/src/hardware/dacMonitor.instance'
 import { encode as cborEncode } from 'cbor-x'
-import { fahrenheitToLevel, HardwareCommand } from '@/src/hardware/types'
+import { HardwareCommand } from '@/src/hardware/types'
 import { broadcastMutationStatus } from '@/src/streaming/broadcastMutationStatus'
 import { cancelAutoOffTimer } from '@/src/services/autoOffWatcher'
 import { markSideMutated } from '@/src/hardware/deviceStateSync'
@@ -325,28 +326,10 @@ export class JobManager {
    * the registered scheduler handler.
    */
   async runTemperatureJob(sched: typeof temperatureSchedules.$inferSelect): Promise<void> {
-    if (await this.hasActiveRunOnceSession(sched.side)) {
-      console.log(`Skipping recurring temp job temp-${sched.id} — run-once session active for ${sched.side}`)
-      return
+    const status = await getTemperatureController().reconcile(sched.side)
+    if (status.source !== 'schedule' || status.blocked) {
+      console.log(`[jobManager] temperature schedule ${sched.id} deferred: ${status.blocked ?? status.source ?? 'no target'}`)
     }
-    await withSideLock(sched.side, async () => {
-      if (!(await this.isSidePowered(sched.side))) {
-        console.log(`Skipping temp job temp-${sched.id} — ${sched.side} is not powered`)
-        return
-      }
-      if (pumpStallShouldBlock(sched.side)) {
-        console.warn(`[jobManager] skipped temp job temp-${sched.id}: pump stall guard blocks ${sched.side}`)
-        return
-      }
-      markSideMutated(sched.side)
-      const client = getSharedHardwareClient()
-      await client.connect()
-      await client.setTemperature(sched.side, sched.temperature)
-      broadcastMutationStatus(sched.side, {
-        targetTemperature: sched.temperature,
-        targetLevel: fahrenheitToLevel(sched.temperature),
-      })
-    })
   }
 
   /**
@@ -378,13 +361,8 @@ export class JobManager {
       markSideMutated(sched.side)
       const client = getSharedHardwareClient()
       await client.connect()
-      await client.setPower(sched.side, true, sched.onTemperature)
+      await getTemperatureController().powerOnLocked(sched.side, sched.onTemperature ?? 75)
       cancelAutoOffTimer(sched.side)
-      const onTemp = sched.onTemperature ?? 75
-      broadcastMutationStatus(sched.side, {
-        targetTemperature: onTemp,
-        targetLevel: fahrenheitToLevel(onTemp),
-      })
     })
   }
 
@@ -416,7 +394,7 @@ export class JobManager {
       await this.markSideOff(sched.side)
       const client = getSharedHardwareClient()
       await client.connect()
-      await client.setPower(sched.side, false)
+      await getTemperatureController().powerOffLocked(sched.side)
       broadcastMutationStatus(sched.side, { targetLevel: 0 })
     })
   }
@@ -451,7 +429,7 @@ export class JobManager {
       const client = getSharedHardwareClient()
       await client.connect()
       if (powered && !stallBlocked) {
-        await client.setTemperature(sched.side, sched.alarmTemperature)
+        await getTemperatureController().reconcileLocked(sched.side)
       }
       else if (powered) {
         console.warn(`[jobManager] skipped alarm temperature alarm-${sched.id}: pump stall guard blocks ${sched.side}; firing vibration only`)
@@ -465,10 +443,6 @@ export class JobManager {
         duration: sched.duration,
       })
       broadcastMutationStatus(sched.side, {
-        ...(powered && !stallBlocked && {
-          targetTemperature: sched.alarmTemperature,
-          targetLevel: fahrenheitToLevel(sched.alarmTemperature),
-        }),
         isAlarmVibrating: true,
       })
     })
@@ -660,7 +634,7 @@ export class JobManager {
               try {
                 const client = getSharedHardwareClient()
                 await client.connect()
-                await client.setPower(side, false)
+                await getTemperatureController().powerOffLocked(side)
                 broadcastMutationStatus(side, { targetLevel: 0 })
               }
               catch (e) {
@@ -699,7 +673,7 @@ export class JobManager {
               try {
                 const client = getSharedHardwareClient()
                 await client.connect()
-                await client.setPower(side, true)
+                await getTemperatureController().powerOnLocked(side)
                 cancelAutoOffTimer(side)
                 broadcastMutationStatus(side, {})
               }
@@ -1106,20 +1080,7 @@ export class JobManager {
         JobType.RUN_ONCE,
         fireDate,
         async () => {
-          await withSideLock(side, async () => {
-            if (pumpStallShouldBlock(side)) {
-              console.warn(`[jobManager] skipped run-once set point: pump stall guard blocks ${side}`)
-              return
-            }
-            markSideMutated(side)
-            const client = getSharedHardwareClient()
-            await client.connect()
-            await client.setTemperature(side, sp.temperature)
-            broadcastMutationStatus(side, {
-              targetTemperature: sp.temperature,
-              targetLevel: fahrenheitToLevel(sp.temperature),
-            })
-          })
+          await getTemperatureController().reconcile(side)
         },
         { sessionId, side, index: i, targetTemperature: sp.temperature },
       )
@@ -1131,7 +1092,7 @@ export class JobManager {
       `runonce-cleanup-${sessionId}`,
       JobType.RUN_ONCE,
       cleanupDate,
-      async () => {
+      async () => withSideLock(side, async () => {
         // Check if session is still active — if cancelled or replaced, bail out
         // to avoid powering off a side that a replacement session is using
         const [current] = await db
@@ -1150,21 +1111,19 @@ export class JobManager {
           .set({ status: 'completed' })
           .where(eq(runOnceSessions.id, sessionId))
 
-        await withSideLock(side, async () => {
-          await this.markSideOff(side)
-          try {
-            const client = getSharedHardwareClient()
-            await client.connect()
-            await client.setPower(side, false)
-            broadcastMutationStatus(side, { targetLevel: 0 })
-          }
-          catch (e) {
-            console.warn(`[runOnce] Failed to power off ${side} at wake:`, e)
-          }
-        })
+        await this.markSideOff(side)
+        try {
+          const client = getSharedHardwareClient()
+          await client.connect()
+          await getTemperatureController().powerOffLocked(side)
+          broadcastMutationStatus(side, { targetLevel: 0 })
+        }
+        catch (e) {
+          console.warn(`[runOnce] Failed to power off ${side} at wake:`, e)
+        }
 
         console.log(`Run-once session ${sessionId} completed — ${side} powered off`)
-      },
+      }),
       { sessionId, side, cleanup: true },
     )
   }
@@ -1172,9 +1131,10 @@ export class JobManager {
   /**
    * Cancel an active run-once session for a side.
    */
-  cancelRunOnceSession(side: 'left' | 'right'): void {
+  cancelRunOnceSession(side: 'left' | 'right', sessionId?: number): void {
     for (const job of this.scheduler.getJobs()) {
-      if (job.type === JobType.RUN_ONCE && job.metadata?.side === side) {
+      if (job.type === JobType.RUN_ONCE && job.metadata?.side === side
+        && (sessionId === undefined || job.metadata.sessionId === sessionId)) {
         this.scheduler.cancelJob(job.id)
       }
     }
@@ -1200,7 +1160,7 @@ export class JobManager {
         try {
           const client = getSharedHardwareClient()
           await client.connect()
-          await client.setPower(session.side, false)
+          await withSideLock(session.side, () => getTemperatureController().powerOffLocked(session.side))
           broadcastMutationStatus(session.side, { targetLevel: 0 })
         }
         catch { /* best effort */ }
