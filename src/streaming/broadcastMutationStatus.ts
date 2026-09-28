@@ -11,13 +11,14 @@
  * HomeKit and gesture writes rely on the poll to surface their changes.
  */
 
+import { getTemperatureControlStatus } from '@/src/temperature/instance'
 import { getDacMonitorIfRunning } from '@/src/hardware/dacMonitor.instance'
 import { broadcastFrame } from './piezoStream'
 import { getPrimeCompletedAt } from '@/src/hardware/primeNotification'
 import { getAllPumpStallNotices } from '@/src/hardware/pumpStallNotification'
 import { getAlarmState } from '@/src/hardware/deviceStateSync'
 import { getSnoozeStatus } from '@/src/hardware/snoozeManager'
-import { recordMutationOverlay } from './mutationOverlay'
+import { applyMutationOverlay, recordMutationOverlay } from './mutationOverlay'
 
 export function broadcastMutationStatus(
   side?: 'left' | 'right',
@@ -33,8 +34,8 @@ export function broadcastMutationStatus(
     const primeCompletedAt = getPrimeCompletedAt()
     const alarmState = getAlarmState()
     const stallNotices = getAllPumpStallNotices()
-    const leftSide = { ...lastStatus.leftSide, isAlarmVibrating: alarmState.left }
-    const rightSide = { ...lastStatus.rightSide, isAlarmVibrating: alarmState.right }
+    const leftSide = { ...applyMutationOverlay('left', { ...lastStatus.leftSide }), isAlarmVibrating: alarmState.left }
+    const rightSide = { ...applyMutationOverlay('right', { ...lastStatus.rightSide }), isAlarmVibrating: alarmState.right }
 
     if (side && sideOverlay) {
       if (side === 'left') Object.assign(leftSide, sideOverlay)
@@ -43,6 +44,7 @@ export function broadcastMutationStatus(
 
     broadcastFrame({
       type: 'deviceStatus',
+      temperatureControl: getTemperatureControlStatus(),
       ts: Date.now(),
       leftSide,
       rightSide,
