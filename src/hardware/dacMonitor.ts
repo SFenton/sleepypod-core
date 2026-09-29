@@ -79,6 +79,9 @@ export class DacMonitor extends EventEmitter {
 
   getLastStatus = (): DeviceStatus | null => this.lastStatus
 
+  /** Epoch ms the last successful status poll started, or null before the first. */
+  getLastPollAt = (): number | null => this.lastPollStartedAt
+
   /** Only reuse a recent, healthy observation with no intervening hardware writes. */
   getFreshStatus = (maxAgeMs: number): DeviceStatus | null => {
     if (this.monitorStatus !== 'running' || !this.client?.isConnected() || this.lastPollStartedAt === null) return null

@@ -248,6 +248,13 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Clear staging/rollback dirs that earlier interrupted runs left on
+# /persistent before measuring free space. Uses the installed copy (the new
+# source isn't downloaded yet); older pods without it just skip this.
+if [ -x /usr/local/bin/sp-storage-cleanup ]; then
+  INSTALL_DIR="$INSTALL_DIR" /usr/local/bin/sp-storage-cleanup --only temp || echo "Warning: storage cleanup failed (continuing)" >&2
+fi
+
 # Pre-flight: disk space
 for space_dir in "$INSTALL_DIR" "$TMPDIR"; do
   DISK_AVAIL=$(df -m "$space_dir" | awk 'NR==2{print $4}')
@@ -310,6 +317,12 @@ else
     const asset = release.assets?.find(a => a.name === "sleepypod-core.tar.gz");
     if (asset && /^https:\/\//.test(asset.browser_download_url)) process.stdout.write(asset.browser_download_url);
   ' "$WORK_DIR/release.json")
+  # Semantic-release tags (vX.Y.Z) are only known here, after the tarball was
+  # built, so record them in .git-info for the UI. Rolling *-latest tags are not versions.
+  RELEASE_VERSION=$(node -e '
+    const tag = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).tag_name ?? "";
+    if (/^v\d+\.\d+\.\d+/.test(tag)) process.stdout.write(tag);
+  ' "$WORK_DIR/release.json" 2>/dev/null || true)
   rm -f "$WORK_DIR/release.json"
   if [ -z "$RELEASE_URL" ]; then
     echo "Error: Release has no sleepypod-core.tar.gz asset. Build/publish the release, or use ./scripts/deploy POD_IP from your computer." >&2
@@ -319,6 +332,13 @@ else
   if ! curl -fSL --connect-timeout 10 --max-time 600 "$RELEASE_URL" | tar xz -C "$WORK_DIR"; then
     echo "Error: Release download/extraction failed. Installed files have not been replaced; retry the update." >&2
     exit 1
+  fi
+  if [ -n "$RELEASE_VERSION" ] && [ -s "$WORK_DIR/.git-info" ]; then
+    node -e '
+      const fs = require("fs");
+      const info = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      fs.writeFileSync(process.argv[1], JSON.stringify({ ...info, version: process.argv[2] }));
+    ' "$WORK_DIR/.git-info" "$RELEASE_VERSION" 2>/dev/null || true
   fi
 fi
 
@@ -548,6 +568,11 @@ if [ -f "$INSTALL_DIR/scripts/lib/maintenance-helpers" ]; then
   install_maintenance_timer
 fi
 
+if [ -f "$INSTALL_DIR/scripts/lib/storage-helpers" ]; then
+  source "$INSTALL_DIR/scripts/lib/storage-helpers"
+  install_storage_cleanup_sudoers
+fi
+
 # Re-block WAN before starting service
 if [ "$WAN_WAS_BLOCKED" = true ]; then
   reload_iptables_helpers
@@ -561,6 +586,12 @@ systemctl start sleepypod.service
 sleep 5
 if systemctl is-active --quiet sleepypod.service; then
   echo "Update complete! Service is running."
+  # Old release builds and the orphaned node_modules eat into the space the
+  # biometrics pruner leaves for raw history. Never fatal: the update is done.
+  # The new copy was installed to /usr/local/bin with the other sp-* tools.
+  if [ -x /usr/local/bin/sp-storage-cleanup ]; then
+    INSTALL_DIR="$INSTALL_DIR" /usr/local/bin/sp-storage-cleanup --exclude "$BACKUP_DIR" || echo "Warning: storage cleanup failed" >&2
+  fi
   exit 0
 fi
 

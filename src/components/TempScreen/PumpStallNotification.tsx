@@ -1,6 +1,7 @@
 'use client'
 
 import { AlertTriangle, X } from 'lucide-react'
+import { Button } from '@/src/components/ds'
 import { trpc } from '@/src/utils/trpc'
 
 interface PumpStallNotificationProps {
@@ -41,39 +42,41 @@ export const PumpStallNotification = ({ side, rpm, trippedAt, alertId, onAction 
   const busy = acknowledge.isPending || dismiss.isPending
 
   return (
-    <div role="alert" className="flex items-center gap-2 rounded-2xl border border-red-500/20 bg-red-950/30 p-3 sm:p-4">
-      <AlertTriangle size={18} className="shrink-0 text-red-400" />
-      <div className="flex-1 text-sm text-red-200">
-        <p className="font-medium">
+    <div role="alert" className="flex flex-wrap items-center gap-2.5 rounded-ctl border border-danger-line px-3 py-2.5">
+      <AlertTriangle size={14} className="shrink-0 text-danger" />
+      <div className="min-w-0 flex-1 text-[13px]">
+        <p className="text-danger">
           {side === 'left' ? 'Left' : 'Right'}
           {' '}
           side powered off — pump stall detected
         </p>
-        <p className="text-xs text-red-200/70">
+        <p className="text-xs text-fg-2">
           Pump RPM dropped to
           {' '}
-          {rpm}
+          <span className="font-mono">{rpm}</span>
           {' '}
           at
           {' '}
-          {formatTime(trippedAt)}
+          <span className="font-mono">{formatTime(trippedAt)}</span>
           . The side is off for safety. Re-enable to retry.
         </p>
       </div>
-      <button
+      <Button
+        size="sm"
+        variant="danger"
         onClick={() => acknowledge.mutate({ side, alertId: alertRef }, { onSettled: onAction })}
         disabled={busy}
-        className="rounded-full bg-red-500/20 px-3 py-2 text-xs text-red-100 transition-all hover:bg-red-500/30 active:scale-95 disabled:opacity-50"
       >
         Re-enable
-      </button>
+      </Button>
       <button
+        type="button"
         onClick={() => dismiss.mutate({ side, alertId: alertRef }, { onSettled: onAction })}
         disabled={busy}
         aria-label="Dismiss pump stall notification"
-        className="flex h-11 w-11 items-center justify-center rounded-full text-red-400/60 transition-all hover:text-red-300 active:scale-90 disabled:opacity-50"
+        className="flex size-8 cursor-pointer items-center justify-center rounded-ctl border-0 bg-transparent text-fg-2 hover:bg-active hover:text-fg disabled:opacity-45"
       >
-        <X size={16} />
+        <X size={14} />
       </button>
     </div>
   )

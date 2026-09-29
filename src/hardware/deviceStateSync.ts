@@ -1,7 +1,7 @@
 import { eq } from 'drizzle-orm'
 import { db, biometricsDb } from '@/src/db'
 import { deviceState } from '@/src/db/schema'
-import { waterLevelReadings, flowReadings } from '@/src/db/biometrics-schema'
+import { waterLevelReadings, flowReadings, primeEvents, thermalState } from '@/src/db/biometrics-schema'
 import { onFrame as pumpStallOnFrame } from './pumpStallGuard'
 import { DEFAULT_HEATING_DURATION } from './types'
 import type { DeviceStatus, Side } from './types'
@@ -30,6 +30,9 @@ export { markSideMutated, _resetMutationStamps } from './sideMutations'
 // freshness window. Observation fields (current temperature, water level)
 // still update normally.
 const MUTATION_FRESHNESS_MS = 5_000
+
+/** thermal_state sample cadence per side while power is unchanged. */
+const THERMAL_SAMPLE_MS = 60_000
 
 function isSideRecentlyMutated(side: Side): boolean {
   return Date.now() - getLastSideMutationAt(side) < MUTATION_FRESHNESS_MS
@@ -94,6 +97,7 @@ interface ObservedSession {
 export class DeviceStateSync {
   private lastWaterLevelWrite = 0
   private lastFlowWrite = 0
+  private lastThermalWrite: Record<Side, { at: number, powered: boolean } | null> = { left: null, right: null }
   private lastAnomalyLog: Record<string, number> = {}
   private prevFlowLeft: number | null = null
   private prevFlowRight: number | null = null
@@ -114,6 +118,7 @@ export class DeviceStateSync {
     const now = Date.now()
     if (this.isPriming && !status.isPriming) {
       this.primeEndedAt = now
+      this.recordPrimeCompleted(now)
     }
     this.isPriming = status.isPriming
     this.recordSideStatus('left', status.leftSide, now)
@@ -200,6 +205,9 @@ export class DeviceStateSync {
     const isNowPowered = durationExpired ? false : sideStatus.currentLevel !== 0
 
     const skipPoweredFields = isSideRecentlyMutated(side)
+    // When duration has expired, clear the target temperature so the UI
+    // doesn't show a stale "warming to X°F" when the pod is actually neutral.
+    const targetTemp = durationExpired ? null : sideStatus.targetTemperature
 
     db.transaction((tx) => {
       const [prev] = tx
@@ -222,10 +230,6 @@ export class DeviceStateSync {
       else if (wasPowered && !isNowPowered) {
         poweredOnAt = null
       }
-
-      // When duration has expired, clear the target temperature so the UI
-      // doesn't show a stale "warming to X°F" when the pod is actually neutral.
-      const targetTemp = durationExpired ? null : sideStatus.targetTemperature
 
       // If a mutation just landed, the firmware status is likely stale —
       // preserve the mutation's powered-state fields and only refresh
@@ -258,6 +262,49 @@ export class DeviceStateSync {
         })
         .run()
     })
+
+    this.recordThermalState(side, now.getTime(), {
+      powered: isNowPowered,
+      target: targetTemp,
+      current: sideStatus.currentTemperature,
+    })
+  }
+
+  /** Persist a finished prime so the Dashboard can tell when the pod last primed. */
+  private recordPrimeCompleted(now: number): void {
+    try {
+      biometricsDb.insert(primeEvents).values({ timestamp: new Date(now) }).run()
+    }
+    catch (error) {
+      console.error('DeviceStateSync: failed to record prime completion:', error instanceof Error ? error.message : error)
+    }
+  }
+
+  /**
+   * Sample regulation state into thermal_state for the Thermal history: once
+   * a minute per side, and straight away when power flips so power-on times
+   * are exact. Uses the firmware-derived state, not the mutation-shielded
+   * device_state write, so a pending command can't smear the history.
+   */
+  private recordThermalState(side: Side, now: number, state: { powered: boolean, target: number | null, current: number | null }): void {
+    const last = this.lastThermalWrite[side]
+    if (last && last.powered === state.powered && now - last.at < THERMAL_SAMPLE_MS) return
+    try {
+      biometricsDb
+        .insert(thermalState)
+        .values({
+          timestamp: new Date(now),
+          side,
+          isPowered: state.powered,
+          targetTempF: state.powered ? state.target : null,
+          currentTempF: state.powered ? state.current : null,
+        })
+        .run()
+      this.lastThermalWrite[side] = { at: now, powered: state.powered }
+    }
+    catch (error) {
+      console.error('DeviceStateSync: failed to write thermal state:', error instanceof Error ? error.message : error)
+    }
   }
 
   /** Write water level to biometrics DB, rate-limited to once per 60s. */

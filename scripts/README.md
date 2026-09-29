@@ -173,6 +173,7 @@ flowchart TD
 After installation (installed from `scripts/bin/`):
 
 - `sp-status` - Report service + firmware variant + biometrics pipeline (old `.RAW` shim vs mid-era direct `.RAW` vs new NATS JetStream), module health, and firmware-side service rollup. Output is paste-friendly for support threads.
+- `sp-storage-cleanup` - Remove sleepypod's own leftovers on `/persistent` (stale rollback/staging dirs, old `sleepypod-releases/*` builds, orphaned relocated `node_modules`; old DB backups with `--include-db-backups`). `--dry-run --json` prints the plan. Run by `sp-update` and by System → Storage.
 - `sp-restart` - Restart sleepypod + reconnect frankenfirmware
 - `sp-logs` - View live logs
 - `sp-bundle-logs` - One-shot diagnostic capture (`/tmp/sleepypod-bundle-<ts>.tar.gz`); redacts secrets by default, pass `--no-redact` for raw

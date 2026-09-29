@@ -548,7 +548,15 @@ describe('system.getVersion', () => {
       commitHash: 'abc123',
       commitTitle: 'fix: thing',
       buildDate: '2026-04-01',
+      version: null,
     })
+  })
+
+  it('returns the release version when .git-info records a vX.Y.Z tag, ignoring anything else', async () => {
+    fsPromisesMock.readFile.mockResolvedValue(JSON.stringify({ branch: 'main', commitHash: 'abc123', commitTitle: 't', buildDate: 'd', version: 'v2.8.0' }))
+    expect((await caller.getVersion({})).version).toBe('v2.8.0')
+    fsPromisesMock.readFile.mockResolvedValue(JSON.stringify({ branch: 'dev', commitHash: 'abc123', commitTitle: 't', buildDate: 'd', version: 'dev-latest' }))
+    expect((await caller.getVersion({})).version).toBeNull()
   })
 
   it('returns "unknown" placeholders when .git-info is missing', async () => {
@@ -556,7 +564,7 @@ describe('system.getVersion', () => {
     const result = await caller.getVersion({})
     expect(result).toEqual({
       branch: 'unknown', commitHash: 'unknown',
-      commitTitle: 'unknown', buildDate: 'unknown',
+      commitTitle: 'unknown', buildDate: 'unknown', version: null,
     })
   })
 
@@ -571,7 +579,7 @@ describe('system.getVersion', () => {
     const result = await caller.getVersion({})
     expect(result).toEqual({
       branch: 'unknown', commitHash: 'unknown',
-      commitTitle: 'unknown', buildDate: 'unknown',
+      commitTitle: 'unknown', buildDate: 'unknown', version: null,
     })
   })
 
