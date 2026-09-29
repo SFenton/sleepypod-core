@@ -3,22 +3,27 @@
 import type { LucideIcon } from 'lucide-react'
 import type { ComponentProps, CSSProperties, ReactNode } from 'react'
 import { cn } from '@/lib/utils'
+import { skyHue, tempHue } from '@/src/lib/tempColors'
 
 /* ─── Card ──────────────────────────────────────────────────────────────
    1px hairline, 12px radius, 16/18 padding, 12 gap, no shadow.
-   highlight = green hairline (active item). dashed = paused / "add" slot. */
+   highlight = green hairline (active item). dashed = paused / "add" slot.
+   backdrop = a layer painted behind the content, clipped to the card
+   (e.g. <TempBackdrop />). */
 export interface CardProps extends ComponentProps<'div'> {
   dashed?: boolean
   flat?: boolean
   highlight?: boolean
   tone?: 'warn' | 'danger'
+  backdrop?: ReactNode
 }
 
-export function Card({ dashed, flat, highlight, tone, className, ...props }: CardProps) {
+export function Card({ dashed, flat, highlight, tone, backdrop, className, children, ...props }: CardProps) {
   return (
     <div
       className={cn(
         'flex min-w-0 flex-col gap-3 rounded-card border px-[18px] py-4',
+        backdrop != null && 'relative isolate overflow-hidden',
         dashed ? 'border-dashed' : 'border-solid',
         highlight
           ? 'border-ok-line'
@@ -32,7 +37,42 @@ export function Card({ dashed, flat, highlight, tone, className, ...props }: Car
         className,
       )}
       {...props}
-    />
+    >
+      {backdrop}
+      {children}
+    </div>
+  )
+}
+
+/**
+ * Temperature backdrop for a Card: a wash for the time of day across the top
+ * (indigo night, rose-amber dawn, pale sky by day, violet dusk) and a glow
+ * rising from below tinted by the temperature (blue cool → violet neutral →
+ * rose warm). Both transition when their inputs change. `off` swaps both for
+ * a flat dark gradient (side powered off).
+ */
+export function TempBackdrop({ tempF, minutes, off }: {
+  /** Set point driving the glow, °F; null hides it. */
+  tempF: number | null
+  /** Time of day for the wash, minutes past midnight. */
+  minutes: number
+  off?: boolean
+}) {
+  const layer = 'pointer-events-none absolute inset-0 -z-10 transition-[background-color,opacity] duration-700'
+  return (
+    <>
+      <div
+        aria-hidden
+        className={cn('sp-temp-sky', layer, off && 'opacity-0')}
+        style={{ '--h': skyHue(minutes) } as CSSProperties}
+      />
+      <div
+        aria-hidden
+        className={cn('sp-temp-glow', layer, (off || tempF == null) && 'opacity-0')}
+        style={tempF == null ? undefined : ({ '--h': tempHue(tempF) } as CSSProperties)}
+      />
+      <div aria-hidden className={cn('sp-temp-off', layer, !off && 'opacity-0')} />
+    </>
   )
 }
 

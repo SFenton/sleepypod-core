@@ -1,14 +1,17 @@
 'use client'
 
-import { Minus, Plane, Plus, Power } from 'lucide-react'
+import { Minus, Plus, Power } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { Card, IconButton, StatusDot } from '@/src/components/ds'
-import { ACCENT_VAR, TempControl, directionFor } from '@/src/components/TempControl/TempControl'
+import { Card, IconButton, StatusDot, TempBackdrop } from '@/src/components/ds'
+import { TempControl } from '@/src/components/TempControl/TempControl'
 import type { TempUnit } from '@/src/lib/tempUtils'
 import type { ControlVariant, TempDisplay } from '@/src/providers/PrefsProvider'
 import type { Side } from '@/src/providers/SideProvider'
 import type { TemperatureControlStatus } from '@/src/temperature/controller'
+import type { NightPhaseKey } from './nightPhases'
 import { HoldDurationRow, HoldStatus } from './TemperatureHoldControls'
+import { TempStepper, stepperBackdrop, type StepperTab } from './TempStepper'
+import type { SideNightPhases } from './useNightPhases'
 
 /** 'in' / 'out' when occupancy can be sensed; null = unknown (claim omitted). */
 export type Presence = 'in' | 'out' | null
@@ -36,6 +39,14 @@ export interface SideCardProps {
   onResumed: () => void
   /** Phones show one side at a time; the other card is hidden below 900px. */
   hiddenOnPhone?: boolean
+  /** Stepper variant only: Now / Night / Dawn selection and tonight's schedule. */
+  stepper?: {
+    tab: StepperTab
+    onTabChange: (tab: StepperTab) => void
+    schedule: SideNightPhases
+    onStepPhase: (phase: NightPhaseKey, delta: number) => void
+    now: Date
+  }
 }
 
 function sideLine(side: Side, presence: Presence, away: boolean) {
@@ -46,9 +57,10 @@ function sideLine(side: Side, presence: Presence, away: boolean) {
 }
 
 /**
- * One side of the bed: header, ownership line, dial/slider, −/power/+ and the
- * hold duration. Desktop (≥900px) shows the name header and 48px buttons;
- * phones fold the side line into the ownership row and use 52/60/52 buttons.
+ * One side of the bed: header (name + power), ownership line, the control
+ * (dial/slider with −/+ below, or the Now/Night/Dawn stepper) and the
+ * hold duration. Phones also fold the side line into the ownership row and
+ * use 52px −/+ buttons (48px on desktop).
  */
 export function SideCard({
   side,
@@ -72,8 +84,9 @@ export function SideCard({
   onPower,
   onResumed,
   hiddenOnPhone,
+  stepper,
 }: SideCardProps) {
-  const accent = ACCENT_VAR[directionFor(targetF, bedF)]
+  const isStepper = variant === 'stepper' && stepper != null
   const line = sideLine(side, presence, away)
 
   return (
@@ -81,14 +94,24 @@ export function SideCard({
       role="group"
       aria-label={`${name} (${side})`}
       className={cn('gap-3.5 p-[18px] min-[900px]:p-5', hiddenOnPhone && 'max-[899px]:hidden')}
+      backdrop={isStepper ? <TempBackdrop {...stepperBackdrop({ ...stepper, targetF, isOn })} /> : undefined}
     >
-      <div className="hidden items-center gap-2 min-[900px]:flex">
+      <div className="flex items-center gap-2">
         <span className="truncate text-[15px] font-medium">{name}</span>
         {!away && presence && <StatusDot tone={presence === 'in' ? 'ok' : 'muted'} />}
-        <span className="sp-label ml-auto flex shrink-0 items-center gap-1.5">
-          {away && <Plane size={12} />}
-          {line}
-        </span>
+        <button
+          type="button"
+          aria-label={isOn ? 'Turn off' : 'Turn on'}
+          aria-pressed={isOn}
+          disabled={powerDisabled}
+          onClick={onPower}
+          className={cn(
+            'ml-auto flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-full border bg-black/20 transition-colors hover:bg-white/[0.08] disabled:cursor-default disabled:opacity-45',
+            !isOn ? 'border-fg-2 text-fg-2' : side === 'left' ? 'border-side-left text-side-left' : 'border-side-right text-side-right',
+          )}
+        >
+          <Power size={16} />
+        </button>
       </div>
 
       <HoldStatus
@@ -99,47 +122,57 @@ export function SideCard({
       />
 
       <div className="flex justify-center min-[900px]:mt-3">
-        <TempControl
-          variant={variant}
-          display={display}
-          targetF={targetF}
-          bedF={bedF}
-          unit={unit}
-          power={isOn}
-          onChange={onPreview}
-          onCommit={onCommit}
-          statusOverride={isOn ? undefined : 'OFF'}
-        />
+        {isStepper
+          ? (
+              <TempStepper
+                tab={stepper.tab}
+                onTabChange={stepper.onTabChange}
+                schedule={stepper.schedule}
+                onStepPhase={stepper.onStepPhase}
+                unit={unit}
+                display={display}
+                targetF={targetF}
+                bedF={bedF}
+                isOn={isOn}
+                nowDisabled={stepDisabled}
+                onStepNow={onStep}
+              />
+            )
+          : (
+              <TempControl
+                variant={variant === 'stepper' ? 'dial' : variant}
+                display={display}
+                targetF={targetF}
+                bedF={bedF}
+                unit={unit}
+                power={isOn}
+                onChange={onPreview}
+                onCommit={onCommit}
+                statusOverride={isOn ? undefined : 'OFF'}
+              />
+            )}
       </div>
 
-      <div className="flex items-center justify-center gap-5 min-[900px]:gap-4">
-        <IconButton
-          icon={Minus}
-          size={52}
-          label="Cooler"
-          className="min-[900px]:!size-12"
-          disabled={stepDisabled}
-          onClick={() => onStep(-1)}
-        />
-        <IconButton
-          icon={Power}
-          size={60}
-          label={isOn ? 'Turn off' : 'Turn on'}
-          aria-pressed={isOn}
-          accent={isOn ? accent : undefined}
-          className="min-[900px]:!size-12"
-          disabled={powerDisabled}
-          onClick={onPower}
-        />
-        <IconButton
-          icon={Plus}
-          size={52}
-          label="Warmer"
-          className="min-[900px]:!size-12"
-          disabled={stepDisabled}
-          onClick={() => onStep(1)}
-        />
-      </div>
+      {!isStepper && (
+        <div className="flex items-center justify-center gap-5 min-[900px]:gap-4">
+          <IconButton
+            icon={Minus}
+            size={52}
+            label="Cooler"
+            className="min-[900px]:!size-12"
+            disabled={stepDisabled}
+            onClick={() => onStep(-1)}
+          />
+          <IconButton
+            icon={Plus}
+            size={52}
+            label="Warmer"
+            className="min-[900px]:!size-12"
+            disabled={stepDisabled}
+            onClick={() => onStep(1)}
+          />
+        </div>
+      )}
 
       <HoldDurationRow holdMinutes={holdMinutes} onDurationChange={onHoldChange} />
     </Card>
