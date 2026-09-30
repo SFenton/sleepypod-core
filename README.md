@@ -1,3 +1,7 @@
+<p align="center">
+  <a href="https://sleepypod.github.io/"><img src="public/logo.png" width="80" height="80" alt="sleepypod" /></a>
+</p>
+
 # sleepypod — local-first Pod mattress controller
 
 [![CI](https://github.com/sleepypod/core/actions/workflows/test.yml/badge.svg?branch=dev)](https://github.com/sleepypod/core/actions/workflows/test.yml)
@@ -8,29 +12,46 @@
 
 Self-hosted control app for Pod 3, 4, and 5. Runs on the Pod's stock embedded Linux — replaces the cloud-bound controller with a local web UI, scheduler, on-device biometrics, and native integrations for Home Assistant (MQTT) and Apple Home (HomeKit).
 
-<p align="center">
-  <img src="docs/images/temperature-control.png" width="280" alt="Temperature control" />
-  <img src="docs/images/schedule.png" width="280" alt="Sleep schedule" />
-</p>
+**User docs:** [sleepypod.github.io](https://sleepypod.github.io/)
 
 <p align="center">
-  <img src="docs/images/ux-walkthrough-1.gif" width="280" alt="UX walkthrough 1" />
-  <img src="docs/images/ux-walkthrough-2.gif" width="280" alt="UX walkthrough 2" />
-  <img src="docs/images/ux-walkthrough-3.gif" width="280" alt="UX walkthrough 3" />
+  <a href="https://sleepypod.github.io/core/"><img src="docs/images/core-temperature.png" width="1000" alt="sleepypod core web UI with per-side temperature controls, sidebar navigation, and the schedule and sleep timeline" /></a>
 </p>
 
+The web UI brings temperature, schedules, Autopilot, sleep, and system diagnostics into one place. The optional Now / Night / Dawn stepper separates immediate manual holds from saved schedule edits. Choose it in **Settings → Appearance**. Control the same Pod from the [iOS app](https://sleepypod.github.io/ios/) or a bedside [M5 rotary dial](https://sleepypod.github.io/dial/).
+
 <p align="center">
-  <a href="https://github.com/sleepypod/core/issues">Issues</a> · <a href="#installation">Install guide</a>
+  <a href="https://sleepypod.github.io/ios/"><img src="docs/images/ios-temperature.png" width="220" alt="sleepypod iOS app temperature control" /></a>
+  &nbsp;&nbsp;
+  <a href="https://sleepypod.github.io/dial/"><img src="docs/images/dial-cooling.png" width="220" alt="sleepypod rotary dial showing a cooling target" /></a>
+</p>
+
+<sub>Real product captures from the [documentation site](https://github.com/sleepypod/sleepypod.github.io/blob/d3b4e86e0153944fba3c92fe96f04aca34db7165/capture/manifest.json). The web UI capture uses disposable demo data. See [asset provenance](docs/images/README.md).</sub>
+
+<p align="center">
+  <a href="https://sleepypod.github.io/">Docs</a> · <a href="https://github.com/sleepypod/core/issues">Issues</a> · <a href="#installation">Install guide</a>
 </p>
 
 ---
 
+## Guides
+
+- [Temperature controls and manual holds](https://sleepypod.github.io/core/temperature/)
+- [Schedules and alarms](https://sleepypod.github.io/core/schedules/) · [Autopilot](https://sleepypod.github.io/core/autopilot/)
+- [System diagnostics](https://sleepypod.github.io/core/system/) · [Settings, backup, and maintenance](https://sleepypod.github.io/core/settings/)
+- [Build, test, and release workflows](https://sleepypod.github.io/developers/workflows/)
+- [Sensor pipeline and calibration](https://sleepypod.github.io/developers/sensor-pipeline/) · [Technical source library](https://sleepypod.github.io/developers/source-library/)
+
 ## Installation
 
-Requires a Pod running its stock embedded Linux. Run as root on the device:
+Starting with a stock Pod? Follow **[Open your Pod and get root access](https://sleepypod.github.io/core/root-access/)** first: parts list, enclosure photos, Tag-Connect wiring, serial login, and the handoff to installation. See [first-time installation](docs/INSTALLATION.md) for the model-specific starting points. You do not need to install free-sleep first.
+
+Once you have a root shell on the Pod, run the installer **on the device**, not on your computer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sleepypod/core/main/scripts/install | sudo bash
+curl -fsSL https://raw.githubusercontent.com/sleepypod/core/main/scripts/install -o /tmp/sleepypod-install
+less /tmp/sleepypod-install
+bash /tmp/sleepypod-install
 ```
 
 The script:

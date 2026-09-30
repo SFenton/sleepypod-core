@@ -13,6 +13,8 @@ See main [installation guide](../docs/INSTALLATION.md) for hardware setup.
 
 ## Getting root on Pod 5
 
+For the full illustrated procedure, start with **[Open your Pod and get root access](https://sleepypod.github.io/core/root-access/)**. It covers hardware, wiring, the slot-A check, every shell command, and installation directly from serial. The notes below are implementation background; they are not a substitute for that first-time walkthrough.
+
 Initial root access on a Pod 5 is a JTAG bootstrap — there is no
 software-only escalation. At a high level: tear down to the circuit board,
 connect a TC2070-IDC + FTDI FT232RL to the JTAG header, open a 921600-baud
@@ -173,6 +175,7 @@ flowchart TD
 After installation (installed from `scripts/bin/`):
 
 - `sp-status` - Report service + firmware variant + biometrics pipeline (old `.RAW` shim vs mid-era direct `.RAW` vs new NATS JetStream), module health, and firmware-side service rollup. Output is paste-friendly for support threads.
+- `sp-storage-cleanup` - Remove sleepypod's own leftovers on `/persistent` (stale rollback/staging dirs, old `sleepypod-releases/*` builds, orphaned relocated `node_modules`; old DB backups with `--include-db-backups`). `--dry-run --json` prints the plan. Run by `sp-update` and by System → Storage.
 - `sp-restart` - Restart sleepypod + reconnect frankenfirmware
 - `sp-logs` - View live logs
 - `sp-bundle-logs` - One-shot diagnostic capture (`/tmp/sleepypod-bundle-<ts>.tar.gz`); redacts secrets by default, pass `--no-redact` for raw

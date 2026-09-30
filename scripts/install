@@ -812,10 +812,15 @@ fi
 # reboots on schedule (observed: 5-day uptime with reboot_daily on). Scope is
 # exactly `systemctl reboot` — both common systemctl paths so the rule matches
 # whichever the image ships. secure_path (below) lets sudo resolve it.
+# The restart rules back System → Health's "Restart <module>" fix, scoped to
+# exactly the three biometrics module units.
 SUDOERS_FILE="/etc/sudoers.d/sleepypod-update"
 SUDOERS_CONTENT='Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 sleepypod ALL=(root) NOPASSWD: /usr/local/bin/sp-update
-sleepypod ALL=(root) NOPASSWD: /bin/systemctl reboot, /usr/bin/systemctl reboot'
+sleepypod ALL=(root) NOPASSWD: /bin/systemctl reboot, /usr/bin/systemctl reboot
+sleepypod ALL=(root) NOPASSWD: /bin/systemctl restart sleepypod-piezo-processor.service, /usr/bin/systemctl restart sleepypod-piezo-processor.service
+sleepypod ALL=(root) NOPASSWD: /bin/systemctl restart sleepypod-sleep-detector.service, /usr/bin/systemctl restart sleepypod-sleep-detector.service
+sleepypod ALL=(root) NOPASSWD: /bin/systemctl restart sleepypod-environment-monitor.service, /usr/bin/systemctl restart sleepypod-environment-monitor.service'
 SUDOERS_TMP=$(mktemp)
 printf '%s\n' "$SUDOERS_CONTENT" > "$SUDOERS_TMP"
 chmod 0440 "$SUDOERS_TMP"
@@ -1095,15 +1100,27 @@ else
   fi
 
   if [ -n "${RELEASE_API:-}" ]; then
-    RELEASE_URL=$(curl -sf "$RELEASE_API" \
+    RELEASE_JSON=$(curl -sf "$RELEASE_API" || true)
+    RELEASE_URL=$(printf '%s' "$RELEASE_JSON" \
       | grep -om1 '"browser_download_url": *"[^"]*sleepypod-core\.tar\.gz"' \
       | grep -o 'https://[^"]*' || true)
+    # Semantic-release tag (vX.Y.Z), recorded in .git-info for the UI; rolling *-latest tags are skipped.
+    RELEASE_VERSION=$(printf '%s' "$RELEASE_JSON" \
+      | grep -om1 '"tag_name": *"v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][^"]*"' \
+      | grep -o 'v[0-9][^"]*' || true)
 
     if [ -n "$RELEASE_URL" ]; then
       echo "Downloading CI release..."
       if curl -fSL "$RELEASE_URL" | tar xz -C "$DOWNLOAD_DIR"; then
         HAS_BUILD=true
         echo "CI release downloaded (pre-built)."
+        if [ -n "$RELEASE_VERSION" ] && [ -s "$DOWNLOAD_DIR/.git-info" ]; then
+          node -e '
+            const fs = require("fs");
+            const info = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            fs.writeFileSync(process.argv[1], JSON.stringify({ ...info, version: process.argv[2] }));
+          ' "$DOWNLOAD_DIR/.git-info" "$RELEASE_VERSION" 2>/dev/null || true
+        fi
       else
         # Clean partial download before fallback
         find "$DOWNLOAD_DIR" -mindepth 1 -delete 2>/dev/null || true
@@ -1473,6 +1490,9 @@ fi
 # Housekeeping runs after boot, independently of API readiness.
 source "$INSTALL_DIR/scripts/lib/maintenance-helpers"
 install_maintenance_timer
+
+source "$INSTALL_DIR/scripts/lib/storage-helpers"
+install_storage_cleanup_sudoers
 
 # Reload systemd and enable service
 echo "Enabling service..."

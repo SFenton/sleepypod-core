@@ -124,6 +124,7 @@ describe('calibration.getStatus', () => {
       createdAt: new Date(10),
       expiresAt: new Date(20),
       errorMessage: null,
+      parameters: null,
     }
     dbMock.profileRows.push(
       { ...base, id: 1, sensorType: 'capacitance' },
@@ -136,6 +137,16 @@ describe('calibration.getStatus', () => {
       piezo: { ...base, id: 2, sensorType: 'piezo' },
       temperature: { ...base, id: 3, sensorType: 'temperature' },
     })
+  })
+
+  it('passes the calibrator baseline through as parameters', async () => {
+    dbMock.profileRows.push({
+      id: 4, side: 'left', sensorType: 'piezo', status: 'completed', qualityScore: 1, samplesUsed: 300,
+      createdAt: new Date(10), expiresAt: new Date(20), errorMessage: null,
+      parameters: { presence_threshold: 50000, baseline_mean_range: 1200 },
+    })
+    const result = await caller.getStatus({ side: 'left' })
+    expect(result.piezo?.parameters).toEqual({ presence_threshold: 50000, baseline_mean_range: 1200 })
   })
 })
 

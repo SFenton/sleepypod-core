@@ -126,14 +126,25 @@ describe('pruneOldBiometrics', () => {
       { timestamp: fresh, type: 'stall_right' },
     ]).run()
 
+    db.insert(schema.thermalState).values([
+      { timestamp: old, side: 'left', isPowered: true },
+      { timestamp: fresh, side: 'left', isPowered: false },
+    ]).run()
+
     db.insert(schema.vitalsQuality).values([
       { vitalsId: 1, side: 'left', timestamp: old, qualityScore: 0.5 },
       { vitalsId: 2, side: 'left', timestamp: fresh, qualityScore: 0.9 },
     ]).run()
 
+    // Pruned by when the run last held, not when it started.
+    db.insert(schema.healthRuns).values([
+      { checkId: 'dac', status: 'ok', startedAt: old, lastSeenAt: old },
+      { checkId: 'dac', status: 'ok', startedAt: old, lastSeenAt: fresh },
+    ]).run()
+
     const result = pruneOldBiometrics(cutoff, db)
 
-    expect(result.rowsDeleted).toBe(9)
+    expect(result.rowsDeleted).toBe(11)
     expect(result.perTable).toEqual({
       vitals: 1,
       vitals_quality: 1,
@@ -144,6 +155,8 @@ describe('pruneOldBiometrics', () => {
       ambient_light: 1,
       water_level_readings: 1,
       pump_alerts: 1,
+      thermal_state: 1,
+      health_runs: 1,
     })
 
     // Verify fresh rows remain
@@ -250,6 +263,8 @@ describe('pruneOldBiometrics', () => {
       ambient_light: 0,
       water_level_readings: 0,
       pump_alerts: 0,
+      thermal_state: 0,
+      health_runs: 0,
     })
   })
 

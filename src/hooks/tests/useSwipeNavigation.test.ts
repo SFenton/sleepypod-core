@@ -190,7 +190,7 @@ describe('useSwipeNavigation', () => {
       result.current.onTouchStart(touchEvent([{ clientX: 200, clientY: 100 }]))
       result.current.onTouchEnd(touchEvent([{ clientX: 50, clientY: 100 }]))
     })
-    expect(navMock.push).toHaveBeenCalledWith('/en/data')
+    expect(navMock.push).toHaveBeenCalledWith('/en/sleep')
   })
 
   it('does not navigate from an unknown path', () => {

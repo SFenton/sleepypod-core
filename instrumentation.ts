@@ -20,6 +20,8 @@ import { getAutomationEngine, shutdownAutomationEngine } from '@/src/automation'
 import { startTemperatureController, stopTemperatureController } from '@/src/temperature/instance'
 import { closeDatabase, closeBiometricsDatabase } from '@/src/db'
 import { startBiometricsRetention, stopBiometricsRetention } from '@/src/db/retention'
+import { startAutomationRunsRetention, stopAutomationRunsRetention } from '@/src/db/automationRunsRetention'
+import { startHealthSampler, stopHealthSampler } from '@/src/lib/healthSampler'
 import { getDacMonitor, shutdownDacMonitor } from '@/src/hardware/dacMonitor.instance'
 import { startPiezoStreamServer, shutdownPiezoStreamServer } from '@/src/streaming/piezoStream'
 import { startBonjourAnnouncement, stopBonjourAnnouncement } from '@/src/streaming/bonjourAnnounce'
@@ -130,9 +132,11 @@ async function gracefulShutdown(signal: string): Promise<void> {
     console.error('Error shutting down DacMonitor:', error)
   }
 
-  // Step 6: Stop biometrics retention loop before closing DB
+  // Step 6: Stop biometrics retention and health sampling before closing DB
   try {
     stopBiometricsRetention()
+    stopAutomationRunsRetention()
+    stopHealthSampler()
   }
   catch (error) {
     console.error('Error stopping biometrics retention:', error)
@@ -305,6 +309,12 @@ async function initializeBackgroundServices(): Promise<void> {
   try {
     await initializeHardware()
     if (isShuttingDown) return
+
+    // Record System → Health's data-path history once a minute (non-blocking).
+    // Started before the scheduler so a scheduler that fails to load still
+    // leaves a history of the failure.
+    startHealthSampler()
+
     const schedulerStartedAt = performance.now()
     console.log('Initializing job scheduler...')
     const jobManager = await withRetry(
@@ -370,6 +380,7 @@ async function initializeBackgroundServices(): Promise<void> {
 
     // Start biometrics time-series retention loop (non-blocking)
     startBiometricsRetention()
+    startAutomationRunsRetention()
 
     // Boot the Autopilot rules engine beside the scheduler (non-blocking).
     // Shares the same hardware path; no-op until automations are created.

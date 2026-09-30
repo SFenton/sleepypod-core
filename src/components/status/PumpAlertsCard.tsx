@@ -2,7 +2,8 @@
 
 import { useCallback } from 'react'
 import { trpc } from '@/src/utils/trpc'
-import { AlertTriangle, X } from 'lucide-react'
+import { TriangleAlert, X } from 'lucide-react'
+import { Button, Card, CardHeader, StatusDot } from '@/src/components/ds'
 
 function formatAge(timestamp: Date): string {
   const ageMs = Date.now() - new Date(timestamp).getTime()
@@ -62,54 +63,43 @@ export function PumpAlertsCard() {
   if (activeAlerts.length === 0) return null
 
   return (
-    <div className="rounded-2xl bg-zinc-900/80 p-4 space-y-3">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <AlertTriangle size={16} className="text-red-400" />
-          <span className="text-sm font-medium text-white">Pump Alerts</span>
-        </div>
-        {activeAlerts.length > 1 && (
-          <button
-            onClick={handleDismissAll}
-            disabled={dismissAlertMutation.isPending}
-            className="rounded-lg px-2 py-1 text-[11px] text-zinc-400 transition-colors active:bg-zinc-800 disabled:opacity-50"
-          >
+    <Card tone="danger">
+      <CardHeader
+        title="Pump alerts"
+        icon={TriangleAlert}
+        iconClassName="text-danger"
+        right={activeAlerts.length > 1 && (
+          <Button size="sm" variant="ghost" onClick={handleDismissAll} disabled={dismissAlertMutation.isPending}>
             Dismiss all
-          </button>
+          </Button>
         )}
-      </div>
+      />
 
-      {/* Active alert rows */}
-      <div className="space-y-1.5">
-        {activeAlerts.map(alert => (
-          <div
-            key={alert.id}
-            className="flex items-center gap-2 rounded-lg bg-red-900/20 px-3 py-2"
+      {activeAlerts.map(alert => (
+        <div key={alert.id} className="flex items-center gap-2.5 border-t border-line pt-3">
+          <StatusDot tone="danger" />
+          <span className="flex-1 font-mono text-xs">
+            {alert.side === 'left' ? 'Left' : alert.side === 'right' ? 'Right' : 'Both'}
+            {' — '}
+            {alert.rpm != null ? `${alert.rpm} rpm` : alert.type}
+            {' — '}
+            {formatAge(alert.timestamp)}
+          </span>
+          <button
+            type="button"
+            onClick={() => handleDismissAlert(alert.id)}
+            disabled={dismissAlertMutation.isPending}
+            aria-label={`Dismiss pump alert ${alert.id}`}
+            className="cursor-pointer border-0 bg-transparent p-0 text-fg-2 hover:text-fg disabled:opacity-45"
           >
-            <AlertTriangle size={12} className="shrink-0 text-red-400" />
-            <span className="flex-1 text-[11px] text-red-300">
-              {alert.side === 'left' ? 'Left' : alert.side === 'right' ? 'Right' : 'Both'}
-              {' — '}
-              {alert.rpm != null ? `${alert.rpm} rpm` : alert.type}
-              {' — '}
-              {formatAge(alert.timestamp)}
-            </span>
-            <button
-              onClick={() => handleDismissAlert(alert.id)}
-              disabled={dismissAlertMutation.isPending}
-              aria-label={`Dismiss pump alert ${alert.id}`}
-              className="shrink-0 rounded p-1 text-zinc-500 active:bg-zinc-700"
-            >
-              <X size={12} />
-            </button>
-          </div>
-        ))}
-      </div>
+            <X size={14} />
+          </button>
+        </div>
+      ))}
 
-      <p className="text-[10px] text-zinc-600">
+      <p className="text-xs text-fg-2">
         Unresolved alerts re-block their side at the next service restart. Dismiss alerts that no longer reflect the pump&apos;s state.
       </p>
-    </div>
+    </Card>
   )
 }

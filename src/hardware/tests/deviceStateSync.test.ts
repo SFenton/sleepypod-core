@@ -49,6 +49,17 @@ function resetSchema(): void {
   ;(biometricsSqlite as any).exec(`
     DROP TABLE IF EXISTS water_level_readings;
     DROP TABLE IF EXISTS flow_readings;
+    DROP TABLE IF EXISTS thermal_state;
+    DROP TABLE IF EXISTS prime_events;
+    CREATE TABLE prime_events (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL);
+    CREATE TABLE thermal_state (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp INTEGER NOT NULL,
+      side TEXT NOT NULL,
+      is_powered INTEGER NOT NULL,
+      target_temp_f REAL,
+      current_temp_f REAL
+    );
     CREATE TABLE water_level_readings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       timestamp INTEGER NOT NULL,
@@ -910,5 +921,62 @@ describe('DeviceStateSync — sync targetTemperature behaviour without mutation'
     s.podVersion = PodVersion.POD_4
     await sync.sync(s)
     expect(readSide('right')?.is_powered).toBe(1)
+  })
+})
+
+describe('DeviceStateSync — thermal_state history', () => {
+  let sync: DeviceStateSync
+  const rows = (side: 'left' | 'right') => (biometricsSqlite as any)
+    .prepare('SELECT timestamp, is_powered, target_temp_f, current_temp_f FROM thermal_state WHERE side = ? ORDER BY id')
+    .all(side) as Array<{ timestamp: number, is_powered: number, target_temp_f: number | null, current_temp_f: number | null }>
+
+  beforeEach(() => {
+    resetSchema()
+    _resetMutationStamps()
+    sync = new DeviceStateSync()
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-28T12:00:00Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('samples once a minute while power is unchanged', async () => {
+    const on = status({ side: 'left', currentLevel: 20, targetLevel: 20, heatingDuration: 3600, currentTemperature: 78, targetTemperature: 80 })
+    await sync.sync(on)
+    vi.advanceTimersByTime(30_000)
+    await sync.sync(on)
+    expect(rows('left')).toHaveLength(1)
+    vi.advanceTimersByTime(31_000)
+    await sync.sync(on)
+    const left = rows('left')
+    expect(left).toHaveLength(2)
+    expect(left[0]).toMatchObject({ is_powered: 1, target_temp_f: 80, current_temp_f: 78 })
+  })
+
+  it('writes straight away on a power transition and nulls temps while off', async () => {
+    await sync.sync(status({ side: 'left', currentLevel: 20, targetLevel: 20, heatingDuration: 3600, targetTemperature: 80 }))
+    vi.advanceTimersByTime(5_000)
+    await sync.sync(status({ side: 'left' }))
+    const left = rows('left')
+    expect(left.map(r => r.is_powered)).toEqual([1, 0])
+    expect(left[1]).toMatchObject({ target_temp_f: null, current_temp_f: null })
+  })
+})
+
+describe('DeviceStateSync — prime history', () => {
+  beforeEach(() => {
+    resetSchema()
+    _resetMutationStamps()
+  })
+
+  it('records a prime_events row when priming finishes', async () => {
+    const sync = new DeviceStateSync()
+    await sync.sync({ ...status(), isPriming: true })
+    await sync.sync({ ...status(), isPriming: true })
+    expect((biometricsSqlite as any).prepare('SELECT COUNT(*) AS n FROM prime_events').get().n).toBe(0)
+    await sync.sync(status())
+    expect((biometricsSqlite as any).prepare('SELECT COUNT(*) AS n FROM prime_events').get().n).toBe(1)
   })
 })

@@ -61,6 +61,28 @@ vi.mock('@/src/db', () => ({ db: primaryDb, biometricsDb }))
 vi.mock('@/src/automation', () => ({ getAutomationEngineIfRunning: engine.get }))
 vi.mock('@/src/automation/backtest', () => ({ runBacktest: backtest.run }))
 
+const liveSignals = vi.hoisted(() => ({ biometrics: {} as Record<string, number | undefined>, device: {} as Record<string, number | undefined> }))
+vi.mock('@/src/automation/signals', () => ({
+  CompositeSignalReader: class {
+    constructor(private readers: Array<{ read: () => Record<string, number | undefined> }>) {}
+    read() {
+      return Object.assign({}, ...this.readers.map(r => r.read()))
+    }
+  },
+  DeviceSignalReader: class {
+    read() {
+      return liveSignals.device
+    }
+  },
+}))
+vi.mock('@/src/automation/signals.biometrics', () => ({
+  BiometricsSignalReader: class {
+    read() {
+      return liveSignals.biometrics
+    }
+  },
+}))
+
 const { automationsRouter } = await import('@/src/server/routers/automations')
 const caller = automationsRouter.createCaller({})
 
@@ -421,7 +443,7 @@ describe('automations nights and historical series', () => {
         endMs: older.leftBedAt.getTime(),
       },
     ])
-    expect(biometricsDb.chain.limit).toHaveBeenCalledWith(30)
+    expect(biometricsDb.chain.limit).toHaveBeenCalledWith(120)
   })
 
   it.each([0, 31])('rejects nights limit %i', async (limit) => {
@@ -632,6 +654,51 @@ describe('automations nights and historical series', () => {
   })
 })
 
+describe('automations diagnostics', () => {
+  it('returns compact run history since midnight and live condition signals', async () => {
+    liveSignals.biometrics = { 'ambient.temperature': 72.3 }
+    liveSignals.device = {}
+    const rule = automationRow({
+      conditions: {
+        kind: 'and',
+        conditions: [
+          { kind: 'compare', op: '>', left: { kind: 'signal', signal: 'ambient.temperature' }, right: { kind: 'literal', value: 75 } },
+          { kind: 'not', condition: { kind: 'between', subject: { kind: 'window', fn: 'avg', signal: 'left.movement', lastMin: 10 }, min: { kind: 'literal', value: 0 }, max: { kind: 'binary', op: '+', left: { kind: 'clamp', value: { kind: 'literal', value: 1 }, min: { kind: 'literal', value: 0 }, max: { kind: 'literal', value: 2 } }, right: { kind: 'literal', value: 1 } } } },
+        ],
+      },
+    })
+    const t1 = new Date('2026-07-20T00:01:00Z')
+    const t2 = new Date('2026-07-20T00:02:00Z')
+    states.primary.queue.push([{ on: true }])
+    states.primary.queue.push([rule])
+    states.primary.queue.push([
+      { firedAt: t1, outcome: 'skipped', detail: { reason: 'condition-false' } },
+      { firedAt: t2, outcome: 'fired', detail: { actions: [{ kind: 'setTemperature', sent: true }] } },
+      { firedAt: t2, outcome: 'dry_run', detail: null },
+    ])
+
+    const out = await caller.diagnostics({})
+    expect(out.globalEnabled).toBe(true)
+    expect(out.since.getTime()).toBeLessThanOrEqual(out.now.getTime() - 3 * 3_600_000)
+    expect(out.since.getTime()).toBeLessThanOrEqual(out.startOfDay.getTime())
+    expect(out.rules[0].runs).toEqual([
+      { t: t1, outcome: 'skipped', reason: 'condition-false', sent: false },
+      { t: t2, outcome: 'fired', reason: null, sent: true },
+      { t: t2, outcome: 'dry_run', reason: null, sent: false },
+    ])
+    expect(out.rules[0].signals).toEqual({ 'ambient.temperature': 72.3, 'left.movement': null })
+    expect(out.rules[0].name).toBe('Cool sleeping side')
+  })
+
+  it('defaults to enabled and rejects out-of-range hours', async () => {
+    states.primary.queue.push([])
+    states.primary.queue.push([])
+    await expect(caller.diagnostics({ hours: 24 })).resolves.toMatchObject({ globalEnabled: true, rules: [] })
+    await expect(caller.diagnostics({ hours: 0 })).rejects.toThrow()
+    await expect(caller.diagnostics({ hours: 25 })).rejects.toThrow()
+  })
+})
+
 describe('automations public API metadata', () => {
   it.each([
     ['list', 'GET', '/automations'],
@@ -645,6 +712,7 @@ describe('automations public API metadata', () => {
     ['setKillSwitch', 'POST', '/automations/kill-switch'],
     ['runs', 'GET', '/automations/runs'],
     ['status', 'GET', '/automations/status'],
+    ['diagnostics', 'GET', '/automations/diagnostics'],
     ['nights', 'GET', '/automations/nights'],
     ['backtest', 'POST', '/automations/backtest'],
     ['capZoneReplay', 'GET', '/automations/cap-zone-replay'],
