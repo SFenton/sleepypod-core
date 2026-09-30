@@ -7,10 +7,14 @@ let controllerClient: HardwareClient
 const pumpStallShouldBlock = vi.fn<(side: 'left' | 'right') => boolean>(() => false)
 
 // Gesture unit tests assert delegation to the shared controller boundary.
+// SleepyPod's own target per side (the controller's selected request).
+const ownedTarget = vi.fn<(side: 'left' | 'right') => number | null>(() => null)
+
 vi.mock('@/src/temperature/instance', () => ({
   getTemperatureController: () => ({
     setManualLocked: (side: 'left' | 'right', temp: number) => controllerClient.setTemperature(side, temp),
     powerOffLocked: (side: 'left' | 'right') => controllerClient.setPower(side, false),
+    status: (side: 'left' | 'right') => ({ targetTemperature: ownedTarget(side) }),
   }),
 }))
 vi.mock('../pumpStallGuard', () => ({
@@ -89,6 +93,32 @@ describe('GestureActionHandler', () => {
   })
 
   describe('temperature action', () => {
+    test('steps from SleepyPod\'s own target, replacing the firmware\'s own tap adjustment', async () => {
+      // SleepyPod set 70°F; the firmware already bumped the hardware one step
+      // (2.75°F), which the status reports as 73°F. A +2 tap must land on 72.
+      ownedTarget.mockImplementation(side => (side === 'left' ? 70 : null))
+      try {
+        const gesture = { actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 2 }
+        const { deps, client } = makeDeps(gesture, { targetTemperature: 73 })
+
+        await new GestureActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'tripleTap'))
+
+        expect(client.setTemperature).toHaveBeenCalledWith('left', 72)
+      }
+      finally {
+        ownedTarget.mockReset().mockReturnValue(null)
+      }
+    })
+
+    test('falls back to the reported target when SleepyPod has none for the side', async () => {
+      const gesture = { actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 3 }
+      const { deps, client } = makeDeps(gesture, { targetTemperature: 73 })
+
+      await new GestureActionHandler(SOCKET_PATH, deps).handle(makeEvent('right', 'quadTap'))
+
+      expect(client.setTemperature).toHaveBeenCalledWith('right', 70)
+    })
+
     test('waits behind the shared side lock before writing hardware', async () => {
       let releaseLeft: () => void = () => {}
       const holder = withSideLock('left', async () => new Promise<void>((resolve) => {
