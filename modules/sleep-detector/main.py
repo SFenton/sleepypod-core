@@ -21,7 +21,12 @@ Movement scoring (Proportional Integration Mode):
   Movement is computed as the sum of absolute sample-to-sample deltas across
   the 3 sensing channel pairs per epoch (Kortelainen et al. 2010; Cole-Kripke
   1992). This measures actual body displacement over time rather than static
-  deviation from an empty-bed baseline.
+  deviation from an empty-bed baseline. On Pod 3/4 (integer capSense) each
+  channel's delta counts only by its excess over CAPSENSE_NOISE_K times that
+  channel's typical delta, since sensor noise alone would fill the scale, and
+  only when it lands on a level the channel hasn't held in the last minute:
+  in some positions one channel flips between two levels with each breath.
+  Pod 3/4 epochs also skip the 3-epoch median filter, which zeroed turn-overs.
 
   Pump artifact gating (#230):
     Pump vibrations contaminate capSense2 deltas, inflating movement scores
@@ -54,6 +59,7 @@ import time
 import json
 import math
 import signal
+import statistics
 import logging
 import sqlite3
 import threading
@@ -154,12 +160,37 @@ MIN_VALID_WALL_CLOCK_TS = 1577836800.0  # 2020-01-01 00:00:00 UTC
 PUMP_GUARD_S = 3.0
 # Reference channel anomaly threshold (capSense2 units)
 REF_ANOMALY_THRESHOLD = 0.02
+# Pod 3/4 capSense movement. The integer channels change by several counts
+# between samples with nobody moving (median |delta| ~3-7), so a plain sum of
+# deltas is mostly noise: at 2 Hz a still minute summed to ~2,000-2,500 and
+# saturated the 1000 cap every minute, and the trailing-baseline subtraction
+# then zeroed every minute — movement read 0 all night. Instead only a delta
+# beyond CAPSENSE_NOISE_K times that channel's typical delta (median of its
+# last CAPSENSE_NOISE_WINDOW samples, ~10 min, at least CAPSENSE_NOISE_FLOOR)
+# counts, by its excess. On a Pod 4 night this scored still minutes ~0 and
+# tracked piezo-detected body movement (rank correlation 0.65 vs 0.34).
+CAPSENSE_NOISE_K = 6.0
+CAPSENSE_NOISE_WINDOW = 1200
+CAPSENSE_NOISE_MIN_SAMPLES = 60
+CAPSENSE_NOISE_FLOOR = 1.0
+CAPSENSE_NOISE_UPDATE_EVERY = 30
+# A jump only counts when it lands on a level the channel hasn't held in the
+# last CAPSENSE_LEVEL_MEMORY samples (~3 min). In some lying positions one
+# channel flips between two fixed levels with each breath (~200 counts apart,
+# every few seconds) while the body is still; summed as deltas that scored
+# 1000 for half an hour at a time. Turning over moves the channels to new
+# levels and still counts; the return leg of an out-and-back motion doesn't.
+CAPSENSE_LEVEL_MEMORY = 360
+
 # Baseline subtraction: trailing epoch window and cold start
 BASELINE_TRAILING_EPOCHS = 30
 BASELINE_COLD_START_EPOCHS = 10  # ~10 minutes at 60s epochs
 # Percentile for baseline (5th percentile)
 BASELINE_PERCENTILE = 5
-# Median filter window (epochs)
+# Median filter window (epochs). Not applied to capSense (Pod 3/4): there a
+# turn-over is usually one busy minute between still ones, which the median
+# zeroed, and the noise margin and level memory already reject the sensor's
+# artifacts.
 MEDIAN_FILTER_WINDOW = 3
 
 # ---------------------------------------------------------------------------
@@ -890,6 +921,13 @@ class SessionTracker:
     _epoch_scores: deque = field(default_factory=lambda: deque(maxlen=BASELINE_TRAILING_EPOCHS))
     _median_buf: deque = field(default_factory=lambda: deque(maxlen=MEDIAN_FILTER_WINDOW))
     _pump_gated_samples: int = 0  # counter for logging
+    # capSense (Pod 3/4) per-channel delta history and typical delta; see
+    # CAPSENSE_NOISE_K.
+    _cap_deltas: deque = field(default_factory=lambda: deque(maxlen=CAPSENSE_NOISE_WINDOW))
+    _cap_noise: Optional[list] = None
+    _cap_since_update: int = 0
+    # Recent capSense channel values; the last one is the previous sample.
+    _cap_levels: deque = field(default_factory=lambda: deque(maxlen=CAPSENSE_LEVEL_MEMORY + 1))
     # Sessions closed only by the MAX_SESSION_S cap since the last natural
     # (absence-timeout) close. Two in a row means the presence signal never
     # dropped for 32+ hours — a stuck level signal, not a sleeper.
@@ -1048,9 +1086,11 @@ class SessionTracker:
         baselines = ({"ref": {"mean": baseline.ref_mean}}
                      if baseline is not None and baseline.ref_mean is not None else None)
 
-        # Set scale factor based on sensor type (Pod 3 int vs Pod 5 float)
-        if rtype == "capSense" and self._scale_factor != 0.5:
-            self._scale_factor = 0.5
+        # Set scale factor based on sensor type (Pod 3/4 int vs Pod 5 float).
+        # capSense scores the excess over its noise (see CAPSENSE_NOISE_K)
+        # one to one, and skips the median filter (keyed on this factor).
+        if rtype == "capSense" and self._scale_factor != 1.0:
+            self._scale_factor = 1.0
         elif rtype == "capSense2" and self._scale_factor != 10.0:
             self._scale_factor = 10.0
 
@@ -1069,10 +1109,40 @@ class SessionTracker:
             if self.pump_gate.is_gated(record, self.side, channel_deltas, baselines):
                 delta = 0.0
                 self._pump_gated_samples += 1
+            elif rtype == "capSense" and channel_deltas is not None:
+                delta = self._capsense_movement(channel_deltas, current_values)
+            if rtype == "capSense":
+                self._cap_levels.append(current_values)
         else:
             # Sentinel or invalid — skip delta, keep previous (zero-order hold)
             delta = 0.0
         return SideObservation(ts, present, delta, values, record)
+
+    def _capsense_movement(self, channel_deltas: list,
+                           values: Optional[list] = None) -> float:
+        """Sum of each channel's delta beyond CAPSENSE_NOISE_K times its
+        typical delta; 0 until CAPSENSE_NOISE_MIN_SAMPLES have been seen.
+        With `values`, a channel landing within that margin of a level it
+        held in the last CAPSENSE_LEVEL_MEMORY samples adds nothing."""
+        self._cap_deltas.append(channel_deltas)
+        if len(self._cap_deltas) < CAPSENSE_NOISE_MIN_SAMPLES:
+            return 0.0
+        self._cap_since_update += 1
+        if self._cap_noise is None or self._cap_since_update >= CAPSENSE_NOISE_UPDATE_EVERY:
+            self._cap_noise = [
+                max(CAPSENSE_NOISE_FLOOR, statistics.median(d[i] for d in self._cap_deltas))
+                for i in range(len(channel_deltas))
+            ]
+            self._cap_since_update = 0
+        excess = [max(0.0, d - CAPSENSE_NOISE_K * n)
+                  for d, n in zip(channel_deltas, self._cap_noise)]
+        if values is not None and any(excess):
+            earlier = list(self._cap_levels)[:-1]
+            for i, e in enumerate(excess):
+                margin = CAPSENSE_NOISE_K * self._cap_noise[i]
+                if e and any(abs(values[i] - lv[i]) <= margin for lv in earlier):
+                    excess[i] = 0.0
+        return sum(excess)
 
     def commit(self, ts: float, present: Optional[bool], delta: float) -> bool:
         """Advance the session with one sample's presence and movement.
@@ -1291,7 +1361,7 @@ class SessionTracker:
         # Step 1: Sum of absolute deltas over the epoch (PIM analog)
         # Scale factor depends on sensor type:
         #   capSense2 (Pod 5): float channels, deltas ~0.05-5.0 → ×10
-        #   capSense  (Pod 3): int ADC channels, deltas ~1-50 → ×0.5
+        #   capSense  (Pod 3/4): int ADC channels, excess over noise → ×1
         raw_sum = sum(self._movement_buf)
         raw_score = min(1000, int(raw_sum * self._scale_factor))
 
@@ -1305,9 +1375,11 @@ class SessionTracker:
             # Cold start: not enough history yet, skip baseline subtraction
             score_after_baseline = raw_score
 
-        # Step 3: 3-epoch median filter for smoothing
+        # Step 3: 3-epoch median filter for smoothing (not for capSense)
         self._median_buf.append(score_after_baseline)
-        if len(self._median_buf) >= MEDIAN_FILTER_WINDOW:
+        if self._scale_factor == 1.0:
+            filtered_score = score_after_baseline
+        elif len(self._median_buf) >= MEDIAN_FILTER_WINDOW:
             filtered_score = _median(list(self._median_buf))
         else:
             # Not enough epochs yet for median filter, pass through
