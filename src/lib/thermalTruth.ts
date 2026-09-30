@@ -5,7 +5,7 @@ import { bedTemp, freezerTemp, flowReadings } from '@/src/db/biometrics-schema'
 import { shouldBlock as pumpStallShouldBlock } from '@/src/hardware/pumpStallGuard'
 import { centiDegreesToF } from '@/src/lib/tempUtils'
 
-export type ThermalVerdict = 'off' | 'delivering' | 'holding' | 'stalled'
+export type ThermalVerdict = 'off' | 'delivering' | 'holding' | 'stalled' | 'unknown'
 
 /**
  * Thermal truth — reconciles what the app commanded (device_state) against
@@ -81,6 +81,13 @@ export function readThermalTruth() {
     let note: string | null = null
     if (!isPowered) {
       verdict = 'off'
+    }
+    else if (!flow) {
+      // No pump reading has ever been recorded: this pod's firmware
+      // doesn't send frzHealth (Pod 3/4), so there is no pump speed to
+      // judge. Calling that "stalled" flagged every powered side.
+      verdict = 'unknown'
+      note = 'this pod does not report pump speed — water temperature tracking the target is the sign it is circulating'
     }
     else if (!flowing) {
       verdict = 'stalled'

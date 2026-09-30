@@ -51,8 +51,8 @@ describe('time-relative formatters', () => {
 })
 
 describe('VERDICT_STYLES', () => {
-  it('covers the four thermal verdicts', () => {
-    expect(Object.keys(VERDICT_STYLES).sort()).toEqual(['delivering', 'holding', 'off', 'stalled'])
+  it('covers the five thermal verdicts', () => {
+    expect(Object.keys(VERDICT_STYLES).sort()).toEqual(['delivering', 'holding', 'off', 'stalled', 'unknown'])
   })
 })
 
