@@ -6,16 +6,15 @@ import { ArrowLeft } from 'lucide-react'
 import { trpc } from '@/src/utils/trpc'
 import { useSideNames } from '@/src/hooks/useSideNames'
 import { Button, Card, CardHeader, InlineError, Skeleton, StatusDot } from '@/src/components/ds'
-import { easedPath } from '@/src/components/Schedule/CurveChart'
+import { stepPath } from '@/src/components/Schedule/CurveChart'
 import { NEUTRAL_TEMP_F, TONE_TEXT, TONE_VAR, tempTone } from '@/src/components/Schedule/scheduleFormat'
 import { cn } from '@/lib/utils'
 import {
-  buildNights, describeSchedule, fmtIn, fmtTime, fmtWhen, groupCounts, jobGroup, jobText, nightAxis, podLane, sideLane,
+  buildNights, describeSchedule, fmtIn, fmtTime, fmtWhen, groupCounts, heldTarget, jobGroup, jobText, nightAxis, podLane, sideLane,
   type JobGroup, type JobText, type Night, type Side, type TimelineJob, type TimelineOccurrence,
 } from './schedulerLogic'
 
 const HOUR = 3_600_000
-const RAMP_MINUTES = 20
 
 /**
  * System → Scheduler: what the pod will do tonight, drawn per side as the
@@ -197,6 +196,9 @@ function NightTimeline({ occurrences, now, next }: { occurrences: TimelineOccurr
 
 function NightChart({ night, now, next, sideName }: { night: Night, now: number, next: TimelineOccurrence | undefined, sideName: (s: Side) => string }) {
   const [ref, width] = useWidth<HTMLDivElement>()
+  const svgRef = useRef<SVGSVGElement>(null)
+  // Same hover as the Schedule chart: a line across the lanes and each side's target at that time.
+  const [hover, setHover] = useState<number | null>(null)
   const { from, to } = nightAxis(night)
   const lanes = (['left', 'right'] as const).map(side => ({ side, lane: sideLane(night.occurrences, side) }))
   const pod = podLane(night.occurrences)
@@ -206,6 +208,22 @@ function NightChart({ night, now, next, sideName }: { night: Night, now: number,
   const stepH = width > 0 && width < 520 ? 4 : 2
   for (let t = from; t <= to; t += stepH * HOUR) ticks.push(t)
   const nowX = now >= from && now <= to ? X(now) : null
+
+  const onPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const rect = svgRef.current?.getBoundingClientRect()
+    if (!rect) return
+    const x = Math.max(0, Math.min(width, e.clientX - rect.left))
+    setHover(from + (x / width) * (to - from))
+  }
+  const readout = hover === null
+    ? null
+    : {
+        x: X(hover),
+        label: [fmtTime(hover), ...lanes.map(({ side, lane }) => {
+          const target = heldTarget(lane, hover)
+          return `${sideName(side)} ${target === null ? '—' : `${target}°`}`
+        })].join(' · '),
+      }
 
   return (
     <div className="flex min-w-0">
@@ -225,7 +243,17 @@ function NightChart({ night, now, next, sideName }: { night: Night, now: number,
       </div>
       <div ref={ref} className="min-w-0 flex-1" style={{ height }}>
         {width > 0 && (
-          <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="block overflow-visible" role="img" aria-label={`Scheduled jobs, ${night.dates}`}>
+          <svg
+            ref={svgRef}
+            width={width}
+            height={height}
+            viewBox={`0 0 ${width} ${height}`}
+            className="block overflow-visible"
+            role="img"
+            aria-label={`Scheduled jobs, ${night.dates}`}
+            onPointerMove={onPointerMove}
+            onPointerLeave={() => setHover(null)}
+          >
             {ticks.map(t => (
               <g key={t}>
                 <line x1={X(t)} x2={X(t)} y1={TOP} y2={height - 22} stroke="var(--border-grid)" />
@@ -252,6 +280,21 @@ function NightChart({ night, now, next, sideName }: { night: Night, now: number,
                 <line x1={nowX} x2={nowX} y1={12} y2={height - 22} stroke="var(--text-1)" strokeOpacity="0.6" />
                 <text x={nowX + (nowX > width - 90 ? -4 : 4)} y={9} textAnchor={nowX > width - 90 ? 'end' : 'start'} fill="var(--text-1)" fontSize="10" className="font-mono">
                   {`now ${fmtTime(now)}`}
+                </text>
+              </g>
+            )}
+            {readout && (
+              <g data-testid="timeline-hover" pointerEvents="none">
+                <line x1={readout.x} x2={readout.x} y1={12} y2={height - 22} stroke="var(--text-1)" strokeOpacity="0.35" />
+                <text
+                  x={readout.x > width / 2 ? readout.x - 6 : readout.x + 6}
+                  y={TOP + SIDE_H - 10}
+                  textAnchor={readout.x > width / 2 ? 'end' : 'start'}
+                  fill="var(--text-1)"
+                  fontSize="10"
+                  className="font-mono"
+                >
+                  {readout.label}
                 </text>
               </g>
             )}
@@ -282,7 +325,7 @@ function SideCurve({ lane, top, width, X, next }: {
   // Hold the last set point until the side powers off.
   const lastOff = lane.off.filter(t => pts.length && t > lane.points[lane.points.length - 1].at)[0]
   const path = pts.length
-    ? easedPath([...pts, ...(lastOff != null ? [{ x: X(lastOff), y: pts[pts.length - 1].y }] : [])], X(RAMP_MINUTES * 60_000) - X(0))
+    ? stepPath([...pts, ...(lastOff != null ? [{ x: X(lastOff), y: pts[pts.length - 1].y }] : [])])
     : ''
   const endX = lastOff != null ? X(lastOff) : pts[pts.length - 1]?.x ?? 0
   const maxP = pts.length ? pts.reduce((a, b) => (b.tempF > a.tempF ? b : a)) : null
@@ -296,16 +339,17 @@ function SideCurve({ lane, top, width, X, next }: {
         <>
           <defs>
             <linearGradient id={gradientId} x1={pts[0].x} y1="0" x2={Math.max(endX, pts[0].x + 1)} y2="0" gradientUnits="userSpaceOnUse">
-              {pts.map((p, i) => (
-                <stop key={i} offset={((p.x - pts[0].x) / (Math.max(endX, pts[0].x + 1) - pts[0].x)).toFixed(3)} stopColor={TONE_VAR[tempTone(p.tempF)]} />
-              ))}
+              {/* Hard stops: each hold keeps its tone right up to the step. */}
+              {pts.flatMap((p, i) => {
+                const offset = ((p.x - pts[0].x) / (Math.max(endX, pts[0].x + 1) - pts[0].x)).toFixed(3)
+                const stops = [<stop key={`${i}-to`} offset={offset} stopColor={TONE_VAR[tempTone(p.tempF)]} />]
+                if (i > 0) stops.unshift(<stop key={`${i}-from`} offset={offset} stopColor={TONE_VAR[tempTone(pts[i - 1].tempF)]} />)
+                return stops
+              })}
             </linearGradient>
           </defs>
           <path d={`${path} L${endX},${bottom} L${pts[0].x},${bottom} Z`} fill="var(--text-1)" fillOpacity="0.04" />
-          <path d={path} fill="none" stroke={`url(#${gradientId})`} strokeWidth="2" />
-          {pts.map((p, i) => (
-            <circle key={`${p.id}-${i}`} cx={p.x} cy={p.y} r={3} fill="var(--surface-card)" stroke={TONE_VAR[tempTone(p.tempF)]} strokeWidth="1.5" />
-          ))}
+          <path d={path} fill="none" stroke={`url(#${gradientId})`} strokeWidth="2" strokeLinejoin="round" />
           {maxP && maxP.tempF !== minP?.tempF && (
             <text x={maxP.x} y={maxP.y - 8} textAnchor="middle" fill={TONE_VAR[tempTone(maxP.tempF)]} fontSize="10" className="font-mono">{`${maxP.tempF}°`}</text>
           )}

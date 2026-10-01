@@ -3,11 +3,11 @@
 import { ArrowRight } from 'lucide-react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { useId } from 'react'
+import { useId, useState, type PointerEvent } from 'react'
 import { cn } from '@/lib/utils'
 import { Card, Skeleton } from '@/src/components/ds'
 import { langFromPath } from '@/src/components/AppShell/navItems'
-import { dropHolds, easedPath, useNowMinute } from '@/src/components/Schedule/CurveChart'
+import { dropHolds, stepPath, useNowMinute } from '@/src/components/Schedule/CurveChart'
 import { formatCountdown } from '@/src/components/Schedule/bothNight'
 import { NEUTRAL_TEMP_F, TONE_VAR, tempTone } from '@/src/components/Schedule/scheduleFormat'
 import { useSideNames } from '@/src/hooks/useSideNames'
@@ -15,7 +15,7 @@ import { formatSetpointF, type TempUnit } from '@/src/lib/tempUtils'
 import type { Side } from '@/src/providers/SideProvider'
 import { trpc } from '@/src/utils/trpc'
 import {
-  nextPoint, nightCurve, nightMismatch, powerIntervals, presenceIntervals, tempRange, timelineWindow,
+  nextPoint, nightCurve, nightMismatch, powerIntervals, presenceIntervals, targetAt, tempRange, timelineWindow,
   type CurvePoint, type Interval, type TimelineWindow,
 } from './timelineLogic'
 
@@ -24,7 +24,6 @@ const HOUR = 3_600_000
 const CURVE_H = 56
 /** SVG user-space width; the curve stretches to the lane (strokes stay 1.5px). */
 const VB_W = 1000
-const RAMP_MIN = 20
 
 const clock = (t: number) => new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
 const nightDate = (d: Date) => d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }).replace(',', '')
@@ -73,9 +72,22 @@ function TimelineBody({ win, now, unit }: { win: TimelineWindow, now: number, un
   for (let t = win.start; t <= win.end; t += 3 * HOUR) ticks.push(t)
   const [last, tonight] = win.nights
   const tonightAt = new Date(tonight.midnight.getFullYear(), tonight.midnight.getMonth(), tonight.midnight.getDate(), 18).getTime()
+  // Same hover as the Schedule charts: a line across the lanes and each side's target at that time.
+  const [hoverT, setHoverT] = useState<number | null>(null)
+  const onPointerMove = (e: PointerEvent<HTMLDivElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    const x = e.clientX - rect.left - 96
+    const w = rect.width - 96
+    setHoverT(x < 0 || w <= 0 ? null : win.start + Math.min(1, x / w) * span)
+  }
 
   return (
-    <div className="relative grid grid-cols-[84px_minmax(0,1fr)] gap-x-3">
+    <div
+      className="relative grid grid-cols-[84px_minmax(0,1fr)] gap-x-3"
+      data-testid="timeline-body"
+      onPointerMove={onPointerMove}
+      onPointerLeave={() => setHoverT(null)}
+    >
       {/* Hour grid behind the lanes. */}
       <div aria-hidden className="pointer-events-none absolute top-5 bottom-5 right-0 left-[96px]">
         {ticks.map(t => (
@@ -92,7 +104,7 @@ function TimelineBody({ win, now, unit }: { win: TimelineWindow, now: number, un
       <span />
       <div className="h-4" />
 
-      {SIDES.map(side => <SideRows key={side} side={side} win={win} now={now} unit={unit} pct={pct} />)}
+      {SIDES.map(side => <SideRows key={side} side={side} win={win} now={now} unit={unit} pct={pct} hoverT={hoverT} />)}
 
       <span />
       <div className="relative h-5 font-mono text-[10px] text-fg-3" aria-hidden>
@@ -115,16 +127,29 @@ function TimelineBody({ win, now, unit }: { win: TimelineWindow, now: number, un
       >
         <span className="absolute top-0 left-1.5 whitespace-nowrap font-mono text-[10px] leading-4 text-fg-2">{`now ${clock(now)}`}</span>
       </div>
+      {hoverT != null && (
+        <div
+          aria-hidden
+          data-testid="timeline-hover"
+          className="pointer-events-none absolute top-5 bottom-5 border-l border-fg/35"
+          style={{ left: `calc(96px + (100% - 96px) * ${pct(hoverT) / 100})` }}
+        >
+          <span className={cn('absolute top-0 whitespace-nowrap font-mono text-[10px] leading-4 text-fg', pct(hoverT) > 50 ? 'right-1.5' : 'left-1.5')}>
+            {clock(hoverT)}
+          </span>
+        </div>
+      )}
     </div>
   )
 }
 
-function SideRows({ side, win, now, unit, pct }: {
+function SideRows({ side, win, now, unit, pct, hoverT }: {
   side: Side
   win: TimelineWindow
   now: number
   unit: TempUnit
   pct: (t: number) => number
+  hoverT: number | null
 }) {
   const { sideName } = useSideNames()
   const schedules = trpc.schedules.getAll.useQuery({ side }, { staleTime: 60_000 })
@@ -182,6 +207,18 @@ function SideRows({ side, win, now, unit, pct }: {
             </span>
           </>
         )}
+        {hoverT != null && range && (
+          <span
+            data-testid={`timeline-${side}-hover`}
+            className={cn('absolute bottom-0 whitespace-nowrap font-mono text-[10px] text-fg', pct(hoverT) > 50 ? '-translate-x-full pr-1.5' : 'pl-1.5')}
+            style={{ left: `${pct(hoverT)}%` }}
+          >
+            {(() => {
+              const t = targetAt(curves, hoverT)
+              return t == null ? '—' : fmt(t)
+            })()}
+          </span>
+        )}
       </div>
 
       <span className="self-center font-mono text-[10px] text-fg-3">on</span>
@@ -238,7 +275,7 @@ function CurveLane({ curves, range, win }: { curves: CurvePoint[][], range: { lo
         const coords = pts.map(p => ({ x: X(p.at), y: Y(p.temperature) }))
         const x0 = coords[0].x
         const x1 = coords[coords.length - 1].x
-        const path = easedPath(coords, (RAMP_MIN * 60_000 / span) * VB_W)
+        const path = stepPath(coords)
         return (
           <g key={i}>
             <defs>
