@@ -509,7 +509,7 @@ export const healthRouter = router({
         waterTempF: z.number().nullable(),
         bedSurfaceTempF: z.number().nullable(),
         guardBlocked: z.boolean(),
-        verdict: z.enum(['off', 'delivering', 'holding', 'stalled']),
+        verdict: z.enum(['off', 'delivering', 'holding', 'stalled', 'unknown']),
         note: z.string().nullable(),
       })),
     }))

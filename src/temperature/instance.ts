@@ -3,6 +3,7 @@ import { db } from '@/src/db'
 import { alarmSchedules, deviceSettings, deviceState, powerSchedules, runOnceSessions, sideSettings, temperatureHolds, temperatureSchedules } from '@/src/db/schema'
 import { getSharedHardwareClient } from '@/src/hardware/dacMonitor.instance'
 import { markSideMutated } from '@/src/hardware/deviceStateSync'
+import { hasFirmwareSynced } from '@/src/hardware/sideMutations'
 import { shouldBlock } from '@/src/hardware/pumpStallGuard'
 import { withSideLock } from '@/src/hardware/sideLock'
 import { fahrenheitToLevel, MAX_TEMP, MIN_TEMP, type Side } from '@/src/hardware/types'
@@ -101,7 +102,15 @@ export function getTemperatureController(): TemperatureController {
         db.insert(temperatureHolds).values(values).onConflictDoUpdate({ target: temperatureHolds.side, set: values }).run()
       },
       readBaseline,
-      isPowered: side => db.select().from(deviceState).where(eq(deviceState.side, side)).get()?.isPowered ?? false,
+      // A device_state row left over from before a restart is not evidence of
+      // a live session until the firmware has reported in. Gating here covers
+      // every reconcile path (the automation engine's startup tick, scheduler
+      // temperature jobs, resume/submit/withdraw), not just the passive loop:
+      // on Pod 88 the engine's first tick read a stale is_powered=1 row and
+      // energized a side the moment frank connected. Explicit power-on and
+      // manual commands do not consult this.
+      isPowered: side => hasFirmwareSynced()
+        && (db.select().from(deviceState).where(eq(deviceState.side, side)).get()?.isPowered ?? false),
       readCurrentTarget: side => db.select().from(deviceState).where(eq(deviceState.side, side)).get()?.targetTemperature ?? null,
       readHardwareDeadline: side => db.select({ deadline: deviceState.hardwareDeadline }).from(deviceState).where(eq(deviceState.side, side)).get()?.deadline ?? null,
       writeHardwareDeadline: (side, hardwareDeadline) => {
@@ -162,7 +171,19 @@ export async function startTemperatureController(): Promise<void> {
   const service = { running: true, pending: new Set<Promise<void>>(), timer: undefined as ReturnType<typeof setInterval> | undefined }
   globalState.__sp_temperatureService = service
   const ticking = new Set<Side>()
+  let waitingLogged = false
   const tick = () => {
+    // device_state is only trustworthy once the firmware has reported in
+    // since this process started; before that a stale is_powered row would
+    // make reconcile energize a side nobody asked for. Explicit commands
+    // (power-on, manual, scheduler) don't pass through here and are unaffected.
+    if (!hasFirmwareSynced()) {
+      if (!waitingLogged) {
+        console.log('[temperature] waiting for first firmware status before reconciling')
+        waitingLogged = true
+      }
+      return Promise.all([...service.pending])
+    }
     for (const side of ['left', 'right'] as const) {
       if (!service.running || ticking.has(side)) continue
       ticking.add(side)

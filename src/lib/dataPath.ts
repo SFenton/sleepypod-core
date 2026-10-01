@@ -123,7 +123,7 @@ export interface DataPathInputs {
   lastVitalAt: Record<Side, number | null>
   lastMovementAt: Record<Side, number | null>
   lastEnvAt: number | null
-  thermal: Array<{ side: Side, verdict: 'off' | 'delivering' | 'holding' | 'stalled' }>
+  thermal: Array<{ side: Side, verdict: 'off' | 'delivering' | 'holding' | 'stalled' | 'unknown' }>
   streamClients: number | null
   /** Port of the browser WebSocket stream. */
   streamPort?: number

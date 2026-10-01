@@ -96,8 +96,16 @@ export class GestureActionHandler {
     gesture: TapGestureRow
   ): Promise<void> => {
     await withSideLock(event.side, async () => {
-      const state = await this.deps.findDeviceState(event.side)
-      const currentTemp = state?.targetTemperature ?? 75
+      // Step from the temperature SleepyPod itself has set (the controller's
+      // selected target), not the firmware's reported target: the firmware
+      // applies its own tap adjustment (one Eight Sleep step, 2.75°F) before
+      // this runs, and the status may already include it. Writing the result
+      // as an absolute target then replaces that adjustment, so a tap moves
+      // exactly the configured amount instead of both added together.
+      const owned = getTemperatureController().status(event.side).targetTemperature
+      const currentTemp = owned
+        ?? (await this.deps.findDeviceState(event.side))?.targetTemperature
+        ?? 75
       const amount = gesture.temperatureAmount ?? 0
       if (!gesture.temperatureChange) return
       const delta = gesture.temperatureChange === 'increment' ? amount : -amount

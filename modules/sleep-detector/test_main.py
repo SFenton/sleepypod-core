@@ -4,6 +4,7 @@ cbor2 / common.raw_follower / common.health are stubbed before importing main.
 Covers ts sanitization (#327) and DB write resilience (#325).
 """
 
+import pytest
 import importlib.util
 import logging
 import sqlite3
@@ -1010,3 +1011,200 @@ class TestAdaptiveProfileSeed:
                                created_at=ts, source="adaptive")
         _run(t, ts, 60, 0)
         assert t.baseline.means == before
+
+
+class TestCapSenseMovement:
+    """Pod 3/4 integer capSense: sensor noise alone changes each channel by
+    several counts per sample. Movement must be scored against that noise."""
+
+    T0 = 1_780_000_000.0
+
+    @staticmethod
+    def _tracker():
+        holder = main.DBHolder(_make_db())
+        main._db_write_failures = 0
+        return main.SessionTracker(side="left", db=holder, calibration=_Cal(),
+                                   pump_gate=main.PumpGateCapSense(),
+                                   _last_movement_write=0.0)
+
+    @staticmethod
+    def _feed(t, start, seconds, sigma, rng, rise=600, hz=2.0):
+        ts = start
+        while ts < start + seconds:
+            t.process(ts, {"type": "capSense",
+                           "left": {ch: int(round(v + rise + rng.gauss(0, sigma))) for ch, v in EMPTY.items()}})
+            ts += 1 / hz
+        return ts
+
+    @staticmethod
+    def _minutes(t):
+        return t.db.conn.execute("SELECT timestamp, total_movement FROM movement ORDER BY timestamp").fetchall()
+
+    def _night_with_burst(self):
+        import random
+        rng = random.Random(4)
+        t = self._tracker()
+        ts = self._feed(t, self.T0, 600, 6, rng, rise=0)       # empty bed
+        ts = self._feed(t, ts, 25 * 60, 6, rng)                # in bed, still
+        burst_at = ts
+        ts = self._feed(t, ts, 20, 150, rng)                   # turning over
+        self._feed(t, ts, 10 * 60, 6, rng)                     # still again
+        return t, burst_at
+
+    def test_still_minutes_score_near_zero_despite_sensor_noise(self):
+        t, burst_at = self._night_with_burst()
+        rows = self._minutes(t)
+        still = [m for ts, m in rows if self.T0 + 600 + 180 <= ts < burst_at - 60]
+        assert len(still) >= 15
+        assert max(still) <= 50
+
+    def test_a_movement_burst_shows_up_in_its_minute(self):
+        # Previously every occupied minute saturated at 1000 and the trailing
+        # baseline subtraction zeroed all of them, bursts included.
+        t, burst_at = self._night_with_burst()
+        rows = self._minutes(t)
+        around = [m for ts, m in rows if burst_at - 60 <= ts <= burst_at + 180]
+        assert max(around) >= 200
+
+    def test_noise_estimate_needs_a_minute_of_samples(self):
+        t = self._tracker()
+        assert t._capsense_movement([500.0, 500.0, 500.0]) == 0.0
+        for _ in range(main.CAPSENSE_NOISE_MIN_SAMPLES - 2):
+            t._capsense_movement([5.0, 5.0, 5.0])
+        assert t._capsense_movement([500.0, 5.0, 5.0]) == pytest.approx(500 - main.CAPSENSE_NOISE_K * 5)
+
+    def test_a_silent_channel_still_needs_a_real_change(self):
+        # A channel that barely moves has typical delta 0: the floor keeps a
+        # 1-2 count flicker from counting as movement.
+        t = self._tracker()
+        for _ in range(main.CAPSENSE_NOISE_WINDOW):
+            t._capsense_movement([0.0, 0.0, 0.0])
+        assert t._capsense_movement([2.0, 1.0, 0.0]) == 0.0
+        assert t._capsense_movement([10.0, 0.0, 0.0]) == pytest.approx(10 - main.CAPSENSE_NOISE_K * main.CAPSENSE_NOISE_FLOOR)
+
+    def _feed_levels(self, t, start, seconds, rng, level, hz=2.0, sigma=6):
+        """Still sleeper; `level(k)` gives the per-channel offsets at sample k."""
+        if start == self.T0:
+            start = self._feed(t, start, 600, sigma, rng, rise=0)   # empty bed first
+        ts, k = start, 0
+        while ts < start + seconds:
+            off = level(k)
+            t.process(ts, {"type": "capSense",
+                           "left": {ch: int(round(v + 600 + off[ch] + rng.gauss(0, sigma))) for ch, v in EMPTY.items()}})
+            ts += 1 / hz
+            k += 1
+        return ts
+
+    def test_breathing_flicker_on_one_channel_is_not_movement(self):
+        # One channel flipping between two levels with each breath (every
+        # ~4 s, 220 counts apart) while the body is still used to score 1000
+        # every minute.
+        import random
+        rng = random.Random(7)
+        t = self._tracker()
+        still = {"out": 0, "cen": 0, "in": 0}
+        ts = self._feed_levels(t, self.T0, 15 * 60, rng, lambda k: still)
+        flicker_at = ts
+        self._feed_levels(t, ts, 10 * 60, rng,
+                          lambda k: {"out": 0, "cen": 0, "in": -220 if k % 8 < 3 else 0})
+        rows = [m for ts, m in self._minutes(t) if ts >= flicker_at + 60]
+        assert len(rows) >= 8
+        assert max(rows) <= 50
+
+    def test_moving_to_a_new_position_still_counts(self):
+        import random
+        rng = random.Random(8)
+        t = self._tracker()
+        zero = {"out": 0, "cen": 0, "in": 0}
+        ts = self._feed_levels(t, self.T0, 15 * 60, rng, lambda k: zero)
+        moved_at = ts
+        before = len(t._epoch_scores)
+        self._feed_levels(t, ts, 5 * 60, rng, lambda k: {"out": 400, "cen": -300, "in": 250})
+        assert max(list(t._epoch_scores)[before:]) >= 500
+        # ...and it reaches the stored minute (no median filter on capSense).
+        around = [m for ts, m in self._minutes(t) if moved_at - 60 <= ts <= moved_at + 120]
+        assert max(around) >= 500
+
+    def test_a_single_busy_minute_between_still_ones_is_kept(self):
+        # The 3-epoch median used to zero a lone turn-over minute.
+        import random
+        rng = random.Random(9)
+        t = self._tracker()
+        zero = {"out": 0, "cen": 0, "in": 0}
+        ts = self._feed_levels(t, self.T0, 15 * 60, rng, lambda k: zero)
+        busy_at = ts
+        ts = self._feed_levels(t, ts, 20, rng, lambda k: {"out": 40 * k, "cen": -30 * k, "in": 25 * k})
+        self._feed_levels(t, ts, 5 * 60, rng, lambda k: {"out": 800, "cen": -600, "in": 500})
+        rows = self._minutes(t)
+        busy = [m for ts, m in rows if busy_at - 60 <= ts <= busy_at + 120]
+        after = [m for ts, m in rows if busy_at + 180 <= ts]
+        assert max(busy) >= 300
+        assert max(after) <= 50
+
+    @staticmethod
+    def _flush_one(t, scale, raw, at):
+        """Write one epoch of `raw` summed movement after 20 still ones."""
+        t._scale_factor = scale
+        t._session_start = at - 3600
+        t._epoch_scores.extend([0] * 20)
+        t._median_buf.extend([0, 0])
+        t._movement_buf = [raw]
+        t._last_movement_write = at - 61
+        t._flush_movement(at)
+
+    def test_capsense_writes_a_lone_busy_epoch_unfiltered(self):
+        t = self._tracker()
+        self._flush_one(t, 1.0, 700.0, self.T0)
+        assert [m for _, m in self._minutes(t)] == [700]
+
+    def test_capsense2_keeps_the_median_filter(self):
+        # Pod 5: a lone busy epoch between still ones is still smoothed away.
+        t = self._tracker()
+        self._flush_one(t, 10.0, 70.0, self.T0)
+        assert [m for _, m in self._minutes(t)] == [0]
+
+    def _warm(self, t, noise=5.0):
+        for _ in range(main.CAPSENSE_NOISE_MIN_SAMPLES):
+            t._capsense_movement([noise, noise, noise])
+
+    def test_a_jump_back_to_a_recent_level_adds_nothing(self):
+        t = self._tracker()
+        self._warm(t)
+        margin = main.CAPSENSE_NOISE_K * 5
+        t._cap_levels.extend([[1000, 2000, 2400], [1000, 2000, 2400], [1000, 2000, 2650]])
+        # Back to 2400, held two samples ago; out and cen didn't move.
+        assert t._capsense_movement([0.0, 0.0, 250.0], [1000, 2000, 2400]) == 0.0
+        # Within the margin of that level still counts as a return.
+        assert t._capsense_movement([0.0, 0.0, 250.0], [1000, 2000, 2400 + margin]) == 0.0
+        # Just past it is a new level.
+        assert t._capsense_movement([0.0, 0.0, 250.0], [1000, 2000, 2400 + margin + 1]) == pytest.approx(250 - margin)
+
+    def test_the_previous_sample_is_not_a_recent_level(self):
+        # The jump starts from the previous sample; only earlier ones count.
+        t = self._tracker()
+        self._warm(t)
+        t._cap_levels.extend([[1000, 2000, 2650]])
+        assert t._capsense_movement([0.0, 0.0, 250.0], [1000, 2000, 2400]) == pytest.approx(250 - main.CAPSENSE_NOISE_K * 5)
+
+    def test_levels_are_remembered_for_about_three_minutes(self):
+        t = self._tracker()
+        self._warm(t)
+        t._cap_levels.append([1000, 2000, 2400])
+        t._cap_levels.extend([[1000, 2000, 2650]] * (main.CAPSENSE_LEVEL_MEMORY + 1))
+        # 2400 has aged out of the memory: the jump counts again.
+        assert t._capsense_movement([0.0, 0.0, 250.0], [1000, 2000, 2400]) == pytest.approx(250 - main.CAPSENSE_NOISE_K * 5)
+        assert main.CAPSENSE_LEVEL_MEMORY == 360
+
+    def test_each_channel_is_judged_on_its_own_levels(self):
+        t = self._tracker()
+        self._warm(t)
+        t._cap_levels.extend([[1000, 2000, 2400], [1000, 2000, 2650]])
+        # in returns to a recent level; out moves somewhere new.
+        assert t._capsense_movement([300.0, 0.0, 250.0], [1300, 2000, 2400]) == pytest.approx(300 - main.CAPSENSE_NOISE_K * 5)
+
+    def test_the_tracker_records_levels_even_while_pump_gated(self):
+        t = self._tracker()
+        t.pump_gate.is_gated = lambda *a, **k: True
+        for i in range(5):
+            t.process(self.T0 + i / 2, {"type": "capSense", "left": {"out": 1000 + i, "cen": 2000, "in": 2400}})
+        assert [lv[0] for lv in t._cap_levels] == [1000, 1001, 1002, 1003, 1004]

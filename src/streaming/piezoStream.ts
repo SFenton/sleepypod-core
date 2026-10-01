@@ -412,7 +412,20 @@ type SensorType = typeof ALL_SENSOR_TYPES[number]
 
 const cborDecoder = new Decoder({ mapsAsObjects: true, useRecords: false })
 
-/** Convert raw byte buffer of little-endian int32s to a JS number array. */
+/**
+ * frankenfirmware writes INT32_MAX in place of a sample it lost — one sample
+ * on every piezo channel at once, in a few percent of records. Plotted, it's
+ * a spike that flattens the waveform; the piezo-processor repairs it the
+ * same way (modules/piezo-processor/main.py `_int32_samples`).
+ */
+const LOST_SAMPLE = 0x7FFFFFFF
+
+/**
+ * Convert raw byte buffer of little-endian int32s to a JS number array.
+ * Lost-sample markers are replaced by linear interpolation between their
+ * neighbours (the nearest valid sample at an edge); a buffer with no valid
+ * sample converts to [].
+ */
 function int32BufferToArray(raw: Buffer | Uint8Array | undefined): number[] {
   if (!raw || raw.length === 0) return []
   // Guard against partial buffers (byteLength not multiple of 4)
@@ -420,8 +433,27 @@ function int32BufferToArray(raw: Buffer | Uint8Array | undefined): number[] {
   if (usableBytes === 0) return []
   const view = new DataView(raw.buffer, raw.byteOffset, usableBytes)
   const nums: number[] = []
+  let lost = 0
   for (let i = 0; i < usableBytes; i += 4) {
-    nums.push(view.getInt32(i, true))
+    const v = view.getInt32(i, true)
+    if (v === LOST_SAMPLE) lost++
+    nums.push(v)
+  }
+  return lost ? repairLostSamples(nums) : nums
+}
+
+function repairLostSamples(nums: number[]): number[] {
+  let prev = -1 // index of the last valid sample
+  for (let i = 0; i <= nums.length; i++) {
+    if (i < nums.length && nums[i] === LOST_SAMPLE) continue
+    // nums[prev+1 .. i-1] are lost: fill between the valid samples around them
+    for (let k = prev + 1; k < i; k++) {
+      if (prev < 0 && i >= nums.length) return []
+      if (prev < 0) nums[k] = nums[i]
+      else if (i >= nums.length) nums[k] = nums[prev]
+      else nums[k] = Math.round(nums[prev] + (nums[i] - nums[prev]) * (k - prev) / (i - prev))
+    }
+    prev = i
   }
   return nums
 }

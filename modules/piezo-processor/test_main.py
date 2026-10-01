@@ -709,6 +709,43 @@ class TestInt32Samples:
         assert main._int32_samples(None).size == 0
         assert main._int32_samples(12345).size == 0
 
+    def test_lost_sample_marker_is_interpolated(self):
+        import main
+        lost = main.LOST_SAMPLE
+        buf = np.array([100, 200, lost, 400, lost, lost, 700], dtype=np.int32).tobytes()
+        assert main._int32_samples(buf).tolist() == [100, 200, 300, 400, 500, 600, 700]
+
+    def test_lost_sample_at_a_record_edge_takes_its_neighbour(self):
+        import main
+        lost = main.LOST_SAMPLE
+        buf = np.array([lost, -50, 10, lost], dtype=np.int32).tobytes()
+        assert main._int32_samples(buf).tolist() == [-50, -50, 10, 10]
+
+    def test_record_of_only_lost_samples_is_empty(self):
+        import main
+        buf = np.full(4, main.LOST_SAMPLE, dtype=np.int32).tobytes()
+        assert main._int32_samples(buf).size == 0
+
+    def test_lost_sample_does_not_trip_the_pump_gate(self):
+        """The marker sits on all four channels at once: symmetric and ~450x
+        the signal, exactly what the gate looks for. Decoded, it's gone."""
+        import main
+        rng = np.random.default_rng(7)
+        gate = main.PumpGate()
+        for _ in range(20):
+            gate.check(rng.normal(-90_000, 200_000, 500).astype(np.int32),
+                       rng.normal(-110_000, 200_000, 500).astype(np.int32))
+        left = rng.normal(-90_000, 200_000, 500).astype(np.int32)
+        right = rng.normal(-110_000, 200_000, 500).astype(np.int32)
+        left[217] = right[217] = main.LOST_SAMPLE
+        assert gate.check(left, right) is True  # raw: taken for a pump
+        gate = main.PumpGate()
+        for _ in range(20):
+            gate.check(rng.normal(-90_000, 200_000, 500).astype(np.int32),
+                       rng.normal(-110_000, 200_000, 500).astype(np.int32))
+        assert gate.check(main._int32_samples(left.tobytes()),
+                          main._int32_samples(right.tobytes())) is False
+
     def test_history_bounded_under_sustained_input(self):
         """HRTracker history must not grow unbounded — only the last
         history_len entries are ever consulted, so retaining more leaks

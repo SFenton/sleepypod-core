@@ -88,6 +88,8 @@ stateDiagram-v2
 
 `RawFileFollower` tails `.RAW` files in `/persistent/` with a 10 ms poll interval. Each record is CBOR-decoded. Only records with `type == "piezo-dual"` are processed. Each record contains approximately 500 int32 samples per channel (`left1`, `right1`), representing 1 second of data at 500 Hz.
 
+**Lost samples.** The firmware writes `INT32_MAX` (2147483647) in place of a sample it lost — it logs `[sensor] sample lost` — on all four channels at once, in a few percent of records. Read as data that is a spike ~450× any real signal: symmetric on both sides, so the pump gate (Stage 2) dropped the record and its 5 s guard, and downstream windows restarted. `_int32_samples` replaces each marker by linear interpolation between its neighbours (the nearest valid sample at a record edge). On a Pod 4 night this took data dropped as "pump" from 24% of records to under 1%. The sensor stream (`piezoStream.ts`) repairs it the same way for the live waveform.
+
 ### Stage 2: Pump Gating
 
 See [Section 4](#4-pump-gating).

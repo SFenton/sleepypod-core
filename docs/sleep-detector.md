@@ -72,7 +72,11 @@ The delta approach removes the DC presence offset entirely. A person's body shif
 | 200-500 | Limb repositioning, partial turn | 5-10% |
 | 500+ | Major position change, rolling over | 1-3% (~1-2/hour) |
 
-Score is capped at 1000. The scale factor is sensor-type-dependent: capSense2 (Pod 5) uses `×10`, capSense (Pod 3) uses `×0.5` to normalize the different ADC ranges to the same 0-1000 scale. Boundaries are empirical and may need per-pod tuning.
+Score is capped at 1000. capSense2 (Pod 5) sums its float channel deltas `×10`. Boundaries are empirical and may need per-pod tuning.
+
+capSense (Pod 3/4) integer channels change by several counts per sample with nobody moving, so a plain delta sum saturates every minute. Instead each channel's delta counts `×1`, only by its excess over `CAPSENSE_NOISE_K` (6) times that channel's typical delta (median over the last ~10 minutes, at least 1), and only when it lands on a level the channel hasn't held in the last `CAPSENSE_LEVEL_MEMORY` samples (~3 min). The level rule is for breathing flicker: in some lying positions one channel flips between two fixed levels (~200 counts apart) with each breath while the body is still, which otherwise scored 1000 for half an hour at a time. Turning over moves the channels to new levels and still counts; the return leg of an out-and-back motion (a tap, a twitch) doesn't.
+
+After summing, each epoch has the 5th percentile of the trailing epochs subtracted. capSense2 epochs then pass through a 3-epoch median filter. capSense epochs don't: a turn-over is usually one busy minute between still ones, which the median zeroed, and the noise margin and level memory already reject that sensor's artifacts.
 
 Normal healthy sleep averages ~10 major position changes per night (De Koninck et al. 1992).
 

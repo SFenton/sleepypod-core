@@ -5,9 +5,9 @@ import { waterLevelReadings, flowReadings, primeEvents, thermalState } from '@/s
 import { onFrame as pumpStallOnFrame } from './pumpStallGuard'
 import { DEFAULT_HEATING_DURATION } from './types'
 import type { DeviceStatus, Side } from './types'
-import { getLastSideMutationAt } from './sideMutations'
+import { getLastSideMutationAt, markFirmwareSynced } from './sideMutations'
 
-export { markSideMutated, _resetMutationStamps } from './sideMutations'
+export { markSideMutated, _resetMutationStamps, hasFirmwareSynced, _resetFirmwareSynced } from './sideMutations'
 
 /**
  * Consumes status:updated events and writes current device state to the DB.
@@ -130,6 +130,7 @@ export class DeviceStateSync {
         this.upsertSide('left', status),
         this.upsertSide('right', status),
       ])
+      markFirmwareSynced()
     }
     catch (error) {
       console.error(
@@ -197,12 +198,29 @@ export class DeviceStateSync {
     const sideStatus = side === 'left' ? status.leftSide : status.rightSide
     const now = new Date()
 
-    // An observed countdown expiry or an explicit neutral/zero state ends
-    // regulation even while firmware retains the target or current level.
+    // Regulation has ended in either of two separate cases:
+    //  - A neutral target, even while firmware retains the current level.
+    //    An explicit power-off only sets level 0 (setPower) and leaves the
+    //    firmware's countdown running, so the countdown must not be required
+    //    to reach zero: otherwise currentLevel wobbling through the
+    //    equalization flips the mirror on and off for an hour, and after a
+    //    restart the temperature controller reads one of those "on" polls as
+    //    a live session and re-energizes a side that was switched off. At
+    //    level 0 the hardware neither heats nor cools, so "off" is the honest
+    //    reading. No integer °F maps to level 0 (82.36–82.64°F); HomeKit's
+    //    unrounded °C→°F conversion can land there (28.0°C = 82.4°F), and
+    //    that side then reads off until the target changes.
+    //  - A confirmed countdown expiry while firmware retains a non-neutral
+    //    target (hasConfirmedSessionEnd only applies when targetLevel != 0).
     // Keep the DB/UI off while the water equalizes back to ambient.
-    const durationExpired = (sideStatus.targetLevel === 0 && sideStatus.heatingDuration === 0)
+    // Otherwise the side is regulating: power follows the commanded target,
+    // not the measured currentLevel, which passes through 0 on its way to
+    // a target on the other side of neutral and would otherwise read as a
+    // momentary off (clearing poweredOnAt and dropping the stall guard's
+    // expectedActive mid-session).
+    const durationExpired = sideStatus.targetLevel === 0
       || this.hasConfirmedSessionEnd(side, now.getTime())
-    const isNowPowered = durationExpired ? false : sideStatus.currentLevel !== 0
+    const isNowPowered = !durationExpired
 
     const skipPoweredFields = isSideRecentlyMutated(side)
     // When duration has expired, clear the target temperature so the UI

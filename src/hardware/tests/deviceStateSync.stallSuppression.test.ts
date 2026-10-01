@@ -54,6 +54,17 @@ function resetSchema(): void {
   ;(biometricsSqlite as any).exec(`
     DROP TABLE IF EXISTS water_level_readings;
     DROP TABLE IF EXISTS flow_readings;
+    DROP TABLE IF EXISTS thermal_state;
+    DROP TABLE IF EXISTS prime_events;
+    CREATE TABLE prime_events (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL);
+    CREATE TABLE thermal_state (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp INTEGER NOT NULL,
+      side TEXT NOT NULL,
+      is_powered INTEGER NOT NULL,
+      target_temp_f REAL,
+      current_temp_f REAL
+    );
     CREATE TABLE water_level_readings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       timestamp INTEGER NOT NULL,
@@ -326,9 +337,9 @@ describe('DeviceStateSync — stall guard expected-stop suppression', () => {
   })
 
   it('suppresses when firmware targetLevel is 0 while device_state still says powered', async () => {
-    // The field-observed failure: firmware commanded neutral, but
-    // device_state.isPowered stays true because durationExpired requires
-    // heatingDuration=0 too and currentLevel is still non-zero.
+    // Firmware commanded neutral while device_state still says powered (a
+    // lagging write, or a poll inside a mutation freshness window): the guard
+    // must follow the firmware target, not the mirror.
     await sync.sync(status({ targetLevel: 0, heatingDuration: 600 }))
     seedSide('left', true, 75) // sync's upsert may have flipped it; force the lagging-DB state
     seedSide('right', true, 75)
@@ -437,6 +448,32 @@ describe('DeviceStateSync — stall guard expected-stop suppression', () => {
     // 600s staleness bound, so a genuine stall in a later session is not
     // masked by the old snapshot.
     vi.setSystemTime(new Date('2026-07-11T08:16:40Z'))
+    sync.recordFlowData(frame({ rpm: 0 }))
+    expect((await lastGuardInput('left'))?.expectedActive).toBe(true)
+  })
+
+  it('feeds expectedActive=false and a null duration for a side commanded off', async () => {
+    seedSide('left', false, null)
+    seedSide('right', false, null)
+    sync.recordFlowData(frame({ rpm: 1_800 }))
+    expect(await lastGuardInput('left')).toMatchObject({ expectedActive: false, preStallDurationSeconds: null })
+  })
+
+  it('feeds expectedActive=true and a null duration for an active side with no observed countdown', async () => {
+    // No status poll yet: the side is commanded on but nothing projects a
+    // remaining session, so the guard gets no pre-stall duration (never the
+    // 8 h default).
+    seedSide('left', true, 78)
+    seedSide('right', true, 78)
+    sync.recordFlowData(frame({ rpm: 1_800 }))
+    expect(await lastGuardInput('left')).toMatchObject({ expectedActive: true, preStallDurationSeconds: null })
+  })
+
+  it('keeps expectedActive=true while the measured level crosses zero mid-session', async () => {
+    const mid = status({ targetLevel: 5, heatingDuration: 7200 })
+    mid.leftSide.currentLevel = 0
+    mid.rightSide.currentLevel = 0
+    await sync.sync(mid)
     sync.recordFlowData(frame({ rpm: 0 }))
     expect((await lastGuardInput('left'))?.expectedActive).toBe(true)
   })

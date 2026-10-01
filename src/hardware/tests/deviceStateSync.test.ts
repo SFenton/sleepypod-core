@@ -24,7 +24,7 @@ vi.mock('@/src/db', async () => {
 })
 
 import * as dbModule from '@/src/db'
-import { DeviceStateSync, markSideMutated, _resetMutationStamps, getAlarmState } from '../deviceStateSync'
+import { DeviceStateSync, markSideMutated, _resetMutationStamps, _resetFirmwareSynced, getAlarmState, hasFirmwareSynced } from '../deviceStateSync'
 
 const { sqlite, biometricsSqlite } = dbModule as typeof dbModule & {
   sqlite: BetterSqlite3.Database
@@ -263,6 +263,20 @@ describe('DeviceStateSync — mutation freshness window', () => {
 
     expect(readSide('left')?.is_powered).toBe(0) // not fresh, reconciled to neutral
     expect(readSide('right')?.is_powered).toBe(0) // fresh, preserved as off
+  })
+
+  it('marks the firmware as synced only after a status is mirrored successfully', async () => {
+    _resetFirmwareSynced()
+    ;(sqlite as any).exec('DROP TABLE device_state')
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      await sync.sync(status({ side: 'right', currentLevel: 5, targetLevel: 5, heatingDuration: 100 }))
+      expect(hasFirmwareSynced()).toBe(false)
+      resetSchema()
+      await sync.sync(status({ side: 'right', currentLevel: 5, targetLevel: 5, heatingDuration: 100 }))
+      expect(hasFirmwareSynced()).toBe(true)
+    }
+    finally { error.mockRestore() }
   })
 
   it('without any mutation, sync writes the firmware-derived powered state directly', async () => {
@@ -643,30 +657,6 @@ describe('DeviceStateSync — recordFlowData', () => {
     warnSpy.mockRestore()
   })
 
-  it('passes preStallDurationSeconds=null when the side is commanded off', async () => {
-    // Side row exists with is_powered=0; runStallGuard derives
-    // expectedActive=false and propagates null for duration. Exercises the
-    // falsy arm of the `expectedActive ? 28800 : null` ternary.
-    seedSide('left', false, null)
-    seedSide('right', false, null)
-
-    sync.recordFlowData(frzHealthFrame({ leftFlow: 1.0, rightFlow: 1.0 }))
-    await Promise.resolve()
-    // No assertion beyond "didn't throw" — branch coverage is the goal here.
-    expect(true).toBe(true)
-  })
-
-  it('passes preStallDurationSeconds=28800 when the side is commanded active', async () => {
-    // Both halves of the `Boolean(row?.isPowered && row.targetTemperature != null)`
-    // and the truthy arm of `expectedActive ? 28800 : null`.
-    seedSide('left', true, 78)
-    seedSide('right', true, 78)
-
-    sync.recordFlowData(frzHealthFrame({ leftFlow: 1.0, rightFlow: 1.0 }))
-    await Promise.resolve()
-    expect(true).toBe(true)
-  })
-
   it('logs raw value when runStallGuard catches a non-Error throw', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const origSelect = (dbModule.db as any).select.bind(dbModule.db)
@@ -884,7 +874,10 @@ describe('DeviceStateSync — sync targetTemperature behaviour without mutation'
     expect(row?.is_powered).toBe(1)
   })
 
-  it('does not expire a zero target level while heating duration remains', async () => {
+  it('reads a neutral target as off even while the firmware countdown and current level remain', async () => {
+    // An explicit power-off only sets level 0; the firmware keeps its heat
+    // session countdown running and currentLevel wobbles while the water
+    // equalizes. That must not read as powered.
     await sync.sync(status({
       side: 'right',
       targetTemperature: 78,
@@ -894,12 +887,36 @@ describe('DeviceStateSync — sync targetTemperature behaviour without mutation'
     }))
 
     expect(readSide('right')).toEqual(expect.objectContaining({
-      is_powered: 1,
-      target_temperature: 78,
+      is_powered: 0,
+      target_temperature: null,
+      powered_on_at: null,
     }))
   })
 
-  it('keeps a side off when its current level is zero during an active target', async () => {
+  it('turns a powered side off on a neutral-target poll after a restart, with no mutation marker', async () => {
+    // Pod 88, 2026-09-30: after the scheduled off, the mirror flipped on/off
+    // every 10–20 s on currentLevel alone; a service restart then lost the
+    // controller's in-memory off flag, read one "on" poll as a live session
+    // and re-energized the side for 8 h at the stale schedule target.
+    seedSide('right', true, 80)
+
+    await sync.sync(status({
+      side: 'right',
+      currentLevel: -10,
+      targetLevel: 0,
+      heatingDuration: 27_900,
+    }))
+
+    expect(readSide('right')).toEqual(expect.objectContaining({
+      is_powered: 0,
+      target_temperature: null,
+      powered_on_at: null,
+    }))
+  })
+
+  it('reads a side on from its target while the measured level crosses zero', async () => {
+    // currentLevel is measured, not commanded: it passes through 0 on the
+    // way to a target across neutral. That is still an active session.
     await sync.sync(status({
       side: 'right',
       targetTemperature: 78,
@@ -909,10 +926,10 @@ describe('DeviceStateSync — sync targetTemperature behaviour without mutation'
     }))
 
     expect(readSide('right')).toEqual(expect.objectContaining({
-      is_powered: 0,
-      powered_on_at: null,
+      is_powered: 1,
       target_temperature: 78,
     }))
+    expect(readSide('right')?.powered_on_at).not.toBeNull()
   })
 
   it('podVersion field on status payload is irrelevant to upsert', async () => {

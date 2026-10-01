@@ -44,6 +44,7 @@ export const VERDICT_STYLES: Record<string, { label: string, className: string }
   holding: { label: 'HOLDING', className: 'text-hold' },
   off: { label: 'OFF', className: 'text-fg-3' },
   stalled: { label: 'STALLED', className: 'text-danger' },
+  unknown: { label: 'NO PUMP DATA', className: 'text-fg-2' },
 }
 
 /**

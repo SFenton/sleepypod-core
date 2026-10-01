@@ -152,6 +152,19 @@ describe('health.thermal verdicts', () => {
     expect(left.note).toContain('TEC')
   })
 
+  it('unknown, not stalled, when powered on a pod that has never reported pump speed', async () => {
+    // Pod 3/4 firmware sends no frzHealth frames, so flow_readings stays empty.
+    rows.deviceStateQueue = [
+      [{ side: 'left', isPowered: true, targetTemperature: 75, currentTemperature: 75, isAlarmVibrating: false, poweredOnAt: new Date() }],
+      [{ side: 'right', isPowered: true, targetTemperature: 77, currentTemperature: 77, isAlarmVibrating: false, poweredOnAt: new Date() }],
+    ]
+    rows.flow = []
+    const res = await caller.thermal({})
+    expect(res.sides.map(s => s.verdict)).toEqual(['unknown', 'unknown'])
+    expect(res.sides[0].pumpRpm).toBeNull()
+    expect(res.sides[0].note).toContain('does not report pump speed')
+  })
+
   it('stalled when powered but the latest flow reading is stale (no fresh frames)', async () => {
     rows.deviceStateQueue = [
       [{ side: 'left', isPowered: true, targetTemperature: 81, currentTemperature: 72, isAlarmVibrating: false, poweredOnAt: new Date() }],

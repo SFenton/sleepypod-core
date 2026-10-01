@@ -1,5 +1,6 @@
 'use client'
 
+import { useState, type PointerEvent } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { ArrowRight, Clock, GitBranch, WifiOff } from 'lucide-react'
@@ -8,18 +9,19 @@ import type { AppRouter } from '@/src/server/routers/app'
 import { trpc } from '@/src/utils/trpc'
 import { useSideNames } from '@/src/hooks/useSideNames'
 import { useTemperatureUnit } from '@/src/hooks/useTemperatureUnit'
-import { Button, Card, InlineError, KeyValue, Skeleton, StatusDot } from '@/src/components/ds'
+import { Button, Card, HoverMark, InlineError, KeyValue, Skeleton, StatusDot, useHoverFraction } from '@/src/components/ds'
 import { cn } from '@/lib/utils'
 import { formatSetpointF } from '@/src/lib/tempUtils'
 import { langFromPath } from '@/src/components/AppShell/navItems'
 import { HealthRing } from '@/src/components/status/HealthCircle'
 import { PumpAlertsCard } from '@/src/components/status/PumpAlertsCard'
 import { formatUptime, useStatusSummary } from '@/src/components/status/StatusScreen'
-import { CurveChart, buildTimeline, useNowMinute } from '@/src/components/Schedule/CurveChart'
+import { CurveChart, CurveLegend, buildTimeline, readAt, useNowMinute } from '@/src/components/Schedule/CurveChart'
+import { bedTrace } from '@/src/components/Schedule/bedTrace'
 import { formatCountdown, nightSetPoints } from '@/src/components/Schedule/bothNight'
 import { fmtClock, fmtF, thermalDirection, type SchedJob } from './diagnosticsLogic'
 import { attentionItems, isPodLaneJob, jobsInWindow, nextTemperatureJob, podJobLabel, tonightWindow, TONIGHT_END_H, TONIGHT_START_H } from './dashboardLogic'
-import { panelDomain, seriesPath, THERMAL_PANELS } from './thermalHistoryLogic'
+import { nearestPoint, panelDomain, seriesPath, THERMAL_PANELS } from './thermalHistoryLogic'
 import type { DiagSection } from './DiagnosticsConsole'
 import { OccupancyCheck } from './OccupancyCheck'
 
@@ -255,7 +257,11 @@ function TonightCard({ onJump }: { onJump: (s: DiagSection) => void }) {
   const scheduler = trpc.health.scheduler.useQuery({ withinHours: 24 }, { refetchInterval: 60_000 })
   const left = trpc.schedules.getAll.useQuery({ side: 'left' }, { staleTime: 60_000 })
   const right = trpc.schedules.getAll.useQuery({ side: 'right' }, { staleTime: 60_000 })
+  // Measured bed temperature so far tonight; the window opens at 5 PM, so 24 h always reaches it.
+  const history = trpc.health.thermalHistory.useQuery({ range: '24h' }, { staleTime: 60_000, refetchInterval: 60_000 })
   const temps = { left: left.data?.temperature, right: right.data?.temperature }
+  // One hover shared by both lanes: the moment under the pointer (epoch ms).
+  const [hoverT, setHoverT] = useState<number | null>(null)
 
   const nowMinute = useNowMinute()
   if (nowMinute == null) return <Skeleton className="h-[220px]" />
@@ -273,6 +279,24 @@ function TonightCard({ onJump }: { onJump: (s: DiagSection) => void }) {
   const hourTicks: number[] = []
   for (let h = TONIGHT_START_H; h <= TONIGHT_END_H; h += 4) hourTicks.push(win.start + (h - TONIGHT_START_H) * 3_600_000)
 
+  const midnight = win.midnight.getTime()
+  // Curves saved entirely after midnight sit a day earlier on the chart's minute axis.
+  const shiftFor = (tl: Array<{ minutes: number }>) => (tl.length && tl[tl.length - 1].minutes < 12 * HOUR_MIN ? -24 * HOUR_MIN : 0)
+  const sides = SIDES.map((side) => {
+    const setPoints = nightSetPoints(temps[side], win.day)
+    const tl = buildTimeline(setPoints)
+    const shift = shiftFor(tl)
+    return { side, setPoints, tl, shift, bed: bedTrace(history.data?.points, side, win.midnight, shift) }
+  })
+  const onLanesPointerMove = (e: PointerEvent<HTMLDivElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    const x = e.clientX - rect.left - 96
+    const w = rect.width - 96
+    setHoverT(x < 0 || w <= 0 ? null : win.start + Math.min(1, x / w) * span)
+  }
+  const hoverPct = hoverT == null ? null : pct(hoverT)
+  const fmt = (v: number | null, decimals = 0) => (v == null ? '—' : formatSetpointF(v, unit, { includeUnit: false, decimals }))
+
   return (
     <Card className="gap-3" data-testid="tonight">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
@@ -283,6 +307,7 @@ function TonightCard({ onJump }: { onJump: (s: DiagSection) => void }) {
             : 'no temperature changes scheduled'}
         </span>
         <span className="ml-auto flex items-center gap-3 font-mono text-[11px] text-fg-2">
+          {history.data?.available.bedTarget && <CurveLegend />}
           {scheduler.data && (
             <span className={cn(drift?.drifted && 'text-warn')}>
               {`${scheduler.data.enabled ? (drift ? (drift.drifted ? 'drifted' : 'in sync') : 'running') : 'off'} · ${scheduler.data.jobCounts.total} jobs`}
@@ -299,13 +324,14 @@ function TonightCard({ onJump }: { onJump: (s: DiagSection) => void }) {
         </span>
       </div>
 
-      <div className="relative grid grid-cols-[84px_minmax(0,1fr)] gap-x-3">
-        {SIDES.map((side) => {
-          const setPoints = nightSetPoints(temps[side], win.day)
-          const tl = buildTimeline(setPoints)
+      <div
+        className="relative grid grid-cols-[84px_minmax(0,1fr)] gap-x-3"
+        data-testid="tonight-lanes"
+        onPointerMove={onLanesPointerMove}
+        onPointerLeave={() => setHoverT(null)}
+      >
+        {sides.map(({ side, setPoints, tl, shift, bed }) => {
           const range = tl.length ? `${Math.min(...tl.map(p => p.temperature))}–${Math.max(...tl.map(p => p.temperature))}°F` : 'no curve'
-          // Curves saved entirely after midnight sit a day earlier on the chart's minute axis.
-          const shift = tl.length && tl[tl.length - 1].minutes < 12 * HOUR_MIN ? -24 * HOUR_MIN : 0
           const powerJobs = tonightJobs.filter(j => (j.type === 'power_on' || j.type === 'power_off') && (j.side === side || j.side === 'both'))
           return [
             <div key={`${side}-label`} className="flex flex-col justify-center border-t border-line py-1.5">
@@ -319,7 +345,12 @@ function TonightCard({ onJump }: { onJump: (s: DiagSection) => void }) {
                   height={LANE_H}
                   showAxis={false}
                   grid="neutral"
+                  endLabels={false}
                   timeDomain={{ start: TONIGHT_START_H * HOUR_MIN + shift, end: TONIGHT_END_H * HOUR_MIN + shift, step: 4 * HOUR_MIN }}
+                  bed={bed}
+                  hoverMinutes={hoverT == null ? null : (hoverT - midnight) / 60_000 + shift}
+                  onHoverMinutes={m => setHoverT(m == null ? null : midnight + (m - shift) * 60_000)}
+                  hoverMarks={false}
                 />
               )}
               {powerJobs.map(j => (
@@ -372,6 +403,30 @@ function TonightCard({ onJump }: { onJump: (s: DiagSection) => void }) {
             <span className="absolute -top-3.5 -translate-x-1/2 font-mono text-[9px] text-fg-2">now</span>
           </div>
         )}
+
+        {hoverT != null && hoverPct != null && (
+          <div
+            data-testid="tonight-hover"
+            className="pointer-events-none absolute top-0 bottom-4 border-l border-fg/35"
+            style={{ left: `calc(96px + (100% - 96px) * ${hoverPct / 100})` }}
+          >
+            <div
+              className={cn(
+                'absolute top-1 grid grid-cols-[auto_auto] gap-x-3 gap-y-0.5 rounded-ctl border border-line bg-surface-card px-2.5 py-1.5 font-mono text-[11px] whitespace-nowrap',
+                hoverPct > 50 ? 'right-2' : 'left-2',
+              )}
+            >
+              <span className="col-span-2 text-fg-2">{`${fmtClock(new Date(hoverT).toISOString())} · target / bed`}</span>
+              {sides.map(({ side, setPoints, shift, bed }) => {
+                const at = readAt(setPoints, bed, (hoverT - midnight) / 60_000 + shift)
+                return [
+                  <span key={`${side}-n`} className="text-fg">{sideName(side)}</span>,
+                  <span key={`${side}-v`} className="text-fg">{`${fmt(at.target)} / ${fmt(at.bed, 1)}`}</span>,
+                ]
+              })}
+            </div>
+          </div>
+        )}
       </div>
     </Card>
   )
@@ -395,6 +450,14 @@ function SideSummaryCard({ side: s, onClick }: { side: ThermalSide, onClick: () 
   const panel = THERMAL_PANELS[0]
   const domain = h ? panelDomain({ ...panel, series: [{ key, label: '' }] }, h.points) : null
   const onAt = s.isPowered && s.poweredOnAt ? new Date(s.poweredOnAt) : null
+  const hover = useHoverFraction()
+  let readout: { pct: number, label: string } | null = null
+  if (h && hover.frac !== null) {
+    const t = h.from + hover.frac * (h.to - h.from)
+    const p = nearestPoint(h.points, t)
+    const v = p && Math.abs(p.t - t) <= h.bucketSec * 3000 ? p[key] : null
+    readout = { pct: hover.frac * 100, label: `${fmtClock(new Date(t).toISOString())} · ${fmtF(v)}` }
+  }
 
   return (
     <Card onClick={onClick} className="cursor-pointer gap-2.5 hover:bg-active" data-testid={`side-${side}`}>
@@ -411,16 +474,19 @@ function SideSummaryCard({ side: s, onClick }: { side: ThermalSide, onClick: () 
       </div>
       {h && domain
         ? (
-            <svg viewBox={`0 0 ${SPARK_W} ${SPARK_H}`} preserveAspectRatio="none" className="h-10 w-full" aria-label={`${sideName(side)} last 12 hours`}>
-              <path
-                transform={`scale(1 ${SPARK_H / 100})`}
-                d={seriesPath(h.points, key, h.from, h.to - h.from, SPARK_W, domain, h.bucketSec * 3000)}
-                fill="none"
-                stroke={side === 'left' ? 'var(--text-1)' : 'var(--stage-rem)'}
-                strokeWidth={1.5}
-                vectorEffect="non-scaling-stroke"
-              />
-            </svg>
+            <div className="relative h-10" onPointerMove={hover.onPointerMove} onPointerLeave={hover.onPointerLeave}>
+              <svg viewBox={`0 0 ${SPARK_W} ${SPARK_H}`} preserveAspectRatio="none" className="h-10 w-full" aria-label={`${sideName(side)} last 12 hours`}>
+                <path
+                  transform={`scale(1 ${SPARK_H / 100})`}
+                  d={seriesPath(h.points, key, h.from, h.to - h.from, SPARK_W, domain, h.bucketSec * 3000)}
+                  fill="none"
+                  stroke={side === 'left' ? 'var(--text-1)' : 'var(--stage-rem)'}
+                  strokeWidth={1.5}
+                  vectorEffect="non-scaling-stroke"
+                />
+              </svg>
+              {readout && <HoverMark pct={readout.pct} label={readout.label} />}
+            </div>
           )
         : <div className="h-10" />}
       <span className="font-mono text-[10px] text-fg-3">
