@@ -1466,6 +1466,10 @@ $SUPP_GROUPS_LINE
 UMask=0002
 WorkingDirectory=$INSTALL_DIR
 Environment="NODE_ENV=production"
+# Let instrumentation.ts own SIGTERM/SIGINT. Without this, Next.js exits 143
+# immediately and the graceful shutdown (MQTT offline + clean disconnect,
+# scheduler drain, DB close) never runs.
+Environment="NEXT_MANUAL_SIG_HANDLE=true"
 Environment="DATABASE_URL=file:$DATA_DIR/sleepypod.db"
 Environment="BIOMETRICS_DATABASE_URL=file:$DATA_DIR/biometrics.db"
 Environment="DAC_SOCK_PATH=$DAC_SOCK_PATH"

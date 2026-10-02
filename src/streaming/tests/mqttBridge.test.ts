@@ -1070,6 +1070,61 @@ describe('mqttBridge — startMqttBridge connect flow', () => {
     await shutdownMqttBridge()
   })
 
+  it('subscribes to its own availability topic on connect', async () => {
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+
+    expect(fake.subscribe).toHaveBeenCalledWith(
+      `sleepypod/${deviceId()}/availability`,
+      { qos: 0 },
+      expect.any(Function),
+    )
+
+    await shutdownMqttBridge()
+  })
+
+  it('republishes online when a stale offline will arrives while connected', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const fake = await startBridgeWithFake()
+    fake.connected = true
+    fake.emit('connect')
+    const availability = `sleepypod/${deviceId()}/availability`
+    fake.publish.mockClear()
+
+    fake.emit('message', availability, Buffer.from('online'))
+    expect(fake.publish).not.toHaveBeenCalled()
+
+    fake.emit('message', availability, Buffer.from('offline'))
+    expect(fake.publish).toHaveBeenCalledTimes(1)
+    expect(fake.publish).toHaveBeenCalledWith(
+      availability,
+      'online',
+      expect.objectContaining({ retain: true }),
+      expect.any(Function),
+    )
+    expect(deviceMock.setTemperature).not.toHaveBeenCalled()
+
+    warn.mockRestore()
+    await shutdownMqttBridge()
+  })
+
+  it('does not republish online for offline observed before connect or after shutdown', async () => {
+    const fake = await startBridgeWithFake()
+    const availability = `sleepypod/${deviceId()}/availability`
+
+    fake.emit('message', availability, Buffer.from('offline'))
+    expect(fake.publish).not.toHaveBeenCalledWith(availability, 'online', expect.anything(), expect.anything())
+
+    fake.connected = true
+    fake.emit('connect')
+    await shutdownMqttBridge()
+    fake.publish.mockClear()
+
+    fake.emit('message', availability, Buffer.from('offline'))
+    expect(fake.publish).not.toHaveBeenCalled()
+  })
+
   it('records reconnect/close/error transitions', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {})
     const fake = await startBridgeWithFake()
