@@ -5,8 +5,13 @@
  *
  * Lifecycle (managed by instrumentation.ts):
  *   1. startMqttBridge()    — resolve config, connect, publish HA discovery,
- *                             start state-mirror loop, subscribe to cmd/*
+ *                             start state-mirror loop, subscribe to cmd/* and
+ *                             own availability (republish online if a stale
+ *                             session's offline will lands after connect)
  *   2. shutdownMqttBridge() — publish offline retained, end client cleanly
+ *                             (requires NEXT_MANUAL_SIG_HANDLE=true on the
+ *                             service; otherwise Next.js exits on SIGTERM
+ *                             before instrumentation's graceful shutdown runs)
  *
  * Configuration precedence per field: device_settings row > MQTT_* env > default.
  * If the resolved row leaves both NULL the field falls back to env, and finally
@@ -2183,6 +2188,12 @@ export async function startMqttBridge(): Promise<void> {
     client.subscribe(topic('cmd', '+'), { qos: 0 }, (err: Error | null) => {
       if (err) console.warn('[mqtt] subscribe cmd/* failed:', err.message)
     })
+    // A previous session that died without a clean disconnect (reboot, crash,
+    // Wi-Fi drop) can have its retained `offline` will fire after this session
+    // already published `online`. Watch our own availability to repair that.
+    client.subscribe(availabilityTopic, { qos: 0 }, (err: Error | null) => {
+      if (err) console.warn('[mqtt] subscribe availability failed:', err.message)
+    })
     void publishState()
     void publishEolOccupancy()
     void publishFusedOccupancy()
@@ -2203,6 +2214,18 @@ export async function startMqttBridge(): Promise<void> {
   })
 
   client.on('message', (incomingTopic: string, payload: Buffer) => {
+    if (incomingTopic === availabilityTopic) {
+      if (
+        payload.toString('utf-8') === 'offline'
+        && state.client === client
+        && state.runState === 'connected'
+        && client.connected
+      ) {
+        console.warn('[mqtt] stale offline availability observed while connected; republishing online')
+        safePublish(availabilityTopic, 'online', RETAINED_QOS_0)
+      }
+      return
+    }
     const cmdPrefix = topic('cmd') + '/'
     if (!incomingTopic.startsWith(cmdPrefix)) return
     const verb = incomingTopic.slice(cmdPrefix.length)

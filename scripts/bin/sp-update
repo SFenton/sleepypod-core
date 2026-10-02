@@ -717,6 +717,22 @@ if [ "$(cat "$NATS_ORDERING_DROPIN" 2>/dev/null || true)" != "$nats_ordering_con
   systemctl daemon-reload
 fi
 
+# Let instrumentation.ts own SIGTERM/SIGINT on pods installed before the main
+# unit carried this line. Without it Next.js exits 143 on stop/reboot before
+# the graceful shutdown publishes MQTT offline and disconnects cleanly, so a
+# stale session's retained offline will can land after the next boot's online.
+SIGNAL_HANDLING_DROPIN=/etc/systemd/system/sleepypod.service.d/manual-signal-handling.conf
+mkdir -p "$(dirname "$SIGNAL_HANDLING_DROPIN")"
+signal_handling_content=$(cat << 'EOF'
+[Service]
+Environment="NEXT_MANUAL_SIG_HANDLE=true"
+EOF
+)
+if [ "$(cat "$SIGNAL_HANDLING_DROPIN" 2>/dev/null || true)" != "$signal_handling_content" ]; then
+  printf '%s\n' "$signal_handling_content" > "$SIGNAL_HANDLING_DROPIN"
+  systemctl daemon-reload
+fi
+
 # Install CLI tools from new source.
 #
 # Use `install` (atomic mkstemp + rename) instead of `cp` — sp-update is
