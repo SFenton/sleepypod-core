@@ -49,6 +49,16 @@ let pollHandle: ReturnType<typeof setInterval> | null = null
 /** Track in-flight powerOffSide() calls so shutdown can await them. */
 const pendingPowerOffs = new Set<Promise<void>>()
 
+/**
+ * Sides with a power-off queued or running. The off waits on the side lock and
+ * device_state stays powered until it runs, so without this every 30s poll
+ * would queue another power-off behind a long-held lock.
+ */
+const powerOffInFlight = new Set<Side>()
+
+/** 'timeout' = per-side presence countdown; 'cap' = global wall-clock cap. */
+type PowerOffReason = 'timeout' | 'cap'
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -181,11 +191,52 @@ function presenceState(side: Side): 'occupied' | 'empty' | 'unsensable' {
   }
 }
 
-/** Power off a side via the shared hardware client. */
-async function powerOffSide(side: Side): Promise<void> {
+/** Whether the side has been powered longer than the global wall-clock cap. */
+function isGlobalCapExceeded(side: Side, globalMaxOnHours: number | null): boolean {
+  if (globalMaxOnHours == null || globalMaxOnHours <= 0) return false
+  const poweredOnAtMs = getPoweredOnAtMs(side)
+  if (poweredOnAtMs == null) return false
+  const msSincePowerOn = Date.now() - poweredOnAtMs
+  // Clock-sanity guard: skip the cap if poweredOnAt is in the future
+  // (NTP reset, clock drift). The 7-day upper bound protects against a
+  // stale row from a pre-2024 clock-seeded migration.
+  const suspicious = msSincePowerOn < 0 || msSincePowerOn > 7 * 86_400_000
+  return !suspicious && msSincePowerOn > globalMaxOnHours * 3600_000
+}
+
+/** Whether a reliably-empty side has been empty for its full timeout. */
+function isEmptyTimeoutElapsed(side: Side, minutes: number): boolean {
+  const since = emptySince[side]
+  return since != null && Date.now() - since >= minutes * 60_000
+}
+
+/**
+ * Re-check, under the side lock, that the power-off is still warranted: the
+ * decision was made before queueing, and the side's state, its settings, or
+ * the countdown (restartAutoOffTimers / cancelAutoOffTimer) may have changed
+ * while it waited. The global cap fires regardless of presence.
+ */
+function isStillEligible(side: Side, reason: PowerOffReason): boolean {
+  if (!isSidePowered(side) || hasActiveRunOnce(side)) return false
+  const cfg = getAutoOffConfig()[side]
+  if (cfg.alwaysOn) return false
+  if (reason === 'cap') return isGlobalCapExceeded(side, getGlobalMaxOnHours())
+  return cfg.enabled
+    && presenceState(side) === 'empty'
+    && isEmptyTimeoutElapsed(side, cfg.minutes)
+}
+
+/** Power off a side through the temperature controller. */
+async function powerOffSide(side: Side, reason: PowerOffReason): Promise<void> {
   try {
-    await getTemperatureController().powerOff(side)
-    console.log(`[auto-off] Powered off ${side} side (no presence detected)`)
+    let eligible = false
+    await getTemperatureController().powerOff(side, () => (eligible = isStillEligible(side, reason)))
+    if (eligible) {
+      console.log(`[auto-off] Powered off ${side} side (no presence detected)`)
+    }
+    else {
+      console.log(`[auto-off] ${side}: power-off skipped, no longer eligible`)
+    }
   }
   catch (error) {
     console.error(
@@ -196,11 +247,15 @@ async function powerOffSide(side: Side): Promise<void> {
 }
 
 /**
- * Fire powerOffSide and track the promise so shutdown can await it.
+ * Fire powerOffSide and track the promise so shutdown can await it. A timeout
+ * off keeps emptySince until its locked re-check, so a settings change or a
+ * cancelled countdown while it is queued still stops it.
  */
-function firePowerOff(side: Side): void {
-  clearEmptySince(side)
-  const p = powerOffSide(side).finally(() => {
+function firePowerOff(side: Side, reason: PowerOffReason): void {
+  powerOffInFlight.add(side)
+  const p = powerOffSide(side, reason).finally(() => {
+    clearEmptySince(side)
+    powerOffInFlight.delete(side)
     pendingPowerOffs.delete(p)
   })
   pendingPowerOffs.add(p)
@@ -216,6 +271,9 @@ function evaluateSide(
   globalMaxOnHours: number | null,
 ): void {
   const cfg = config[side]
+
+  // A power-off is already queued; it re-checks eligibility once it runs.
+  if (powerOffInFlight.has(side)) return
 
   // Side already off — nothing to evaluate for either cap
   if (!isSidePowered(side)) {
@@ -235,23 +293,12 @@ function evaluateSide(
   // If a side has been powered for > globalMaxOnHours, force it off. This is
   // the safety net that fires even when the biometrics pipeline is broken or
   // presence can't be sensed at all.
-  if (globalMaxOnHours != null && globalMaxOnHours > 0) {
-    const poweredOnAtMs = getPoweredOnAtMs(side)
-    if (poweredOnAtMs != null) {
-      const msSincePowerOn = Date.now() - poweredOnAtMs
-      const capMs = globalMaxOnHours * 3600_000
-      // Clock-sanity guard: skip the cap if poweredOnAt is in the future
-      // (NTP reset, clock drift). The 7-day upper bound protects against a
-      // stale row from a pre-2024 clock-seeded migration.
-      const suspicious = msSincePowerOn < 0 || msSincePowerOn > 7 * 86_400_000
-      if (!suspicious && msSincePowerOn > capMs) {
-        console.log(
-          `[auto-off] ${side}: global max-on cap exceeded (${globalMaxOnHours}h), powering off`,
-        )
-        firePowerOff(side)
-        return
-      }
-    }
+  if (isGlobalCapExceeded(side, globalMaxOnHours)) {
+    console.log(
+      `[auto-off] ${side}: global max-on cap exceeded (${globalMaxOnHours}h), powering off`,
+    )
+    firePowerOff(side, 'cap')
+    return
   }
 
   // ── Per-side presence-based auto-off ─────────────────────────────────────
@@ -288,13 +335,11 @@ function evaluateSide(
     return
   }
 
-  const emptyMs = now - since
-  const timeoutMs = cfg.minutes * 60_000
-  if (emptyMs >= timeoutMs) {
+  if (isEmptyTimeoutElapsed(side, cfg.minutes)) {
     console.log(
-      `[auto-off] ${side}: empty for ${Math.round(emptyMs / 1000)}s (past ${cfg.minutes}min timeout), powering off`,
+      `[auto-off] ${side}: empty for ${Math.round((now - since) / 1000)}s (past ${cfg.minutes}min timeout), powering off`,
     )
-    firePowerOff(side)
+    firePowerOff(side, 'timeout')
   }
 }
 
