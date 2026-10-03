@@ -24,6 +24,8 @@ echo ""
 # Mode flags
 #   --local            Skip download (code already on disk, e.g. via scp/deploy)
 #   --no-ssh           Skip interactive SSH setup prompt
+#   --ssh-key KEY      Configure SSH with this public key, no prompts. For runs
+#                      with no terminal at all (CI, `ssh pod 'bash install'`).
 #   --branch X         Install a specific branch (default: main). For branches
 #                      outside main/dev/latest, the latest successful build
 #                      artifact is fetched via nightly.link.
@@ -37,6 +39,7 @@ echo ""
 #                      rootfs vs /persistent by total partition size.
 INSTALL_LOCAL=false
 SKIP_SSH=false
+SSH_KEY_ARG=""
 INSTALL_BRANCH=""
 ARTIFACT_URL_OVERRIDE=""
 PURGE_FREE_SLEEP=false
@@ -50,6 +53,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --local)              INSTALL_LOCAL=true ;;
     --no-ssh)             SKIP_SSH=true ;;
+    --ssh-key)            shift; SSH_KEY_ARG="${1:-}" ;;
     --branch)             shift; INSTALL_BRANCH="${1:-}" ;;
     --artifact-url)       shift; ARTIFACT_URL_OVERRIDE="${1:-}" ;;
     --purge-free-sleep)   PURGE_FREE_SLEEP=true ;;
@@ -844,11 +848,16 @@ fi
 # reboots on schedule (observed: 5-day uptime with reboot_daily on). Scope is
 # exactly `systemctl reboot` — both common systemctl paths so the rule matches
 # whichever the image ships. secure_path (below) lets sudo resolve it.
+# The restart rules back System → Health's "Restart <module>" fix, scoped to
+# exactly the three biometrics module units.
 SUDOERS_FILE="/etc/sudoers.d/sleepypod-update"
 SUDOERS_CONTENT='Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 sleepypod ALL=(root) NOPASSWD: /usr/local/bin/sp-update
 sleepypod ALL=(root) NOPASSWD: /bin/systemctl reboot, /usr/bin/systemctl reboot
-sleepypod ALL=(root) NOPASSWD: /usr/local/bin/sp-iptables-save'
+sleepypod ALL=(root) NOPASSWD: /usr/local/bin/sp-iptables-save
+sleepypod ALL=(root) NOPASSWD: /bin/systemctl restart sleepypod-piezo-processor.service, /usr/bin/systemctl restart sleepypod-piezo-processor.service
+sleepypod ALL=(root) NOPASSWD: /bin/systemctl restart sleepypod-sleep-detector.service, /usr/bin/systemctl restart sleepypod-sleep-detector.service
+sleepypod ALL=(root) NOPASSWD: /bin/systemctl restart sleepypod-environment-monitor.service, /usr/bin/systemctl restart sleepypod-environment-monitor.service'
 SUDOERS_TMP=$(mktemp)
 printf '%s\n' "$SUDOERS_CONTENT" > "$SUDOERS_TMP"
 chmod 0440 "$SUDOERS_TMP"
@@ -1118,34 +1127,57 @@ else
   # Try CI release first (includes pre-built .next). Mirrors sp-update:
   #   main / latest  → releases/latest          (semantic-release vX.Y.Z)
   #   dev            → releases/tags/dev-latest (rolling, dev-release.yml)
-  #   <other>        → releases/tags/<slug>-latest (branch-release.yml)
-  # `feat/foo` slugs to `feat-foo-latest` to match branch-release.yml.
+  #   <other>        → no release; the build.yml artifact below
+  RELEASE_API=""
   if [ "$DOWNLOAD_BRANCH" = "main" ] || [ "$DOWNLOAD_BRANCH" = "latest" ]; then
     RELEASE_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
   elif [ "$DOWNLOAD_BRANCH" = "dev" ]; then
     # Rolling dev tag was renamed from `dev` to `dev-latest` in #427.
     RELEASE_API="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/dev-latest"
-  else
-    RELEASE_TAG="${DOWNLOAD_BRANCH//\//-}-latest"
-    RELEASE_API="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${RELEASE_TAG}"
   fi
 
   if [ -n "${RELEASE_API:-}" ]; then
-    RELEASE_URL=$(curl -sf "$RELEASE_API" \
+    RELEASE_JSON=$(curl -sf "$RELEASE_API" || true)
+    RELEASE_URL=$(printf '%s' "$RELEASE_JSON" \
       | grep -om1 '"browser_download_url": *"[^"]*sleepypod-core\.tar\.gz"' \
       | grep -o 'https://[^"]*' || true)
+    # Semantic-release tag (vX.Y.Z), recorded in .git-info for the UI; rolling *-latest tags are skipped.
+    RELEASE_VERSION=$(printf '%s' "$RELEASE_JSON" \
+      | grep -om1 '"tag_name": *"v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][^"]*"' \
+      | grep -o 'v[0-9][^"]*' || true)
 
     if [ -n "$RELEASE_URL" ]; then
       echo "Downloading CI release..."
       if curl -fSL "$RELEASE_URL" | tar xz -C "$DOWNLOAD_DIR"; then
         HAS_BUILD=true
         echo "CI release downloaded (pre-built)."
+        if [ -n "$RELEASE_VERSION" ] && [ -s "$DOWNLOAD_DIR/.git-info" ]; then
+          node -e '
+            const fs = require("fs");
+            const info = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            fs.writeFileSync(process.argv[1], JSON.stringify({ ...info, version: process.argv[2] }));
+          ' "$DOWNLOAD_DIR/.git-info" "$RELEASE_VERSION" 2>/dev/null || true
+        fi
       else
         # Clean partial download before fallback
         find "$DOWNLOAD_DIR" -mindepth 1 -delete 2>/dev/null || true
       fi
     fi
   fi
+
+  # nightly.link 404s on a raw `/` in the branch segment; percent-encode
+  # everything outside the URL-unreserved set.
+  urlencode() {
+    local s="$1" out="" c i
+    for ((i = 0; i < ${#s}; i++)); do
+      c="${s:i:1}"
+      case "$c" in
+        [A-Za-z0-9._~-]) out+="$c" ;;
+        *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+      esac
+    done
+    printf '%s' "$out"
+  }
 
   # Try a CI workflow artifact via nightly.link. Two paths in:
   #   1. --artifact-url <url>  — pinned to an exact run (PR comments use this).
@@ -1160,7 +1192,7 @@ else
         && [ "$INSTALL_BRANCH" != "main" ] \
         && [ "$INSTALL_BRANCH" != "dev" ] \
         && [ "$INSTALL_BRANCH" != "latest" ]; then
-      ARTIFACT_URL="https://nightly.link/${GITHUB_REPO}/workflows/build/${INSTALL_BRANCH}/sleepypod-core.zip"
+      ARTIFACT_URL="https://nightly.link/${GITHUB_REPO}/workflows/build/$(urlencode "$INSTALL_BRANCH")/sleepypod-core.zip"
     fi
 
     if [ -n "$ARTIFACT_URL" ]; then
@@ -1568,6 +1600,9 @@ fi
 source "$INSTALL_DIR/scripts/lib/maintenance-helpers"
 install_maintenance_timer
 
+source "$INSTALL_DIR/scripts/lib/storage-helpers"
+install_storage_cleanup_sudoers
+
 # Reload systemd and enable service
 echo "Enabling service..."
 systemctl daemon-reload
@@ -1973,20 +2008,29 @@ fi
 fix_db_permissions
 
 # Optional SSH configuration
+#
+# The documented `curl … | sudo bash` install hands bash the script on stdin,
+# so stdin is never a terminal — the prompts read the controlling terminal
+# instead. Only a run with no terminal at all skips them, and --ssh-key covers
+# that case without prompting.
+SETUP_SSH=""
+SSH_KEY="$SSH_KEY_ARG"
 if [ "$SKIP_SSH" = true ]; then
   echo "Skipping SSH setup (--no-ssh)"
-elif [ ! -t 0 ]; then
-  echo "Skipping SSH setup (non-interactive)"
-else
+elif [ -n "$SSH_KEY" ]; then
+  SETUP_SSH=y
+elif { : </dev/tty; } 2>/dev/null; then
   echo ""
   echo "========================================"
   echo "  Optional SSH Configuration"
   echo "========================================"
   echo ""
-  read -rp "Configure SSH on port 8822? [y/N] " SETUP_SSH
+  read -rp "Configure SSH on port 8822? [y/N] " SETUP_SSH </dev/tty || true
+else
+  echo "Skipping SSH setup (no terminal to prompt on — re-run with --ssh-key \"<public key>\" to configure it)"
 fi
 
-if [ "${SKIP_SSH:-}" != true ] && [ -t 0 ] && [[ "${SETUP_SSH:-}" =~ ^[Yy]$ ]]; then
+if [[ "$SETUP_SSH" =~ ^[Yy]$ ]]; then
   echo "Configuring SSH..."
 
   if [ ! -f "$INSTALL_DIR/scripts/lib/ssh-helpers" ]; then
@@ -2017,9 +2061,11 @@ if [ "${SKIP_SSH:-}" != true ] && [ -t 0 ] && [[ "${SETUP_SSH:-}" =~ ^[Yy]$ ]]; 
   # went to /root/.ssh and sshd (root home = /home/root) never read it.
   migrate_stranded_authorized_keys root
 
-  echo ""
-  echo "Enter your SSH public key:"
-  read -r SSH_KEY
+  if [ -z "$SSH_KEY" ]; then
+    echo ""
+    echo "Enter your SSH public key:"
+    read -r SSH_KEY </dev/tty || true
+  fi
 
   SSH_KEY_INSTALLED=false
   if [ -n "$SSH_KEY" ]; then
@@ -2044,17 +2090,25 @@ if [ "${SKIP_SSH:-}" != true ] && [ -t 0 ] && [[ "${SETUP_SSH:-}" =~ ^[Yy]$ ]]; 
     esac
   fi
 
-  # Only disable password auth once root has a key sshd can actually read.
-  # Hardening without one is an unrecoverable lockout — port 8822 is the
-  # pod's only remote entry point, and getting back in means opening the
-  # case for a serial console.
-  if [ "$SSH_KEY_INSTALLED" = true ]; then
+  # Only disable password auth once root has a key sshd can actually read,
+  # and sshd's AllowUsers/DenyUsers rules let root log in at all. Hardening
+  # without both is an unrecoverable lockout — port 8822 is the pod's only
+  # remote entry point, and getting back in means opening the case for a
+  # serial console.
+  SSH_HARDEN=false
+  if [ "$SSH_KEY_INSTALLED" != true ]; then
+    echo "No SSH key installed — leaving password authentication as-is." >&2
+    echo "Re-run the installer with a valid public key to harden sshd." >&2
+  elif ensure_sshd_allows_user root; then
+    SSH_HARDEN=true
+  else
+    echo "sshd's user access rules would refuse root — leaving password authentication as-is." >&2
+  fi
+
+  if [ "$SSH_HARDEN" = true ]; then
     set_sshd_directive PermitRootLogin prohibit-password
     set_sshd_directive PasswordAuthentication no
     set_sshd_directive PermitEmptyPasswords no
-  else
-    echo "No SSH key installed — leaving password authentication as-is." >&2
-    echo "Re-run the installer with a valid public key to harden sshd." >&2
   fi
 
   # Validate SSH config before restarting
@@ -2073,7 +2127,7 @@ if [ "${SKIP_SSH:-}" != true ] && [ -t 0 ] && [[ "${SETUP_SSH:-}" =~ ^[Yy]$ ]]; 
   # re-enabled password auth for exactly the account being hardened. Port
   # can't appear in a Match block, so it stays global.
   SSH_EXPECTED="port=8822"
-  if [ "$SSH_KEY_INSTALLED" = true ]; then
+  if [ "$SSH_HARDEN" = true ]; then
     SSH_EXPECTED="$SSH_EXPECTED root:permitrootlogin=prohibit-password"
     SSH_EXPECTED="$SSH_EXPECTED root:passwordauthentication=no root:permitemptypasswords=no"
   fi
@@ -2093,16 +2147,20 @@ if [ "${SKIP_SSH:-}" != true ] && [ -t 0 ] && [[ "${SETUP_SSH:-}" =~ ^[Yy]$ ]]; 
     fi
   done
 
-  if [ "$SSH_KEY_INSTALLED" = true ]; then
+  if [ "$SSH_HARDEN" = true ] && ! sshd_allows_user root; then
+    echo "Error: sshd's user access rules refuse root after the edit." >&2
+    echo "Restoring backup and leaving sshd untouched..." >&2
+    cp /etc/ssh/sshd_config.pre-install /etc/ssh/sshd_config
+    exit 1
+  fi
+
+  if [ "$SSH_HARDEN" = true ]; then
     SSH_RESULT="SSH configured on port 8822 (keys only)"
   else
     SSH_RESULT="SSH configured on port 8822 (existing auth methods unchanged)"
   fi
 
-  # Restart SSH (try both service names for compatibility)
-  if systemctl restart sshd 2>/dev/null; then
-    echo "$SSH_RESULT"
-  elif systemctl restart ssh 2>/dev/null; then
+  if restart_sshd; then
     echo "$SSH_RESULT"
   else
     echo "Error: Failed to restart SSH service" >&2

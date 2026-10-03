@@ -17,6 +17,7 @@
  * monitors competing for the same socket.
  */
 
+import { getTemperatureControlStatus } from '@/src/temperature/instance'
 import { connectDac, disconnectDac } from './dacTransport'
 import { DacMonitor } from './dacMonitor'
 import { CoverButtonActionHandler, type CoverButton, type CoverButtonEvent } from './coverButtonActionHandler'
@@ -29,6 +30,7 @@ import { getAllPumpStallNotices } from './pumpStallNotification'
 import { getAlarmStatus, getSnoozeStatus } from './snoozeManager'
 import { clearSharedHardwareClient, getSharedHardwareClient } from './sharedClient'
 import type { Side } from './types'
+import { applyMutationOverlay } from '../streaming/mutationOverlay'
 
 const DAC_SOCK_PATH = process.env.DAC_SOCK_PATH || '/persistent/deviceinfo/dac.sock'
 
@@ -274,9 +276,12 @@ export const getDacMonitor = async (): Promise<DacMonitor> => {
           const rightAlarm = getAlarmStatus('right')
           broadcastFrame({
             type: 'deviceStatus',
+            temperatureControl: getTemperatureControlStatus(),
             ts: Date.now(),
-            leftSide: { ...status.leftSide, isAlarmVibrating: leftAlarm.state === 'ringing' },
-            rightSide: { ...status.rightSide, isAlarmVibrating: rightAlarm.state === 'ringing' },
+            // A poll can still report the pre-command target right after a
+            // mutation; keep the mutation's target until the firmware agrees.
+            leftSide: { ...applyMutationOverlay('left', { ...status.leftSide }), isAlarmVibrating: leftAlarm.state === 'ringing' },
+            rightSide: { ...applyMutationOverlay('right', { ...status.rightSide }), isAlarmVibrating: rightAlarm.state === 'ringing' },
             waterLevel: status.waterLevel,
             isPriming: status.isPriming,
             ...(primeCompletedAt && { primeCompletedNotification: { timestamp: primeCompletedAt } }),

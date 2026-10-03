@@ -4,7 +4,8 @@ SleepyPod calibrator module.
 
 Runs sensor calibration either on a daily schedule or on-demand (triggered
 by the iOS app via tRPC → trigger file IPC). Computes baselines for:
-  - Capacitance sensors (per-channel mean+std for presence detection)
+  - Capacitance sensors (per-channel mean+std for presence detection) —
+    manual requests only; see SCHEDULED_SENSOR_TYPES
   - Piezo sensors (noise floor RMS for presence threshold)
   - Temperature sensors (per-thermistor offsets vs ambient reference)
 
@@ -19,7 +20,6 @@ import os
 import sys
 import time
 import math
-import json
 import signal
 import logging
 import sqlite3
@@ -57,8 +57,15 @@ DAILY_MIN_AGE_HOURS = 23
 
 CAL_SIDES = ("left", "right")
 CAL_SENSOR_TYPES = ("capacitance", "piezo", "temperature")
+# Sensor types calibrated without a user asking (startup, retry, daily,
+# pre-prime). Capacitance is excluded: the sleep-detector keeps a
+# self-adjusting empty-bed baseline, and a scheduled snapshot can capture a
+# sleeper as "empty" (the fixed-UTC-hour fallback can land mid-night), making
+# the empty bed read occupied all day. A manual recalibration still runs it,
+# and the sleep-detector adopts the result.
+SCHEDULED_SENSOR_TYPES = ("piezo", "temperature")
 # Missing profiles retry quickly while a new NATS buffer warms, then back off
-# so disconnected sensors cannot append six failed audit rows every minute.
+# so disconnected sensors cannot append failed audit rows every minute.
 CAL_RETRY_INITIAL_S = 60
 CAL_RETRY_MAX_S = 3600
 CAL_RUN_RETENTION_S = 30 * 86400
@@ -238,42 +245,16 @@ def run_calibration(store: CalibrationStore, side: str, sensor_type: str,
         return False
 
 
-def live_capacitance_format(buffer) -> Optional[str]:
-    """Return the newest buffered capacitance dialect, if one is available."""
-    if buffer is None:
-        return None
-    snapshot = buffer.snapshot()
-    newest = None
-    for rtype, profile_format in (("capSense", "capSense"),
-                                  ("capSense2", "capSense2")):
-        for record in snapshot.get(rtype, []):
-            try:
-                ts = float(record.get("ts"))
-            except (AttributeError, TypeError, ValueError):
-                continue
-            if math.isfinite(ts) and (newest is None or ts > newest[0]):
-                newest = (ts, profile_format)
-    return newest[1] if newest else None
-
-
 def compute_pending(store: CalibrationStore, now: float, buffer=None) -> set:
     """Return the set of (side, sensor_type) whose profile is missing or
     expired and therefore still needs (re)calibration."""
     pending = set()
-    live_format = live_capacitance_format(buffer)
     for side in CAL_SIDES:
-        for sensor_type in CAL_SENSOR_TYPES:
+        for sensor_type in SCHEDULED_SENSOR_TYPES:
             profile = store.get_active(side, sensor_type)
             needs = profile is None
             if profile and profile.get("expires_at"):
                 needs = profile["expires_at"] < now
-            if profile and sensor_type == "capacitance" and live_format:
-                try:
-                    params = json.loads(profile.get("parameters") or "{}")
-                except (TypeError, ValueError):
-                    params = {}
-                profile_format = params.get("format", "capSense")
-                needs = needs or profile_format != live_format
             if needs:
                 pending.add((side, sensor_type))
     return pending
@@ -301,6 +282,16 @@ def next_retry_interval(current: float, remaining: set) -> float:
     return min(CAL_RETRY_MAX_S, max(CAL_RETRY_INITIAL_S, current * 2))
 
 
+def trigger_sensor_types(trigger: dict) -> tuple:
+    """Sensor types a trigger file asks for. Triggers the scheduler writes
+    (source "scheduled", e.g. pre-prime) never recalibrate capacitance."""
+    t_type = trigger.get("sensor_type", "all")
+    types = CAL_SENSOR_TYPES if t_type == "all" else (t_type,)
+    if trigger.get("source") == "scheduled":
+        types = tuple(t for t in types if t in SCHEDULED_SENSOR_TYPES)
+    return types
+
+
 def should_run_daily(store: CalibrationStore, now: float, last_run: float) -> bool:
     """Fallback daily calibration if scheduler trigger didn't fire.
 
@@ -319,8 +310,8 @@ def should_run_daily(store: CalibrationStore, now: float, last_run: float) -> bo
         return False
     if time.gmtime(now).tm_hour != DAILY_HOUR:
         return False
-    for side in ("left", "right"):
-        for sensor_type in ("capacitance", "piezo", "temperature"):
+    for side in CAL_SIDES:
+        for sensor_type in SCHEDULED_SENSOR_TYPES:
             age = store.get_profile_age_hours(side, sensor_type)
             if age is None or age >= DAILY_MIN_AGE_HOURS:
                 return True
@@ -376,14 +367,14 @@ def main() -> None:
             trigger = watcher.check_trigger()
             if trigger:
                 t_side = trigger.get("side", "all")
-                t_type = trigger.get("sensor_type", "all")
 
                 sides = CAL_SIDES if t_side == "all" else (t_side,)
-                types = CAL_SENSOR_TYPES if t_type == "all" else (t_type,)
+                types = trigger_sensor_types(trigger)
 
+                source = "scheduled" if trigger.get("source") == "scheduled" else "manual"
                 for s in sides:
                     for st in types:
-                        run_calibration(store, s, st, triggered_by="manual",
+                        run_calibration(store, s, st, triggered_by=source,
                                         buffer=nats_buffer)
 
                 watcher.clear_trigger()
@@ -397,7 +388,7 @@ def main() -> None:
             if should_run_daily(store, now, daily_last_run):
                 log.info("Running daily calibration")
                 for side in CAL_SIDES:
-                    for st in CAL_SENSOR_TYPES:
+                    for st in SCHEDULED_SENSOR_TYPES:
                         run_calibration(store, side, st, triggered_by="daily",
                                         buffer=nats_buffer)
                 daily_last_run = now

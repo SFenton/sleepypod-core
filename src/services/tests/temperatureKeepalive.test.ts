@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { resetControlDatabase } from '@/src/temperature/tests/databaseFixture'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import type BetterSqlite3 from 'better-sqlite3'
 
@@ -51,6 +52,7 @@ const { sqlite } = dbModule as typeof dbModule & {
 const KEEPALIVE_INTERVAL_MS = 6 * 60 * 60 * 1000
 
 function resetSchema(): void {
+/*
   ;(sqlite as any).exec(`
     DROP TABLE IF EXISTS side_settings;
     DROP TABLE IF EXISTS device_state;
@@ -90,6 +92,10 @@ function resetSchema(): void {
     INSERT INTO side_settings (side, name) VALUES ('left', 'Left'), ('right', 'Right');
     INSERT INTO device_state (side, is_powered) VALUES ('left', 0), ('right', 0);
   `)
+*/
+  resetControlDatabase(sqlite)
+  sqlite.exec(`INSERT INTO side_settings (side, name) VALUES ('left', 'Left'), ('right', 'Right');
+    INSERT INTO device_state (side, is_powered) VALUES ('left', 0), ('right', 0);`)
 }
 
 function setSideState(

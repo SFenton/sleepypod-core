@@ -200,6 +200,19 @@ describe('health.scheduler', () => {
     )
   })
 
+  it('returns every job inside withinHours instead of the next ten', async () => {
+    const now = Date.now()
+    schedulerMock.scheduler.getJobs.mockReturnValue(Array.from({ length: 14 }, (_, index) => ({
+      id: `job-${index}`,
+      type: 'temperature',
+    })))
+    // One job per hour from now; 12 fall inside a 12-hour window.
+    schedulerMock.scheduler.getNextInvocation.mockImplementation((id: string) => new Date(now + (Number(id.slice('job-'.length)) + 0.5) * 3_600_000))
+
+    const result = await caller.scheduler({ withinHours: 12 })
+    expect(result.upcomingJobs.map(job => job.id)).toEqual(Array.from({ length: 12 }, (_, index) => `job-${index}`))
+  })
+
   it('drops jobs without a next invocation and exposes typed metadata exactly', async () => {
     schedulerMock.scheduler.getJobs.mockReturnValue([
       { id: 'missing', type: 'temperature', metadata: { side: 'left' } },

@@ -3,14 +3,15 @@ import { Characteristic } from 'hap-nodejs'
 
 const setTemperature = vi.fn().mockResolvedValue(undefined)
 const setPower = vi.fn().mockResolvedValue(undefined)
-const registerManualOverride = vi.fn()
 const shouldBlock = vi.fn<() => boolean>().mockReturnValue(false)
 
-vi.mock('@/src/hardware/dacMonitor.instance', () => ({
-  getSharedHardwareClient: () => ({ setTemperature, setPower }),
-}))
-vi.mock('@/src/automation', () => ({
-  getAutomationEngineIfRunning: () => ({ registerManualOverride }),
+// Test HomeKit's staging, serialization, and error mapping at the shared
+// controller boundary. Controller/hardware integration has its own real-DB tests.
+vi.mock('@/src/temperature/instance', () => ({
+  getTemperatureController: () => ({
+    setManualLocked: setTemperature,
+    powerOffLocked: (side: 'left' | 'right') => setPower(side, false),
+  }),
 }))
 vi.mock('@/src/hardware/pumpStallGuard', () => ({
   shouldBlock: () => shouldBlock(),
@@ -20,6 +21,7 @@ import { buildThermostatService } from '../accessories/thermostat'
 import { __resetSideController } from '../accessories/sideController'
 import type { DacMonitor } from '@/src/hardware/dacMonitor'
 import type { DeviceStatus } from '@/src/hardware/types'
+import { fahrenheitToLevel } from '@/src/hardware/types'
 
 const status: DeviceStatus = {
   leftSide: { currentTemperature: 75, targetTemperature: 70, currentLevel: -20, targetLevel: -45, heatingDuration: 0 },
@@ -43,7 +45,6 @@ describe('thermostat accessory', () => {
     __resetSideController()
     setTemperature.mockClear()
     setPower.mockClear()
-    registerManualOverride.mockClear()
     shouldBlock.mockReset()
     shouldBlock.mockReturnValue(false)
   })
@@ -119,6 +120,17 @@ describe('thermostat accessory', () => {
     expect(f).toBeLessThanOrEqual(110)
   })
 
+  it.each([28, 28.5])('rounds a %s°C target to whole °F so it never lands on the neutral level', async (c) => {
+    // 28.0°C is 82.4°F, which fahrenheitToLevel maps to level 0: the firmware
+    // treats that as off, and device_state then reads the side as off.
+    const { service } = buildThermostatService('left', fakeMonitor as DacMonitor)
+    await service.getCharacteristic(Characteristic.TargetTemperature).handleSetRequest(c)
+    expect(setTemperature).toHaveBeenCalledTimes(1)
+    const [, f] = setTemperature.mock.calls[0]
+    expect(Number.isInteger(f)).toBe(true)
+    expect(fahrenheitToLevel(f)).not.toBe(0)
+  })
+
   it('TargetHeatingCoolingState onGet returns AUTO (3) when powered, OFF (0) otherwise', async () => {
     const { service: leftSvc } = buildThermostatService('left', fakeMonitor as DacMonitor)
     expect(await leftSvc.getCharacteristic(Characteristic.TargetHeatingCoolingState).handleGetRequest()).toBe(3)
@@ -134,7 +146,7 @@ describe('thermostat accessory', () => {
     await service.getCharacteristic(Characteristic.TargetHeatingCoolingState).handleSetRequest(3)
     // Right fixture targetTemperature is 80°F — must pass through so the
     // hardware client doesn't silently fall back to its 75°F default.
-    expect(setPower).toHaveBeenCalledWith('right', true, 80)
+    expect(setTemperature).toHaveBeenCalledWith('right', 80)
 
     setPower.mockClear()
     await service.getCharacteristic(Characteristic.TargetHeatingCoolingState).handleSetRequest(0)
@@ -181,7 +193,7 @@ describe('thermostat accessory', () => {
     // the requested intent, not the 77°F the slider visibly reverted to.
     shouldBlock.mockReturnValue(false)
     await service.getCharacteristic(Characteristic.TargetHeatingCoolingState).handleSetRequest(3)
-    expect(setPower).toHaveBeenCalledWith('left', true, 95)
+    expect(setTemperature).toHaveBeenCalledWith('left', 95)
     warn.mockRestore()
   })
 

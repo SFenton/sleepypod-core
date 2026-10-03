@@ -271,6 +271,13 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Clear staging/rollback dirs that earlier interrupted runs left on
+# /persistent before measuring free space. Uses the installed copy (the new
+# source isn't downloaded yet); older pods without it just skip this.
+if [ -x /usr/local/bin/sp-storage-cleanup ]; then
+  INSTALL_DIR="$INSTALL_DIR" /usr/local/bin/sp-storage-cleanup --only temp || echo "Warning: storage cleanup failed (continuing)" >&2
+fi
+
 # Pre-flight: disk space
 for space_dir in "$INSTALL_DIR" "$TMPDIR"; do
   DISK_AVAIL=$(df -m "$space_dir" | awk 'NR==2{print $4}')
@@ -298,50 +305,104 @@ open_update_wan() {
   fi
 }
 
+# nightly.link 404s on a raw `/` in the branch segment; percent-encode
+# everything outside the URL-unreserved set.
+urlencode() {
+  local s="$1" out="" c i
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [A-Za-z0-9._~-]) out+="$c" ;;
+      *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 if [ -n "$ARCHIVE" ]; then
   echo "Using local build: $ARCHIVE"
   tar xzf "$ARCHIVE" -C "$WORK_DIR"
 else
   open_update_wan
-  if [ "$BRANCH" = main ] || [ "$BRANCH" = latest ]; then
-    RELEASE_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-  else
-    RELEASE_TAG="${BRANCH//\//-}-latest"
-    RELEASE_API="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${RELEASE_TAG}"
-  fi
-  echo "Checking for pre-built release: $RELEASE_API"
-  if ! HTTP_STATUS=$(curl -sS -L --connect-timeout 10 --max-time 60 \
-      -o "$WORK_DIR/release.json" -w '%{http_code}' "$RELEASE_API"); then
-    echo "Error: Could not contact GitHub. Check the Pod's network and retry." >&2
-    exit 1
-  fi
-  case "$HTTP_STATUS" in
-    200) ;;
-    404)
-      echo "Error: No accessible pre-built release for '$BRANCH' in '$GITHUB_REPO'." >&2
-      echo "Enable GitHub Actions in the fork and push the branch to publish its Branch Release." >&2
+  if [ "$BRANCH" != main ] && [ "$BRANCH" != latest ] && [ "$BRANCH" != dev ]; then
+    # Feature branches install the build.yml artifact for the branch's latest
+    # successful run. nightly.link serves it without GitHub auth, wrapped in a
+    # zip; build.yml's retention (30 days) bounds how old a branch can be.
+    ARTIFACT_URL="https://nightly.link/${GITHUB_REPO}/workflows/build/$(urlencode "$BRANCH")/sleepypod-core.zip"
+    echo "Downloading CI build for '$BRANCH': $ARTIFACT_URL"
+    if ! curl -fSL --connect-timeout 10 --max-time 600 -o "$WORK_DIR/artifact.zip" "$ARTIFACT_URL"; then
+      rm -f "$WORK_DIR/artifact.zip"
+      echo "Error: No accessible CI build for '$BRANCH' in '$GITHUB_REPO'." >&2
+      echo "Push the branch (with Actions enabled in the fork) and wait for Build & Package to pass." >&2
       echo "Or, from a cloned repo on your computer: ./scripts/deploy POD_IP" >&2
       echo "Installed files have not been replaced; source-only builds are not supported on the Pod." >&2
-      exit 1 ;;
-    *)
-      echo "Error: GitHub release lookup returned HTTP $HTTP_STATUS (check API access/rate limits)." >&2
-      exit 1 ;;
-  esac
-  RELEASE_URL=$(node -e '
-    const fs = require("fs");
-    const release = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    const asset = release.assets?.find(a => a.name === "sleepypod-core.tar.gz");
-    if (asset && /^https:\/\//.test(asset.browser_download_url)) process.stdout.write(asset.browser_download_url);
-  ' "$WORK_DIR/release.json")
-  rm -f "$WORK_DIR/release.json"
-  if [ -z "$RELEASE_URL" ]; then
-    echo "Error: Release has no sleepypod-core.tar.gz asset. Build/publish the release, or use ./scripts/deploy POD_IP from your computer." >&2
-    exit 1
-  fi
-  echo "Downloading pre-built release..."
-  if ! curl -fSL --connect-timeout 10 --max-time 600 "$RELEASE_URL" | tar xz -C "$WORK_DIR"; then
-    echo "Error: Release download/extraction failed. Installed files have not been replaced; retry the update." >&2
-    exit 1
+      exit 1
+    fi
+    # Pods reliably ship python3 but not always unzip.
+    if command -v unzip >/dev/null 2>&1; then
+      unzip -q -o "$WORK_DIR/artifact.zip" sleepypod-core.tar.gz -d "$WORK_DIR" || true
+    else
+      python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract("sleepypod-core.tar.gz", sys.argv[2])' \
+        "$WORK_DIR/artifact.zip" "$WORK_DIR" || true
+    fi
+    rm -f "$WORK_DIR/artifact.zip"
+    if [ ! -s "$WORK_DIR/sleepypod-core.tar.gz" ] || ! tar xzf "$WORK_DIR/sleepypod-core.tar.gz" -C "$WORK_DIR"; then
+      echo "Error: CI build download/extraction failed. Installed files have not been replaced; retry the update." >&2
+      exit 1
+    fi
+    rm -f "$WORK_DIR/sleepypod-core.tar.gz"
+  else
+    if [ "$BRANCH" = dev ]; then
+      RELEASE_API="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/dev-latest"
+    else
+      RELEASE_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    fi
+    echo "Checking for pre-built release: $RELEASE_API"
+    if ! HTTP_STATUS=$(curl -sS -L --connect-timeout 10 --max-time 60 \
+        -o "$WORK_DIR/release.json" -w '%{http_code}' "$RELEASE_API"); then
+      echo "Error: Could not contact GitHub. Check the Pod's network and retry." >&2
+      exit 1
+    fi
+    case "$HTTP_STATUS" in
+      200) ;;
+      404)
+        echo "Error: No accessible pre-built release for '$BRANCH' in '$GITHUB_REPO'." >&2
+        echo "Or, from a cloned repo on your computer: ./scripts/deploy POD_IP" >&2
+        echo "Installed files have not been replaced; source-only builds are not supported on the Pod." >&2
+        exit 1 ;;
+      *)
+        echo "Error: GitHub release lookup returned HTTP $HTTP_STATUS (check API access/rate limits)." >&2
+        exit 1 ;;
+    esac
+    RELEASE_URL=$(node -e '
+      const fs = require("fs");
+      const release = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const asset = release.assets?.find(a => a.name === "sleepypod-core.tar.gz");
+      if (asset && /^https:\/\//.test(asset.browser_download_url)) process.stdout.write(asset.browser_download_url);
+    ' "$WORK_DIR/release.json")
+    # Semantic-release tags (vX.Y.Z) are only known here, after the tarball was
+    # built, so record them in .git-info for the UI. Rolling *-latest tags are not versions.
+    RELEASE_VERSION=$(node -e '
+      const tag = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).tag_name ?? "";
+      if (/^v\d+\.\d+\.\d+/.test(tag)) process.stdout.write(tag);
+    ' "$WORK_DIR/release.json" 2>/dev/null || true)
+    rm -f "$WORK_DIR/release.json"
+    if [ -z "$RELEASE_URL" ]; then
+      echo "Error: Release has no sleepypod-core.tar.gz asset. Build/publish the release, or use ./scripts/deploy POD_IP from your computer." >&2
+      exit 1
+    fi
+    echo "Downloading pre-built release..."
+    if ! curl -fSL --connect-timeout 10 --max-time 600 "$RELEASE_URL" | tar xz -C "$WORK_DIR"; then
+      echo "Error: Release download/extraction failed. Installed files have not been replaced; retry the update." >&2
+      exit 1
+    fi
+    if [ -n "$RELEASE_VERSION" ] && [ -s "$WORK_DIR/.git-info" ]; then
+      node -e '
+        const fs = require("fs");
+        const info = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        fs.writeFileSync(process.argv[1], JSON.stringify({ ...info, version: process.argv[2] }));
+      ' "$WORK_DIR/.git-info" "$RELEASE_VERSION" 2>/dev/null || true
+    fi
   fi
 fi
 
@@ -753,6 +814,11 @@ if [ -f "$INSTALL_DIR/scripts/lib/maintenance-helpers" ]; then
   install_maintenance_timer
 fi
 
+if [ -f "$INSTALL_DIR/scripts/lib/storage-helpers" ]; then
+  source "$INSTALL_DIR/scripts/lib/storage-helpers"
+  install_storage_cleanup_sudoers
+fi
+
 # Re-block WAN before starting service
 if [ "$WAN_WAS_BLOCKED" = true ]; then
   reload_iptables_helpers
@@ -785,6 +851,12 @@ if systemctl is-active --quiet sleepypod.service && [ "$MODULES_HEALTHY" = true 
     MODULE_SWAP_ACTIVE=false
   fi
   echo "Update complete! Service is running."
+  # Old release builds and the orphaned node_modules eat into the space the
+  # biometrics pruner leaves for raw history. Never fatal: the update is done.
+  # The new copy was installed to /usr/local/bin with the other sp-* tools.
+  if [ -x /usr/local/bin/sp-storage-cleanup ]; then
+    INSTALL_DIR="$INSTALL_DIR" /usr/local/bin/sp-storage-cleanup --exclude "$BACKUP_DIR" || echo "Warning: storage cleanup failed" >&2
+  fi
   exit 0
 fi
 

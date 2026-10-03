@@ -13,6 +13,8 @@ See main [installation guide](../docs/INSTALLATION.md) for hardware setup.
 
 ## Getting root on Pod 5
 
+For the full illustrated procedure, start with **[Open your Pod and get root access](https://sleepypod.github.io/core/root-access/)**. It covers hardware, wiring, the slot-A check, every shell command, and installation directly from serial. The notes below are implementation background; they are not a substitute for that first-time walkthrough.
+
 Initial root access on a Pod 5 is a JTAG bootstrap — there is no
 software-only escalation. At a high level: tear down to the circuit board,
 connect a TC2070-IDC + FTDI FT232RL to the JTAG header, open a 921600-baud
@@ -173,6 +175,7 @@ flowchart TD
 After installation (installed from `scripts/bin/`):
 
 - `sp-status` - Report service + firmware variant + biometrics pipeline (old `.RAW` shim vs mid-era direct `.RAW` vs new NATS JetStream), module health, and firmware-side service rollup. Output is paste-friendly for support threads.
+- `sp-storage-cleanup` - Remove sleepypod's own leftovers on `/persistent` (stale rollback/staging dirs, old `sleepypod-releases/*` builds, orphaned relocated `node_modules`; old DB backups with `--include-db-backups`). `--dry-run --json` prints the plan. Run by `sp-update` and by System → Storage.
 - `sp-restart` - Restart sleepypod + reconnect frankenfirmware
 - `sp-logs` - View live logs
 - `sp-bundle-logs` - One-shot diagnostic capture (`/tmp/sleepypod-bundle-<ts>.tar.gz`); redacts secrets by default, pass `--no-redact` for raw
@@ -227,11 +230,13 @@ systemctl disable sleepypod
 
 ## SSH Access
 
-During installation, you'll be prompted to configure SSH on port 8822 with keys-only authentication.
+During installation, you'll be prompted to configure SSH on port 8822 with keys-only authentication — including when the installer is piped in with `curl … | sudo bash`. Runs with no terminal at all (e.g. `ssh pod 'bash install'`) skip the prompt; pass `--ssh-key "ssh-ed25519 AAAA… you@host"` to configure SSH without one.
 
 If you need to configure SSH later:
 1. Edit `/etc/ssh/sshd_config`
-2. Set `Port 8822` and `PermitRootLogin prohibit-password`
+2. Set `Port 8822` and `PermitRootLogin prohibit-password`. If the config has
+   an `AllowUsers` line (stock Pod 4 ships `AllowUsers rewt`), add `root` to
+   it — otherwise sshd refuses root before it ever looks at a key
 3. Add your public key to the file sshd reads for root — check with
    `sshd -T -C user=root,host=localhost,addr=127.0.0.1 | grep -i authorizedkeysfile`
    (the `-C` matters: a plain `sshd -T` reports the global value and misses
@@ -240,7 +245,9 @@ If you need to configure SSH later:
    `/home/root/.ssh/authorized_keys`, **not** `/root/.ssh/authorized_keys`
 4. Confirm key auth works (`ssh -p 8822 root@<POD_IP>`) *before* setting
    `PasswordAuthentication no` — there is no other way back in
-5. Restart: `systemctl restart sshd`
+5. Restart: `systemctl restart sshd`. Pods whose sshd runs from
+   `sshd.socket` (per-connection, no `sshd.service`) need no restart — each
+   new connection reads the config fresh
 
 Connect with:
 ```bash

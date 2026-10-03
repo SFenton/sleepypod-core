@@ -24,7 +24,7 @@ vi.mock('@/src/db', async () => {
 })
 
 import * as dbModule from '@/src/db'
-import { DeviceStateSync, markSideMutated, _resetMutationStamps, getAlarmState } from '../deviceStateSync'
+import { DeviceStateSync, markSideMutated, _resetMutationStamps, _resetFirmwareSynced, getAlarmState, hasFirmwareSynced } from '../deviceStateSync'
 
 const { sqlite, biometricsSqlite } = dbModule as typeof dbModule & {
   sqlite: BetterSqlite3.Database
@@ -35,6 +35,7 @@ function resetSchema(): void {
   ;(sqlite as any).exec(`
     DROP TABLE IF EXISTS device_state;
     CREATE TABLE device_state (
+      hardware_deadline INTEGER,
       side TEXT PRIMARY KEY,
       current_temperature REAL,
       target_temperature REAL,
@@ -57,6 +58,17 @@ function resetSchema(): void {
   ;(biometricsSqlite as any).exec(`
     DROP TABLE IF EXISTS water_level_readings;
     DROP TABLE IF EXISTS flow_readings;
+    DROP TABLE IF EXISTS thermal_state;
+    DROP TABLE IF EXISTS prime_events;
+    CREATE TABLE prime_events (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL);
+    CREATE TABLE thermal_state (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp INTEGER NOT NULL,
+      side TEXT NOT NULL,
+      is_powered INTEGER NOT NULL,
+      target_temp_f REAL,
+      current_temp_f REAL
+    );
     CREATE TABLE water_level_readings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       timestamp INTEGER NOT NULL,
@@ -260,6 +272,20 @@ describe('DeviceStateSync — mutation freshness window', () => {
 
     expect(readSide('left')?.is_powered).toBe(0) // not fresh, reconciled to neutral
     expect(readSide('right')?.is_powered).toBe(0) // fresh, preserved as off
+  })
+
+  it('marks the firmware as synced only after a status is mirrored successfully', async () => {
+    _resetFirmwareSynced()
+    ;(sqlite as any).exec('DROP TABLE device_state')
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      await sync.sync(status({ side: 'right', currentLevel: 5, targetLevel: 5, heatingDuration: 100 }))
+      expect(hasFirmwareSynced()).toBe(false)
+      resetSchema()
+      await sync.sync(status({ side: 'right', currentLevel: 5, targetLevel: 5, heatingDuration: 100 }))
+      expect(hasFirmwareSynced()).toBe(true)
+    }
+    finally { error.mockRestore() }
   })
 
   it('without any mutation, sync writes the firmware-derived powered state directly', async () => {
@@ -640,30 +666,6 @@ describe('DeviceStateSync — recordFlowData', () => {
     warnSpy.mockRestore()
   })
 
-  it('passes preStallDurationSeconds=null when the side is commanded off', async () => {
-    // Side row exists with is_powered=0; runStallGuard derives
-    // expectedActive=false and propagates null for duration. Exercises the
-    // falsy arm of the `expectedActive ? 28800 : null` ternary.
-    seedSide('left', false, null)
-    seedSide('right', false, null)
-
-    sync.recordFlowData(frzHealthFrame({ leftFlow: 1.0, rightFlow: 1.0 }))
-    await Promise.resolve()
-    // No assertion beyond "didn't throw" — branch coverage is the goal here.
-    expect(true).toBe(true)
-  })
-
-  it('passes preStallDurationSeconds=28800 when the side is commanded active', async () => {
-    // Both halves of the `Boolean(row?.isPowered && row.targetTemperature != null)`
-    // and the truthy arm of `expectedActive ? 28800 : null`.
-    seedSide('left', true, 78)
-    seedSide('right', true, 78)
-
-    sync.recordFlowData(frzHealthFrame({ leftFlow: 1.0, rightFlow: 1.0 }))
-    await Promise.resolve()
-    expect(true).toBe(true)
-  })
-
   it('logs raw value when runStallGuard catches a non-Error throw', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const origSelect = (dbModule.db as any).select.bind(dbModule.db)
@@ -900,7 +902,10 @@ describe('DeviceStateSync — sync targetTemperature behaviour without mutation'
     expect(row?.is_powered).toBe(1)
   })
 
-  it('does not expire a zero target level while heating duration remains', async () => {
+  it('reads a neutral target as off even while the firmware countdown and current level remain', async () => {
+    // An explicit power-off only sets level 0; the firmware keeps its heat
+    // session countdown running and currentLevel wobbles while the water
+    // equalizes. That must not read as powered.
     await sync.sync(status({
       side: 'right',
       targetTemperature: 78,
@@ -910,12 +915,36 @@ describe('DeviceStateSync — sync targetTemperature behaviour without mutation'
     }))
 
     expect(readSide('right')).toEqual(expect.objectContaining({
-      is_powered: 1,
-      target_temperature: 78,
+      is_powered: 0,
+      target_temperature: null,
+      powered_on_at: null,
     }))
   })
 
-  it('keeps a side off when its current level is zero during an active target', async () => {
+  it('turns a powered side off on a neutral-target poll after a restart, with no mutation marker', async () => {
+    // Pod 88, 2026-09-30: after the scheduled off, the mirror flipped on/off
+    // every 10–20 s on currentLevel alone; a service restart then lost the
+    // controller's in-memory off flag, read one "on" poll as a live session
+    // and re-energized the side for 8 h at the stale schedule target.
+    seedSide('right', true, 80)
+
+    await sync.sync(status({
+      side: 'right',
+      currentLevel: -10,
+      targetLevel: 0,
+      heatingDuration: 27_900,
+    }))
+
+    expect(readSide('right')).toEqual(expect.objectContaining({
+      is_powered: 0,
+      target_temperature: null,
+      powered_on_at: null,
+    }))
+  })
+
+  it('reads a side on from its target while the measured level crosses zero', async () => {
+    // currentLevel is measured, not commanded: it passes through 0 on the
+    // way to a target across neutral. That is still an active session.
     await sync.sync(status({
       side: 'right',
       targetTemperature: 78,
@@ -925,10 +954,10 @@ describe('DeviceStateSync — sync targetTemperature behaviour without mutation'
     }))
 
     expect(readSide('right')).toEqual(expect.objectContaining({
-      is_powered: 0,
-      powered_on_at: null,
+      is_powered: 1,
       target_temperature: 78,
     }))
+    expect(readSide('right')?.powered_on_at).not.toBeNull()
   })
 
   it('podVersion field on status payload is irrelevant to upsert', async () => {
@@ -937,5 +966,62 @@ describe('DeviceStateSync — sync targetTemperature behaviour without mutation'
     s.podVersion = PodVersion.POD_4
     await sync.sync(s)
     expect(readSide('right')?.is_powered).toBe(1)
+  })
+})
+
+describe('DeviceStateSync — thermal_state history', () => {
+  let sync: DeviceStateSync
+  const rows = (side: 'left' | 'right') => (biometricsSqlite as any)
+    .prepare('SELECT timestamp, is_powered, target_temp_f, current_temp_f FROM thermal_state WHERE side = ? ORDER BY id')
+    .all(side) as Array<{ timestamp: number, is_powered: number, target_temp_f: number | null, current_temp_f: number | null }>
+
+  beforeEach(() => {
+    resetSchema()
+    _resetMutationStamps()
+    sync = new DeviceStateSync()
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-28T12:00:00Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('samples once a minute while power is unchanged', async () => {
+    const on = status({ side: 'left', currentLevel: 20, targetLevel: 20, heatingDuration: 3600, currentTemperature: 78, targetTemperature: 80 })
+    await sync.sync(on)
+    vi.advanceTimersByTime(30_000)
+    await sync.sync(on)
+    expect(rows('left')).toHaveLength(1)
+    vi.advanceTimersByTime(31_000)
+    await sync.sync(on)
+    const left = rows('left')
+    expect(left).toHaveLength(2)
+    expect(left[0]).toMatchObject({ is_powered: 1, target_temp_f: 80, current_temp_f: 78 })
+  })
+
+  it('writes straight away on a power transition and nulls temps while off', async () => {
+    await sync.sync(status({ side: 'left', currentLevel: 20, targetLevel: 20, heatingDuration: 3600, targetTemperature: 80 }))
+    vi.advanceTimersByTime(5_000)
+    await sync.sync(status({ side: 'left' }))
+    const left = rows('left')
+    expect(left.map(r => r.is_powered)).toEqual([1, 0])
+    expect(left[1]).toMatchObject({ target_temp_f: null, current_temp_f: null })
+  })
+})
+
+describe('DeviceStateSync — prime history', () => {
+  beforeEach(() => {
+    resetSchema()
+    _resetMutationStamps()
+  })
+
+  it('records a prime_events row when priming finishes', async () => {
+    const sync = new DeviceStateSync()
+    await sync.sync({ ...status(), isPriming: true })
+    await sync.sync({ ...status(), isPriming: true })
+    expect((biometricsSqlite as any).prepare('SELECT COUNT(*) AS n FROM prime_events').get().n).toBe(0)
+    await sync.sync(status())
+    expect((biometricsSqlite as any).prepare('SELECT COUNT(*) AS n FROM prime_events').get().n).toBe(1)
   })
 })

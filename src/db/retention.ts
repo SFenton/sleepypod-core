@@ -6,10 +6,12 @@ import {
   bedTemp,
   flowReadings,
   freezerTemp,
+  healthRuns,
   movement,
   piezoPresenceDecisions,
   piezoTransitionSnapshots,
   pumpAlerts,
+  thermalState,
   vitals,
   vitalsQuality,
   waterLevelReadings,
@@ -26,7 +28,7 @@ import {
  * Tables covered (all write at ≥1/minute and have no referential joins):
  *   vitals, movement, piezo_presence_decisions, piezo_transition_snapshots,
  *   bed_temp, freezer_temp, flow_readings, ambient_light, water_level_readings,
- *   pump_alerts, vitals_quality
+ *   pump_alerts, vitals_quality, thermal_state, health_runs
  *
  * vitals_quality shares vitals' timestamp cutoff so each quality row dies
  * with its paired vitals row (vitals_id is a logical, unenforced reference —
@@ -50,7 +52,18 @@ const RETENTION_TABLES = [
   { table: ambientLight, column: ambientLight.timestamp, name: 'ambient_light' },
   { table: waterLevelReadings, column: waterLevelReadings.timestamp, name: 'water_level_readings' },
   { table: pumpAlerts, column: pumpAlerts.timestamp, name: 'pump_alerts' },
+  { table: thermalState, column: thermalState.timestamp, name: 'thermal_state' },
+  { table: healthRuns, column: healthRuns.lastSeenAt, name: 'health_runs' },
 ] as const
+
+/** Tables the daily retention pass prunes, for System → Databases. */
+export const RETAINED_TABLE_NAMES: readonly string[] = RETENTION_TABLES.map(t => t.name)
+
+/** The retention window the loop uses when started without options. */
+export function configuredRetentionDays(): number {
+  const days = Number(process.env.BIOMETRICS_RETENTION_DAYS ?? 90)
+  return Number.isFinite(days) && days > 0 ? days : 90
+}
 
 export interface RetentionResult {
   /** Total rows deleted across all tables. */
