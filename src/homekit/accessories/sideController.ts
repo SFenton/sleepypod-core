@@ -1,7 +1,7 @@
 /**
  * Per-side hardware-write coordinator for HomeKit accessories.
  *
- * The Thermostat and PowerSwitch surfaces both write to the same pod side.
+ * Thermostat power and temperature characteristics write to the same pod side.
  * iOS can dispatch parallel onSet callbacks (batched writes from scenes,
  * automations, or near-simultaneous user gestures), so any non-serialized
  * caller can race another and stomp the user's setpoint:
@@ -22,8 +22,8 @@ import type { HAPStatus } from 'hap-nodejs'
 import type { DacMonitor } from '@/src/hardware/dacMonitor'
 import type { DeviceStatus, Side } from '@/src/hardware/types'
 import { MAX_TEMP, MIN_TEMP } from '@/src/hardware/types'
-import { getSharedHardwareClient } from '@/src/hardware/dacMonitor.instance'
-import { getAutomationEngineIfRunning } from '@/src/automation'
+import { getTemperatureController } from '@/src/temperature/instance'
+import { TemperatureBlockedError } from '@/src/temperature/controller'
 import { shouldBlock as pumpStallShouldBlock } from '@/src/hardware/pumpStallGuard'
 import { withSideLock } from '@/src/hardware/sideLock'
 
@@ -76,22 +76,22 @@ const POWER_ON_FALLBACK_F = 75
 // the pre-toggle value and silently swallow the queued setTemperature.
 const intendedPower: Record<Side, boolean | null> = { left: null, right: null }
 
-function registerManualOverride(side: Side): void {
-  getAutomationEngineIfRunning()?.registerManualOverride(side)
-}
-
 async function logged<T>(label: string, fn: () => Promise<T>): Promise<T> {
   try {
     return await fn()
   }
   catch (e) {
     console.warn(`[homekit] ${label} failed:`, e instanceof Error ? e.message : e)
+    if (e instanceof TemperatureBlockedError) throw new GuardBlockedError()
     throw e
   }
 }
 
+// Whole °F only: HomeKit's °C→°F conversion is fractional, and 82.36–82.64°F
+// rounds to level 0, which the firmware treats as neutral/off — 28.0°C would
+// silently switch the side off.
 function clampF(f: number): number {
-  return Math.min(MAX_TEMP, Math.max(MIN_TEMP, f))
+  return Math.min(MAX_TEMP, Math.max(MIN_TEMP, Math.round(f)))
 }
 
 export function isPoweredFromStatus(status: DeviceStatus, side: Side): boolean {
@@ -199,10 +199,9 @@ export async function setTargetTemperature(
     // harmless, and the guard trip leaves the intent latch stuck ON
     // (firmware never confirms), so `powered` alone can't be trusted here.
     assertNotGuardBlocked(side, `setTemperature(${side}, ${f})`)
-    registerManualOverride(side)
     await logged(
       `setTemperature(${side}, ${f})`,
-      () => getSharedHardwareClient().setTemperature(side, f),
+      () => getTemperatureController().setManualLocked(side, f),
     )
   })
 }
@@ -228,10 +227,9 @@ export async function setSidePowerOn(monitor: DacMonitor, side: Side): Promise<v
       assertNotGuardBlocked(side, `setPower(${side}, true)`)
       const target = clampF(getStagedTargetF(monitor, side))
       lastTargetF[side] = target
-      registerManualOverride(side)
       await logged(
         `setPower(${side}, true, ${target})`,
-        () => getSharedHardwareClient().setPower(side, true, target),
+        () => getTemperatureController().setManualLocked(side, target),
       )
     })
   }
@@ -253,8 +251,7 @@ export async function setSidePowerOff(monitor: DacMonitor, side: Side): Promise<
     await withSideLock(side, () => logged(
       `setPower(${side}, false)`,
       () => {
-        registerManualOverride(side)
-        return getSharedHardwareClient().setPower(side, false)
+        return getTemperatureController().powerOffLocked(side)
       },
     ))
   }

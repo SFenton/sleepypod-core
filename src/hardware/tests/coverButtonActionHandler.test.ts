@@ -1,5 +1,23 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type { HardwareClient } from '../client'
+import type { CoverButtonActionDeps, CoverButtonEvent } from '../coverButtonActionHandler'
+
+const controllerMock = vi.hoisted(() => ({
+  setManualLocked: vi.fn(),
+  powerOnLocked: vi.fn(),
+  powerOffLocked: vi.fn(),
+  status: vi.fn(),
+}))
+
+const pumpStallShouldBlock = vi.hoisted(() => vi.fn<(side: 'left' | 'right') => boolean>(() => false))
+
+vi.mock('@/src/temperature/instance', () => ({
+  getTemperatureController: () => controllerMock,
+}))
+
+vi.mock('../pumpStallGuard', () => ({
+  shouldBlock: (side: 'left' | 'right') => pumpStallShouldBlock(side),
+}))
 
 const alarmMock = vi.hoisted(() => ({
   getAlarmStatus: vi.fn(() => ({ active: false, state: 'idle' })),
@@ -9,7 +27,7 @@ const alarmMock = vi.hoisted(() => ({
 
 vi.mock('../snoozeManager', () => alarmMock)
 
-import { CoverButtonActionHandler, type CoverButtonActionDeps, type CoverButtonEvent } from '../coverButtonActionHandler'
+const { CoverButtonActionHandler } = await import('../coverButtonActionHandler')
 
 const SOCKET_PATH = '/tmp/test-cover-button.sock'
 
@@ -39,10 +57,8 @@ const makeDeps = (
   deps: CoverButtonActionDeps
   client: HardwareClient
   triggerFeedbackHaptic: ReturnType<typeof vi.fn>
-  recordTemperatureChange: ReturnType<typeof vi.fn>
 } => {
   const triggerFeedbackHaptic = vi.fn().mockResolvedValue(undefined)
-  const recordTemperatureChange = vi.fn().mockResolvedValue(undefined)
   return {
     client,
     deps: {
@@ -50,15 +66,19 @@ const makeDeps = (
       findDeviceState: vi.fn().mockResolvedValue(stateRow),
       newHardwareClient: vi.fn().mockReturnValue(client),
       triggerFeedbackHaptic,
-      recordTemperatureChange,
     },
     triggerFeedbackHaptic,
-    recordTemperatureChange,
   }
 }
 
 describe('CoverButtonActionHandler', () => {
   beforeEach(() => {
+    Object.values(controllerMock).forEach(mock => mock.mockReset())
+    controllerMock.setManualLocked.mockResolvedValue(undefined)
+    controllerMock.powerOnLocked.mockResolvedValue(undefined)
+    controllerMock.powerOffLocked.mockResolvedValue(undefined)
+    controllerMock.status.mockReturnValue({ targetTemperature: null })
+    pumpStallShouldBlock.mockReset().mockReturnValue(false)
     alarmMock.getAlarmStatus.mockReset().mockReturnValue({ active: false, state: 'idle' })
     alarmMock.snoozeAlarm.mockReset().mockImplementation(async (side, _duration, options) => {
       await options.client.clearAlarm(side)
@@ -89,17 +109,13 @@ describe('CoverButtonActionHandler', () => {
   test('executes the gesture matching the button tap count', async () => {
     const action = { actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 }
     const state = { targetTemperature: 70, isPowered: true, isAlarmVibrating: false }
-    const { deps, client, recordTemperatureChange } = makeDeps(action, state)
+    const { deps, client } = makeDeps(action, state)
 
     await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'top', 2))
 
     expect(deps.findActionConfig).toHaveBeenCalledWith('left', 'top', 'doubleTap')
-    expect(client.setTemperature).toHaveBeenCalledTimes(1)
-    expect(client.setTemperature).toHaveBeenCalledWith('left', 71)
-    expect(recordTemperatureChange).toHaveBeenCalledWith('left', 71)
-    expect(vi.mocked(client.setTemperature).mock.invocationCallOrder[0]).toBeLessThan(
-      recordTemperatureChange.mock.invocationCallOrder[0],
-    )
+    expect(controllerMock.setManualLocked).toHaveBeenCalledExactlyOnceWith('left', 71)
+    expect(client.setTemperature).not.toHaveBeenCalled()
   })
 
   test('increments temperature by HA target level when level step mode is enabled', async () => {
@@ -110,12 +126,11 @@ describe('CoverButtonActionHandler', () => {
       temperatureStepMode: 'level',
     }
     const state = { targetTemperature: 74, isPowered: true, isAlarmVibrating: false }
-    const { deps, client, recordTemperatureChange } = makeDeps(action, state)
+    const { deps } = makeDeps(action, state)
 
     await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'top', 2))
 
-    expect(client.setTemperature).toHaveBeenCalledWith('left', 77)
-    expect(recordTemperatureChange).toHaveBeenCalledWith('left', 77)
+    expect(controllerMock.setManualLocked).toHaveBeenCalledWith('left', 77)
   })
 
   test('decrements temperature by HA target level when level step mode is enabled', async () => {
@@ -126,11 +141,11 @@ describe('CoverButtonActionHandler', () => {
       temperatureStepMode: 'level',
     }
     const state = { targetTemperature: 77, isPowered: true, isAlarmVibrating: false }
-    const { deps, client } = makeDeps(action, state)
+    const { deps } = makeDeps(action, state)
 
     await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'bottom', 2))
 
-    expect(client.setTemperature).toHaveBeenCalledWith('left', 74)
+    expect(controllerMock.setManualLocked).toHaveBeenCalledWith('left', 74)
   })
 
   test('ignores unsupported button tap counts', async () => {
@@ -139,27 +154,43 @@ describe('CoverButtonActionHandler', () => {
     await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'top', 5))
 
     expect(deps.findActionConfig).not.toHaveBeenCalled()
+    expect(controllerMock.setManualLocked).not.toHaveBeenCalled()
     expect(client.setTemperature).not.toHaveBeenCalled()
   })
 
   test('decrements and clamps temperature', async () => {
     const action = { actionType: 'temperature', temperatureChange: 'decrement', temperatureAmount: 10 }
     const state = { targetTemperature: 57, isPowered: true, isAlarmVibrating: false }
-    const { deps, client } = makeDeps(action, state)
+    const { deps } = makeDeps(action, state)
 
     await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('right', 'bottom', 2))
 
-    expect(client.setTemperature).toHaveBeenCalledWith('right', 55)
+    expect(controllerMock.setManualLocked).toHaveBeenCalledWith('right', 55)
   })
 
   test('toggles power and preserves cached target when powering on', async () => {
     const action = { actionType: 'power', powerBehavior: 'toggle' }
     const state = { targetTemperature: 72, isPowered: false, isAlarmVibrating: false }
-    const { deps, client } = makeDeps(action, state)
+    const { deps } = makeDeps(action, state)
 
     await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'middle', 2))
 
-    expect(client.setPower).toHaveBeenCalledWith('left', true, 72)
+    expect(controllerMock.powerOnLocked).toHaveBeenCalledWith('left', 72)
+  })
+
+  test.each([
+    ['on', false, true],
+    ['off', true, false],
+  ] as const)('honors configured power behavior %s', async (powerBehavior, isPowered, powersOn) => {
+    const { deps } = makeDeps(
+      { actionType: 'power', powerBehavior },
+      { targetTemperature: 72, isPowered, isAlarmVibrating: false },
+    )
+
+    await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'middle', 2))
+
+    if (powersOn) expect(controllerMock.powerOnLocked).toHaveBeenCalledWith('left', 72)
+    else expect(controllerMock.powerOffLocked).toHaveBeenCalledWith('left')
   })
 
   test('runs configured feedback vibration before a temperature action', async () => {
@@ -179,12 +210,12 @@ describe('CoverButtonActionHandler', () => {
 
     await handler.handle(makeEvent('left', 'top', 2))
 
-    expect(client.setTemperature).toHaveBeenCalledWith('left', 71)
+    expect(controllerMock.setManualLocked).toHaveBeenCalledWith('left', 71)
     expect(triggerFeedbackHaptic).toHaveBeenCalledWith('left')
     expect(client.setAlarm).not.toHaveBeenCalled()
     expect(client.clearAlarm).not.toHaveBeenCalled()
     expect(triggerFeedbackHaptic.mock.invocationCallOrder[0]).toBeLessThan(
-      vi.mocked(client.setTemperature).mock.invocationCallOrder[0],
+      controllerMock.setManualLocked.mock.invocationCallOrder[0],
     )
 
     await vi.advanceTimersByTimeAsync(2_000)
@@ -237,7 +268,7 @@ describe('CoverButtonActionHandler', () => {
 
     await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'top', 2))
 
-    expect(client.setTemperature).toHaveBeenCalledWith('left', 71)
+    expect(controllerMock.setManualLocked).toHaveBeenCalledWith('left', 71)
     expect(client.setAlarm).not.toHaveBeenCalled()
   })
 
@@ -276,10 +307,8 @@ describe('CoverButtonActionHandler', () => {
 
   test('errors in execution do not throw', async () => {
     const action = { actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 }
-    const client = makeMockClient({
-      setTemperature: vi.fn().mockRejectedValue(new Error('hardware failure')),
-    })
-    const { deps } = makeDeps(action, { targetTemperature: 70 }, client)
+    const { deps } = makeDeps(action, { targetTemperature: 70 })
+    controllerMock.setManualLocked.mockRejectedValueOnce(new Error('hardware failure'))
 
     await expect(
       new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'top', 2)),
@@ -306,7 +335,7 @@ describe('CoverButtonActionHandler', () => {
     await handler.handle(makeEvent('left', 'top', 1))
 
     expect(deps.findActionConfig).toHaveBeenCalledWith('left', 'top', 'doubleTap')
-    expect(client.setTemperature).toHaveBeenCalledWith('left', 71)
+    expect(controllerMock.setManualLocked).toHaveBeenCalledWith('left', 71)
   })
 
   test('waits to disambiguate double taps when a higher tap action exists', async () => {
@@ -328,9 +357,36 @@ describe('CoverButtonActionHandler', () => {
     await vi.advanceTimersByTimeAsync(300)
     await handler.handle(makeEvent('left', 'top', 1))
 
-    expect(client.setTemperature).not.toHaveBeenCalled()
+    expect(controllerMock.setManualLocked).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(650)
 
-    expect(client.setTemperature).toHaveBeenCalledWith('left', 71)
+    expect(controllerMock.setManualLocked).toHaveBeenCalledWith('left', 71)
+  })
+
+  test('uses the controller target before the mirrored device target', async () => {
+    controllerMock.status.mockReturnValue({ targetTemperature: 70 })
+    const { deps } = makeDeps(
+      { actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 2 },
+      { targetTemperature: 90, isPowered: true, isAlarmVibrating: false },
+    )
+
+    await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('left', 'top', 2))
+
+    expect(controllerMock.setManualLocked).toHaveBeenCalledWith('left', 72)
+  })
+
+  test('skips a temperature action while the pump-stall guard blocks the side', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    pumpStallShouldBlock.mockReturnValue(true)
+    const { deps } = makeDeps(
+      { actionType: 'temperature', temperatureChange: 'increment', temperatureAmount: 1 },
+      { targetTemperature: 70, isPowered: true, isAlarmVibrating: false },
+    )
+
+    await new CoverButtonActionHandler(SOCKET_PATH, deps).handle(makeEvent('right', 'top', 2))
+
+    expect(controllerMock.setManualLocked).not.toHaveBeenCalled()
+    expect(warn).toHaveBeenCalledWith('[coverButtonActionHandler] skipped setTemperature: pump stall guard blocks right')
+    warn.mockRestore()
   })
 })

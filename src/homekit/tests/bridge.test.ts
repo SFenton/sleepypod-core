@@ -30,6 +30,7 @@ const m = vi.hoisted(() => {
   }
   const fakeAccessory = (name: string) => ({
     name,
+    _server: {},
     addService: vi.fn(),
     getService: vi.fn().mockReturnValue(infoService),
     addBridgedAccessory: vi.fn(),
@@ -53,13 +54,11 @@ const m = vi.hoisted(() => {
     thermostatStop: vi.fn(),
     occupancyStop: vi.fn(),
     snoozeStop: vi.fn(),
-    powerStop: vi.fn(),
     primeStop: vi.fn(),
     ambientStop: vi.fn(),
     buildThermostatService: vi.fn(),
     buildOccupancySensor: vi.fn(),
     buildSnoozeSwitch: vi.fn(),
-    buildPowerSwitch: vi.fn(),
     buildPrimeSwitch: vi.fn(),
     buildAmbientSensor: vi.fn(),
     pumpStop: vi.fn(),
@@ -91,9 +90,6 @@ vi.mock('../accessories/occupancySensor', () => ({
 }))
 vi.mock('../accessories/snoozeSwitch', () => ({
   buildSnoozeSwitch: m.buildSnoozeSwitch,
-}))
-vi.mock('../accessories/powerSwitch', () => ({
-  buildPowerSwitch: m.buildPowerSwitch,
 }))
 vi.mock('../accessories/primeSwitch', () => ({
   buildPrimeSwitch: m.buildPrimeSwitch,
@@ -136,7 +132,6 @@ describe('homekit bridge', () => {
     m.thermostatStop.mockClear()
     m.occupancyStop.mockClear()
     m.snoozeStop.mockClear()
-    m.powerStop.mockClear()
     m.primeStop.mockClear()
     m.ambientStop.mockClear()
     m.pumpStop.mockClear()
@@ -144,7 +139,6 @@ describe('homekit bridge', () => {
     m.buildThermostatService.mockImplementation(() => ({ service: fakeService, stop: m.thermostatStop }))
     m.buildOccupancySensor.mockImplementation(() => ({ service: fakeService, stop: m.occupancyStop }))
     m.buildSnoozeSwitch.mockImplementation(() => ({ service: fakeService, stop: m.snoozeStop }))
-    m.buildPowerSwitch.mockImplementation(() => ({ service: fakeService, stop: m.powerStop }))
     m.buildPrimeSwitch.mockImplementation(() => ({ service: fakeService, stop: m.primeStop }))
     m.buildAmbientSensor.mockImplementation(() => ({ service: fakeService, stop: m.ambientStop }))
     m.buildPumpHealthSensor.mockImplementation(() => ({ service: fakeService, stop: m.pumpStop }))
@@ -174,18 +168,16 @@ describe('homekit bridge', () => {
     }
   })
 
-  it('startBridge wires Thermostat + Occupancy + Snooze + Power per side, plus Prime and Ambient', { timeout: 30_000 }, async () => {
+  it('startBridge wires Thermostat + Occupancy + Snooze per side, plus Prime and Ambient', { timeout: 30_000 }, async () => {
     const { startBridge } = await import('../bridge')
     await startBridge(fakeMonitor)
 
-    // 2 sides × 4 per-side accessories + 1 prime + 1 ambient + 2 pump = 12 bridged accessories
-    expect(m.bridgeInstance?.addBridgedAccessory).toHaveBeenCalledTimes(12)
+    // 2 sides × 3 per-side accessories + 1 prime + 1 ambient + 2 pump = 10 bridged accessories
+    expect(m.bridgeInstance?.addBridgedAccessory).toHaveBeenCalledTimes(10)
 
     // Builders called with the expected sides.
     expect(m.buildThermostatService).toHaveBeenCalledWith('left', fakeMonitor)
     expect(m.buildThermostatService).toHaveBeenCalledWith('right', fakeMonitor)
-    expect(m.buildPowerSwitch).toHaveBeenCalledWith('left', fakeMonitor)
-    expect(m.buildPowerSwitch).toHaveBeenCalledWith('right', fakeMonitor)
     expect(m.buildOccupancySensor).toHaveBeenCalledWith('left')
     expect(m.buildOccupancySensor).toHaveBeenCalledWith('right')
     expect(m.buildSnoozeSwitch).toHaveBeenCalledWith('left')
@@ -288,11 +280,9 @@ describe('homekit bridge', () => {
       ['Bed left', 'bed-left'],
       ['Bed left occupancy', 'occupancy-left'],
       ['Snooze left', 'snooze-left'],
-      ['Bed left power', 'power-left'],
       ['Bed right', 'bed-right'],
       ['Bed right occupancy', 'occupancy-right'],
       ['Snooze right', 'snooze-right'],
-      ['Bed right power', 'power-right'],
       ['Prime pod', 'prime'],
       ['Pod ambient', 'ambient'],
       ['Pod pump left', 'pump-left'],
@@ -317,6 +307,7 @@ describe('homekit bridge', () => {
     m.BridgeCtor.mockImplementationOnce(function BridgeFail(this: unknown, name: string) {
       const inst = {
         name,
+        _server: {},
         addService: vi.fn(),
         getService: vi.fn().mockReturnValue({ setCharacteristic: vi.fn().mockReturnThis() }),
         addBridgedAccessory: vi.fn(),
@@ -333,7 +324,6 @@ describe('homekit bridge', () => {
     expect(m.thermostatStop).toHaveBeenCalledTimes(2)
     expect(m.occupancyStop).toHaveBeenCalledTimes(2)
     expect(m.snoozeStop).toHaveBeenCalledTimes(2)
-    expect(m.powerStop).toHaveBeenCalledTimes(2)
     expect(m.primeStop).toHaveBeenCalledTimes(1)
     expect(m.ambientStop).toHaveBeenCalledTimes(1)
   })
@@ -345,19 +335,18 @@ describe('homekit bridge', () => {
 
     await stopBridge()
     expect(m.thermostatStop).toHaveBeenCalledTimes(2)
-    expect(m.powerStop).toHaveBeenCalledTimes(2)
     expect(m.primeStop).toHaveBeenCalledTimes(1)
     expect(m.ambientStop).toHaveBeenCalledTimes(1)
     expect(getStatus().running).toBe(false)
   })
 
-  it('stopBridge keeps the singleton live when destroy() throws', async () => {
+  it('stopBridge keeps the singleton live when unpublish() throws', async () => {
     const { startBridge, stopBridge, getStatus } = await import('../bridge')
     await startBridge(fakeMonitor)
     if (m.bridgeInstance) {
-      m.bridgeInstance.destroy = vi.fn().mockRejectedValue(new Error('destroy failed'))
+      m.bridgeInstance.unpublish = vi.fn().mockRejectedValueOnce(new Error('unpublish failed'))
     }
-    await stopBridge()
+    await expect(stopBridge()).rejects.toThrow('unpublish failed')
     expect(getStatus().running).toBe(true)
   })
 
@@ -373,14 +362,13 @@ describe('homekit bridge', () => {
     expect(m.clearPairings).toHaveBeenCalledWith('AA:BB:CC:DD:EE:FF')
     expect(m.regenerateIdentity).toHaveBeenCalledTimes(1)
     expect(getStatus().username).toBe('NN:NN:NN:NN:NN:NN')
-    // The load-bearing order is destroy() → clearPairings. hap-nodejs writes
-    // to AccessoryInfo during shutdown; deleting the file mid-teardown
-    // would race that write. clearPairings/regenerateIdentity order is
+    // Finish unpublishing before deleting state so the old HAP server
+    // cannot accept pairing requests after its persisted state is cleared. clearPairings/regenerateIdentity order is
     // file-safe (oldUsername is captured upfront), so we don't pin it.
     if (!m.bridgeInstance) throw new Error('bridge instance missing')
-    const destroyCall = m.bridgeInstance.destroy.mock.invocationCallOrder[0]
+    const unpublishCall = m.bridgeInstance.unpublish.mock.invocationCallOrder[0]
     const clearCall = m.clearPairings.mock.invocationCallOrder[0]
-    expect(destroyCall).toBeLessThan(clearCall)
+    expect(unpublishCall).toBeLessThan(clearCall)
   })
 
   it('unpairAll without a prior startBridge falls back to loadOrCreateIdentity for the username', async () => {
@@ -402,12 +390,12 @@ describe('homekit bridge', () => {
     const { startBridge, unpairAll, getStatus } = await import('../bridge')
     await startBridge(fakeMonitor)
     if (m.bridgeInstance) {
-      m.bridgeInstance.destroy = vi.fn().mockRejectedValue(new Error('destroy failed'))
+      m.bridgeInstance.unpublish = vi.fn().mockRejectedValueOnce(new Error('unpublish failed'))
     }
     // Identity must stay on the old MAC — rotating while a live bridge
     // still answers on the old MAC would desync getStatus() from the
     // running HAP server.
-    await expect(unpairAll()).rejects.toThrow(/bridge teardown incomplete/)
+    await expect(unpairAll()).rejects.toThrow('unpublish failed')
     expect(m.clearPairings).not.toHaveBeenCalled()
     expect(m.regenerateIdentity).not.toHaveBeenCalled()
     expect(getStatus().username).toBe('AA:BB:CC:DD:EE:FF')
@@ -431,21 +419,42 @@ describe('homekit bridge', () => {
     warnSpy.mockRestore()
   })
 
-  it('stopBridge warns when unpublish() throws but destroy() still completes', async () => {
+  it('continues teardown when an accessory stopper throws a non-Error value', async () => {
     const { startBridge, stopBridge, getStatus } = await import('../bridge')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    m.thermostatStop.mockImplementationOnce(() => {
+      throw 'stopper failure'
+    })
     await startBridge(fakeMonitor)
-    if (m.bridgeInstance) {
-      m.bridgeInstance.unpublish = vi.fn().mockRejectedValue(new Error('unpub boom'))
-    }
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     await stopBridge()
-    expect(warnSpy).toHaveBeenCalledWith(
-      '[homekit] unpublish failed:',
-      expect.stringMatching(/unpub boom/),
-    )
+
+    expect(warn).toHaveBeenCalledWith('[homekit] stopper failed:', 'stopper failure')
+    expect(m.ambientStop).toHaveBeenCalledOnce()
     expect(getStatus().running).toBe(false)
-    warnSpy.mockRestore()
+  })
+
+  it('retries cleanup for an advertiser without EventEmitter helpers', async () => {
+    const { startBridge, stopBridge, getStatus } = await import('../bridge')
+    await startBridge(fakeMonitor)
+    if (!m.bridgeInstance) throw new Error('bridge instance missing')
+    const advertiser = { destroy: vi.fn().mockResolvedValue(undefined) }
+    Object.assign(m.bridgeInstance, { _server: undefined, _advertiser: advertiser })
+    m.bridgeInstance.unpublish.mockRejectedValueOnce(new Error('cleanup interrupted'))
+
+    await expect(stopBridge()).rejects.toThrow('cleanup interrupted')
+    expect(getStatus().running).toBe(false)
+    await startBridge(fakeMonitor)
+    expect(advertiser.destroy).toHaveBeenCalledOnce()
+    expect(getStatus().running).toBe(true)
+  })
+
+  it('stopBridge never destroys persisted accessory data', async () => {
+    const { startBridge, stopBridge } = await import('../bridge')
+    await startBridge(fakeMonitor)
+    await stopBridge()
+    expect(m.bridgeInstance?.unpublish).toHaveBeenCalledOnce()
+    expect(m.bridgeInstance?.destroy).not.toHaveBeenCalled()
   })
 
   it('stopBridge clears setupURI even when no bridge was ever published', async () => {
@@ -664,11 +673,11 @@ describe('homekit bridge', () => {
     const { startBridge, regenerate, getStatus } = await import('../bridge')
     await startBridge(fakeMonitor)
     if (m.bridgeInstance) {
-      m.bridgeInstance.destroy = vi.fn().mockRejectedValue(new Error('destroy failed'))
+      m.bridgeInstance.unpublish = vi.fn().mockRejectedValueOnce(new Error('unpublish failed'))
     }
     // Same invariant as unpairAll: rotating identity while a live bridge
     // still answers on the old MAC desyncs getStatus from the HAP server.
-    await expect(regenerate()).rejects.toThrow(/bridge teardown incomplete/)
+    await expect(regenerate()).rejects.toThrow('unpublish failed')
     expect(m.clearPairings).not.toHaveBeenCalled()
     expect(m.regenerateIdentity).not.toHaveBeenCalled()
     expect(getStatus().username).toBe('AA:BB:CC:DD:EE:FF')
@@ -847,19 +856,6 @@ describe('homekit bridge', () => {
       pairedControllers: [],
     })
     expect(m.readPairedControllers).not.toHaveBeenCalled()
-  })
-
-  it('logs an exact destroy warning and keeps bridge state on teardown failure', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const { startBridge, stopBridge, getStatus } = await import('../bridge')
-    await startBridge(fakeMonitor)
-    if (!m.bridgeInstance) throw new Error('bridge instance missing')
-    m.bridgeInstance.destroy = vi.fn().mockRejectedValue(new Error('destroy boom'))
-
-    await stopBridge()
-
-    expect(warn).toHaveBeenCalledWith('[homekit] destroy failed:', 'destroy boom')
-    expect(getStatus().running).toBe(true)
   })
 
   it('honors HOMEKIT_ADVERTISER=avahi', async () => {

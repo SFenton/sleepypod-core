@@ -1,6 +1,9 @@
 import type { HardwareClient } from './client'
 import { fahrenheitToLevel, levelToFahrenheit, MAX_TEMP, MIN_TEMP, TEMP_NEUTRAL, type Side } from './types'
 import { getAlarmStatus, snoozeAlarm, stopAlarm } from './snoozeManager'
+import { shouldBlock as pumpStallShouldBlock } from './pumpStallGuard'
+import { withSideLock } from './sideLock'
+import { getTemperatureController } from '@/src/temperature/instance'
 
 export type CoverButton = 'top' | 'middle' | 'bottom'
 export type CoverButtonTapType = 'singleTap' | 'doubleTap' | 'tripleTap' | 'quadTap'
@@ -38,7 +41,6 @@ export interface CoverButtonActionDeps {
   findDeviceState: (side: Side) => Promise<CoverButtonDeviceStateRow | null>
   newHardwareClient: (socketPath: string) => HardwareClient
   triggerFeedbackHaptic: (side: Side) => Promise<void>
-  recordTemperatureChange?: (side: Side, targetTemperature: number) => Promise<void>
 }
 
 const TAP_AGGREGATION_WINDOW_MS = 650
@@ -205,24 +207,27 @@ export class CoverButtonActionHandler {
     side: Side,
     action: CoverButtonActionRow,
   ): Promise<void> => {
-    const state = await this.deps.findDeviceState(side)
-    const currentTemp = state?.targetTemperature ?? TEMP_NEUTRAL
-    const amount = action.temperatureAmount ?? 0
     if (!action.temperatureChange) return
-    const direction = action.temperatureChange === 'increment' ? 1 : -1
-    const newTemp = action.temperatureStepMode === 'level'
-      ? this.temperatureForLevelStep(currentTemp, amount * direction)
-      : Math.min(MAX_TEMP, Math.max(MIN_TEMP, currentTemp + (amount * direction)))
-
-    const client = this.deps.newHardwareClient(this.socketPath)
-    try {
-      await client.connect()
-      await client.setTemperature(side, newTemp)
-      await this.deps.recordTemperatureChange?.(side, newTemp)
-    }
-    finally {
-      client.disconnect()
-    }
+    await withSideLock(side, async () => {
+      // Step from the target SleepyPod owns (manual hold, schedule, run-once,
+      // Autopilot), falling back to the mirrored device target. Routing through
+      // the controller makes the press a manual hold, so the reconcile loop
+      // does not revert it to the previous owner's target.
+      const owned = getTemperatureController().status(side).targetTemperature
+      const currentTemp = owned
+        ?? (await this.deps.findDeviceState(side))?.targetTemperature
+        ?? TEMP_NEUTRAL
+      const amount = action.temperatureAmount ?? 0
+      const direction = action.temperatureChange === 'increment' ? 1 : -1
+      const newTemp = action.temperatureStepMode === 'level'
+        ? this.temperatureForLevelStep(currentTemp, amount * direction)
+        : Math.min(MAX_TEMP, Math.max(MIN_TEMP, currentTemp + (amount * direction)))
+      if (pumpStallShouldBlock(side)) {
+        console.warn(`[coverButtonActionHandler] skipped setTemperature: pump stall guard blocks ${side}`)
+        return
+      }
+      await getTemperatureController().setManualLocked(side, newTemp)
+    })
   }
 
   private temperatureForLevelStep = (currentTemp: number, delta: number): number => {
@@ -241,21 +246,24 @@ export class CoverButtonActionHandler {
     side: Side,
     action: CoverButtonActionRow,
   ): Promise<void> => {
-    const state = await this.deps.findDeviceState(side)
-    const behavior = action.powerBehavior ?? 'toggle'
-    const nextPowered = behavior === 'toggle'
-      ? !(state?.isPowered ?? false)
-      : behavior === 'on'
-    const target = state?.targetTemperature ?? TEMP_NEUTRAL
-
-    const client = this.deps.newHardwareClient(this.socketPath)
-    try {
-      await client.connect()
-      await client.setPower(side, nextPowered, nextPowered ? target : undefined)
-    }
-    finally {
-      client.disconnect()
-    }
+    await withSideLock(side, async () => {
+      // Resolve the toggle after older queued commands have updated state.
+      const state = await this.deps.findDeviceState(side)
+      const behavior = action.powerBehavior ?? 'toggle'
+      const nextPowered = behavior === 'toggle'
+        ? !(state?.isPowered ?? false)
+        : behavior === 'on'
+      if (nextPowered && pumpStallShouldBlock(side)) {
+        console.warn(`[coverButtonActionHandler] skipped power-on: pump stall guard blocks ${side}`)
+        return
+      }
+      if (nextPowered) {
+        await getTemperatureController().powerOnLocked(side, state?.targetTemperature ?? TEMP_NEUTRAL)
+      }
+      else {
+        await getTemperatureController().powerOffLocked(side)
+      }
+    })
   }
 
   private handleAlarmAction = async (

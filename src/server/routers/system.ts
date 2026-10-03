@@ -1,12 +1,66 @@
 import { z } from 'zod'
+import { branchNameSchema } from '@/src/server/validation-schemas'
 import { TRPCError } from '@trpc/server'
 import { publicProcedure, router } from '@/src/server/trpc'
 import { execFile } from 'node:child_process'
 import { accessSync, constants } from 'node:fs'
-import { readdir, readFile } from 'node:fs/promises'
+import { readdir, readFile, stat } from 'node:fs/promises'
 import { promisify } from 'node:util'
+import { getStorageReport, runStorageCleanup } from '@/src/lib/podStorage'
+import {
+  classifyFirmware,
+  expectedTransport,
+  FIRMWARE_LABELS,
+  firmwareProbed,
+  type FirmwareSignals,
+} from '@/src/lib/firmwareGeneration'
+import { getServerPerformance } from '@/src/lib/serverPerformance'
+import { getSensorFrameTimes } from '@/src/streaming/piezoStream'
 
 const execFileAsync = promisify(execFile)
+
+/**
+ * Probe the pod's firmware footprint for `getSensorSource`. Each probe maps a
+ * missing tool (ENOENT — dev box, no systemd) to `null` and any other failure
+ * to `false`, so the classifier can tell "not a pod" from "not that variant".
+ */
+async function collectFirmwareSignals(): Promise<FirmwareSignals> {
+  const isEnoent = (err: unknown) => (err as NodeJS.ErrnoException)?.code === 'ENOENT'
+  const exec = async (file: string, args: string[]): Promise<string | null | false> => {
+    try {
+      const { stdout } = await execFileAsync(file, args, { timeout: 3000 })
+      return stdout
+    }
+    catch (err) {
+      return isEnoent(err) ? null : false
+    }
+  }
+  const tri = (out: string | null | false, test: (s: string) => boolean): boolean | null =>
+    out === null ? null : out === false ? false : test(out)
+
+  const [loadState, active, jetstream, mounted, frankSh, frankUnit] = await Promise.all([
+    exec('systemctl', ['show', 'nats-server.service', '--property=LoadState', '--value']),
+    exec('systemctl', ['is-active', '--quiet', 'nats-server.service']),
+    stat('/persistent/jetstream').then(s => s.isDirectory()).catch((err: unknown) => (isEnoent(err) ? false : null)),
+    exec('mountpoint', ['-q', '/persistent/biometrics']),
+    readFile('/opt/eight/bin/frank.sh', 'utf-8').catch((err: unknown) => (isEnoent(err) ? false as const : null)),
+    exec('systemctl', ['cat', 'frank.service']),
+  ])
+
+  return {
+    natsUnitInstalled: tri(loadState, (s) => {
+      const v = s.trim()
+      return v === 'loaded' || v === 'masked'
+    }),
+    natsServerActive: tri(active, () => true),
+    jetstreamDirPresent: jetstream,
+    biometricsTmpfsMounted: tri(mounted, () => true),
+    frankShimRoutesTmpfs: tri(frankSh, s => s.includes('cd /persistent/biometrics')),
+    frankServiceRoutesTmpfs: tri(frankUnit, s => /^WorkingDirectory=\/persistent\/biometrics$/m.test(s)),
+  }
+}
+
+const SENSOR_TRANSPORT_OVERRIDES = ['raw', 'nats'] as const
 
 /**
  * Resolve an executable path, checking common locations on Yocto and Debian.
@@ -269,18 +323,7 @@ export const systemRouter = router({
   triggerUpdate: publicProcedure
     .meta({ openapi: { method: 'POST', path: '/system/update', protect: false, tags: ['System'] } })
     .input(z.object({
-      branch: z.string()
-        .regex(/^[a-zA-Z0-9._\-/]+$/, 'Invalid branch name')
-        // git-ref safety the character class can't express: no path
-        // traversal ('..'), no leading/trailing '/', no empty segments
-        // ('//'), and no leading '-' (option injection into git argv).
-        .refine(
-          b => !b.includes('..') && !b.includes('//')
-            && !b.startsWith('/') && !b.endsWith('/')
-            && !b.startsWith('-') && !b.endsWith('.lock'),
-          'Invalid branch name',
-        )
-        .optional(),
+      branch: branchNameSchema.optional(),
     }))
     .output(z.object({
       triggered: z.boolean(),
@@ -532,6 +575,66 @@ export const systemRouter = router({
     }),
 
   /**
+   * /persistent usage by category, days of raw history left by the pruner,
+   * and what sp-storage-cleanup could reclaim (System → Storage).
+   */
+  getStorage: publicProcedure
+    .meta({ openapi: { method: 'GET', path: '/system/storage', protect: false, tags: ['System'] } })
+    .input(z.object({}))
+    .output(z.object({
+      persistent: z.object({
+        totalBytes: z.number(),
+        usedBytes: z.number(),
+        availableBytes: z.number(),
+        usedPercent: z.number(),
+      }),
+      prunerTargetPercent: z.number(),
+      segments: z.array(z.object({
+        key: z.enum(['rawArchive', 'app', 'database', 'swap', 'reclaimable', 'other']),
+        bytes: z.number(),
+      })),
+      rawHistory: z.object({
+        fileCount: z.number(),
+        oldest: z.string().nullable(),
+        newest: z.string().nullable(),
+        days: z.number().nullable(),
+      }),
+      reclaimable: z.object({
+        available: z.boolean(),
+        totalBytes: z.number(),
+        items: z.array(z.object({
+          path: z.string(),
+          bytes: z.number(),
+          reason: z.string(),
+          kind: z.enum(['temp', 'release', 'modules', 'backup']),
+        })),
+      }),
+    }))
+    .query(() => getStorageReport()),
+
+  /**
+   * Delete sleepypod's own leftovers on /persistent (never the live install,
+   * databases, raw archive, swap or HomeKit data). Old database backups only
+   * when asked; the newest of each is always kept.
+   */
+  freeStorage: publicProcedure
+    .meta({ openapi: { method: 'POST', path: '/system/storage/free', protect: false, tags: ['System'] } })
+    .input(z.object({ includeDbBackups: z.boolean().default(false) }).strict())
+    .output(z.object({ freedBytes: z.number(), removed: z.number() }))
+    .mutation(async ({ input }) => {
+      try {
+        return await runStorageCleanup(input.includeDbBackups)
+      }
+      catch (error) {
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: `Storage cleanup failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+          cause: error,
+        })
+      }
+    }),
+
+  /**
    * Returns build/version info from .git-info (generated at build time).
    */
   getVersion: publicProcedure
@@ -542,9 +645,11 @@ export const systemRouter = router({
       commitHash: z.string(),
       commitTitle: z.string(),
       buildDate: z.string(),
+      /** Semantic-release tag (vX.Y.Z) when installed from a tagged release, else null. */
+      version: z.string().nullable(),
     }))
     .query(async () => {
-      const fallback = { branch: 'unknown', commitHash: 'unknown', commitTitle: 'unknown', buildDate: 'unknown' }
+      const fallback = { branch: 'unknown', commitHash: 'unknown', commitTitle: 'unknown', buildDate: 'unknown', version: null }
       try {
         const raw = await readFile('.git-info', 'utf-8')
         const parsed = JSON.parse(raw)
@@ -553,10 +658,92 @@ export const systemRouter = router({
           commitHash: typeof parsed.commitHash === 'string' ? parsed.commitHash : 'unknown',
           commitTitle: typeof parsed.commitTitle === 'string' ? parsed.commitTitle : 'unknown',
           buildDate: typeof parsed.buildDate === 'string' ? parsed.buildDate : 'unknown',
+          version: typeof parsed.version === 'string' && /^v\d+\.\d+\.\d+/.test(parsed.version) ? parsed.version : null,
         }
       }
       catch {
         return fallback
+      }
+    }),
+
+  /**
+   * Which sensor-frame transport this pod's firmware provides, and which one
+   * the core's stream actually selected at startup. Read-only: selection
+   * happens once per process (see `docs/nats-frame-readers.md`), so this
+   * exists to make the choice visible in Settings → Device without a shell.
+   */
+  getSensorSource: publicProcedure
+    .meta({ openapi: { method: 'GET', path: '/system/sensor-source', protect: false, tags: ['System'] } })
+    .input(z.object({}))
+    .output(z.object({
+      firmware: z.object({
+        generation: z.enum(['nats', 'raw-tmpfs-shim', 'raw-tmpfs-service', 'raw-tmpfs-unverified', 'raw-filesystem']),
+        label: z.string(),
+        detail: z.string(),
+        expectedTransport: z.enum(['nats', 'raw']),
+        /** False on a dev box where no systemd probe could run. */
+        probed: z.boolean(),
+        signals: z.object({
+          natsUnitInstalled: z.boolean().nullable(),
+          natsServerActive: z.boolean().nullable(),
+          jetstreamDirPresent: z.boolean().nullable(),
+          biometricsTmpfsMounted: z.boolean().nullable(),
+          frankShimRoutesTmpfs: z.boolean().nullable(),
+          frankServiceRoutesTmpfs: z.boolean().nullable(),
+        }),
+      }),
+      stream: z.object({
+        /** `pending` until the startup probe settles on a source. */
+        source: z.enum(['pending', 'raw', 'nats']),
+        /** PIEZO_SENSOR_SOURCE when set to a valid value, else null. */
+        override: z.enum(SENSOR_TRANSPORT_OVERRIDES).nullable(),
+        /** PIEZO_NATS_DISABLED=1 — the legacy RAW-only escape hatch. */
+        legacyNatsDisabled: z.boolean(),
+        lastFrameAtMs: z.number().nullable(),
+        /** Server-side age so the client never needs its own clock. */
+        lastFrameAgeMs: z.number().nullable(),
+        lastFrameType: z.string().nullable(),
+        firstFrameMs: z.number().nullable(),
+        uptimeSeconds: z.number(),
+      }),
+    }))
+    .query(async () => {
+      const signals = await collectFirmwareSignals()
+      const generation = classifyFirmware(signals)
+      const perf = getServerPerformance()
+
+      let lastFrameAtMs: number | null = null
+      let lastFrameType: string | null = null
+      for (const [type, at] of Object.entries(getSensorFrameTimes())) {
+        if (lastFrameAtMs === null || at > lastFrameAtMs) {
+          lastFrameAtMs = at
+          lastFrameType = type
+        }
+      }
+
+      const rawOverride = process.env.PIEZO_SENSOR_SOURCE
+      const override = (SENSOR_TRANSPORT_OVERRIDES as readonly string[]).includes(rawOverride ?? '')
+        ? rawOverride as typeof SENSOR_TRANSPORT_OVERRIDES[number]
+        : null
+
+      return {
+        firmware: {
+          generation,
+          ...FIRMWARE_LABELS[generation],
+          expectedTransport: expectedTransport(generation),
+          probed: firmwareProbed(signals),
+          signals,
+        },
+        stream: {
+          source: perf.sensorSource,
+          override,
+          legacyNatsDisabled: process.env.PIEZO_NATS_DISABLED === '1',
+          lastFrameAtMs,
+          lastFrameAgeMs: lastFrameAtMs === null ? null : Math.max(0, Date.now() - lastFrameAtMs),
+          lastFrameType,
+          firstFrameMs: perf.firstFrameMs,
+          uptimeSeconds: perf.uptimeSeconds,
+        },
       }
     }),
 })

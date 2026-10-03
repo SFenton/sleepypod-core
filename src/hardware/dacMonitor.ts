@@ -79,6 +79,12 @@ export class DacMonitor extends EventEmitter {
 
   getLastStatus = (): DeviceStatus | null => this.lastStatus
 
+  /** Epoch ms the last successful status poll started, or null before the first. */
+  getLastPollAt = (): number | null => this.lastPollStartedAt
+
+  /** Current poll interval: 1 s while clients watch, 5 s idle, 2 s by default. */
+  getPollIntervalMs = (): number => this.config.pollIntervalMs
+
   /** Only reuse a recent, healthy observation with no intervening hardware writes. */
   getFreshStatus = (maxAgeMs: number): DeviceStatus | null => {
     if (this.monitorStatus !== 'running' || !this.client?.isConnected() || this.lastPollStartedAt === null) return null

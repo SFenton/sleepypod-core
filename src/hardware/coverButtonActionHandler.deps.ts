@@ -4,7 +4,6 @@ import { deviceState, tapGestures } from '@/src/db/schema'
 import type { Side } from './types'
 import { getSharedHardwareClient } from './dacMonitor.instance'
 import { triggerHapticConfirm } from './sensorHaptics'
-import { recordTemperatureChange } from './temperatureMutationState'
 import type { CoverButton, CoverButtonActionDeps, CoverButtonTapType } from './coverButtonActionHandler'
 
 export const defaultCoverButtonActionDeps: CoverButtonActionDeps = {
@@ -32,5 +31,4 @@ export const defaultCoverButtonActionDeps: CoverButtonActionDeps = {
 
   newHardwareClient: () => getSharedHardwareClient(),
   triggerFeedbackHaptic: triggerHapticConfirm,
-  recordTemperatureChange,
 }

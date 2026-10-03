@@ -511,6 +511,14 @@ describe('piezoStream — decodeSensorFrames', () => {
     expect(int32BufferToArray(Buffer.alloc(0))).toEqual([])
     expect(int32BufferToArray(Buffer.from([1, 2, 3]))).toEqual([])
   })
+
+  it('repairs firmware lost-sample markers by interpolation', () => {
+    const LOST = 0x7FFFFFFF
+    const buf = (vals: number[]) => Buffer.from(new Int32Array(vals).buffer)
+    expect(int32BufferToArray(buf([100, 200, LOST, 400, LOST, LOST, 700]))).toEqual([100, 200, 300, 400, 500, 600, 700])
+    expect(int32BufferToArray(buf([LOST, -50, 10, LOST]))).toEqual([-50, -50, 10, 10])
+    expect(int32BufferToArray(buf([LOST, LOST]))).toEqual([])
+  })
 })
 
 describe('piezoStream — findIndexEntry binary search', () => {

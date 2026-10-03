@@ -44,6 +44,8 @@ const mocks = vi.hoisted(() => ({
   startPerformanceMonitoring: vi.fn(),
   stopPerformanceMonitoring: vi.fn(),
   recordStartupPhase: vi.fn(),
+  startTemperatureController: vi.fn(async () => undefined),
+  stopTemperatureController: vi.fn(),
   getAutomationEngine: vi.fn(async () => ({})),
   shutdownAutomationEngine: vi.fn(async () => undefined),
 }))
@@ -57,6 +59,11 @@ vi.mock('@/src/lib/serverPerformance', () => ({
   stopPerformanceMonitoring: mocks.stopPerformanceMonitoring,
   recordStartupPhase: mocks.recordStartupPhase,
 }))
+vi.mock('@/src/temperature/instance', () => ({
+  startTemperatureController: mocks.startTemperatureController,
+  stopTemperatureController: mocks.stopTemperatureController,
+}))
+
 vi.mock('@/src/automation', () => ({
   getAutomationEngine: mocks.getAutomationEngine,
   shutdownAutomationEngine: mocks.shutdownAutomationEngine,
@@ -290,7 +297,9 @@ describe('initializeScheduler — error swallowing', () => {
 
     const { initializeScheduler } = await fresh()
     const initialization = initializeScheduler()
-    await vi.runAllTimersAsync()
+    // Advance past the backoff (500 + 1000 ms) and one 5 s recovery retry; recurring
+    // samplers make runAllTimersAsync unbounded.
+    await vi.advanceTimersByTimeAsync(1_500 + 5_000 + 1_000)
     await initialization
 
     expect(mocks.initializeAlarmLifecycle).toHaveBeenCalledTimes(4)
@@ -365,6 +374,16 @@ describe('initializeScheduler — error swallowing', () => {
 })
 
 describe('register()', () => {
+  it('starts the shared controller and keepalives even when Autopilot fails', async () => {
+    mocks.getAutomationEngine.mockRejectedValueOnce(new Error('automation table unavailable'))
+    const { register } = await import('../instrumentation')
+    await register()
+    await vi.waitFor(() => {
+      expect(mocks.startTemperatureController).toHaveBeenCalledTimes(1)
+      expect(mocks.initializeKeepalives).toHaveBeenCalledTimes(1)
+    })
+  })
+
   it('waits for migrations before publishing hardware readiness', async () => {
     let release!: () => void
     mocks.runMigrations.mockImplementationOnce(() => new Promise((resolve) => {

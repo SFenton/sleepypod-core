@@ -11,17 +11,21 @@
  * HomeKit and gesture writes rely on the poll to surface their changes.
  */
 
+import { getTemperatureControlStatus } from '@/src/temperature/instance'
 import { getDacMonitorIfRunning } from '@/src/hardware/dacMonitor.instance'
 import { broadcastFrame } from './piezoStream'
 import { getPrimeCompletedAt } from '@/src/hardware/primeNotification'
 import { getAllPumpStallNotices } from '@/src/hardware/pumpStallNotification'
 import { getAlarmStatus, getSnoozeStatus } from '@/src/hardware/snoozeManager'
+import { applyMutationOverlay, recordMutationOverlay } from './mutationOverlay'
 
 export function broadcastMutationStatus(
   side?: 'left' | 'right',
   sideOverlay?: Record<string, unknown>,
 ): void {
   try {
+    // Hold the new target over polls that still report the old one.
+    if (side) recordMutationOverlay(side, sideOverlay)
     const monitor = getDacMonitorIfRunning()
     const lastStatus = monitor?.getLastStatus()
     if (!lastStatus) return
@@ -30,8 +34,8 @@ export function broadcastMutationStatus(
     const stallNotices = getAllPumpStallNotices()
     const leftAlarm = getAlarmStatus('left')
     const rightAlarm = getAlarmStatus('right')
-    const leftSide = { ...lastStatus.leftSide, isAlarmVibrating: leftAlarm.state === 'ringing' }
-    const rightSide = { ...lastStatus.rightSide, isAlarmVibrating: rightAlarm.state === 'ringing' }
+    const leftSide = { ...applyMutationOverlay('left', { ...lastStatus.leftSide }), isAlarmVibrating: leftAlarm.state === 'ringing' }
+    const rightSide = { ...applyMutationOverlay('right', { ...lastStatus.rightSide }), isAlarmVibrating: rightAlarm.state === 'ringing' }
 
     if (side && sideOverlay) {
       if (side === 'left') Object.assign(leftSide, sideOverlay)
@@ -40,6 +44,7 @@ export function broadcastMutationStatus(
 
     broadcastFrame({
       type: 'deviceStatus',
+      temperatureControl: getTemperatureControlStatus(),
       ts: Date.now(),
       leftSide,
       rightSide,

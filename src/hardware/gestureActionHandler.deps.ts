@@ -5,7 +5,6 @@ import type { Side } from './types'
 import type { GestureActionDeps } from './gestureActionHandler'
 import type { GestureEvent } from './dacMonitor'
 import { getSharedHardwareClient } from './dacMonitor.instance'
-import { recordTemperatureChange } from './temperatureMutationState'
 
 /**
  * Production dependency implementations for GestureActionHandler.
@@ -38,5 +37,4 @@ export const defaultGestureActionDeps: GestureActionDeps = {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   newHardwareClient: (_socketPath: string) =>
     getSharedHardwareClient(),
-  recordTemperatureChange,
 }
