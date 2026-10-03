@@ -700,7 +700,7 @@ export const biometricsRouter = router({
   /**
    * Current bed occupancy for both sides. Single source of truth used by
    * the HomeKit OccupancySensor accessory and the web-app PresenceCard.
-   * Uses fresh adaptive sustained-load state with a fail-safe unavailable
+   * Uses fresh confirmed evidence-of-life state with a fail-safe unavailable
    * legacy fallback. See `src/lib/occupancy.ts`.
    */
   getOccupancy: publicProcedure
@@ -709,7 +709,7 @@ export const biometricsRouter = router({
     .output(z.object({
       left: z.object({
         occupied: z.boolean(),
-        // True when adaptive state is fresh enough to act on absence. The
+        // True when evidence-of-life state is fresh and non-degraded. The
         // Settings UI gates the auto-off toggle on this.
         available: z.boolean(),
         movement: z.object({ active: z.boolean(), peakScore: z.number() }),
@@ -722,7 +722,7 @@ export const biometricsRouter = router({
       }),
       right: z.object({
         occupied: z.boolean(),
-        // True when adaptive state is fresh enough to act on absence. The
+        // True when evidence-of-life state is fresh and non-degraded. The
         // Settings UI gates the auto-off toggle on this.
         available: z.boolean(),
         movement: z.object({ active: z.boolean(), peakScore: z.number() }),

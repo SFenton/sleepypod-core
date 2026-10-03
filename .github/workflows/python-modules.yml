@@ -81,11 +81,6 @@ jobs:
             target: .
             cov_source: .
             deps: ""
-          - name: adaptive-occupancy
-            workdir: modules/adaptive-occupancy
-            target: .
-            cov_source: .
-            deps: ""
           - name: eol-occupancy
             workdir: modules/eol-occupancy
             target: .

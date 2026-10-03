@@ -13,6 +13,7 @@ from main import (
     CAPTURE_SUBJECTS,
     append_label,
     archive_summary,
+    build_parser,
     chunk_bounds,
     export_study,
     freeze_message,
@@ -22,6 +23,13 @@ from main import (
     validate_consumer_config,
     write_chunk,
 )
+
+
+def test_parser_exposes_only_recorder_commands():
+    command_action = next(
+        action for action in build_parser()._actions if action.dest == "command"
+    )
+    assert set(command_action.choices) == {"record", "status", "label", "export"}
 
 
 def message(sequence, timestamp, subject="raw.sens.piezo", payload=b"payload"):

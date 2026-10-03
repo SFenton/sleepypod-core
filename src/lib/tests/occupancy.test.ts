@@ -3,17 +3,18 @@ import type { LatestCapSenseSnapshot } from '@/src/streaming/piezoStream'
 
 interface MovementRow { peak: number | null }
 interface CalRow { parameters: unknown }
-interface AdaptiveRow {
+interface EolRow {
   side: 'left' | 'right'
-  loadPresent: boolean
-  score: number
+  confirmed: boolean
+  degraded: boolean
+  loadAboveReference: number | null
   sampleTimestamp: Date
   updatedAt: Date
 }
 
 let movementRows: MovementRow[] = []
 let calRows: CalRow[] = []
-let adaptiveRows: AdaptiveRow[] = []
+let eolRows: EolRow[] = []
 let snapshot: LatestCapSenseSnapshot | null = null
 
 const drizzle = vi.hoisted(() => ({
@@ -30,11 +31,11 @@ vi.mock('drizzle-orm', () => drizzle)
 
 const movementAll = vi.fn<() => MovementRow[]>(() => movementRows)
 const calAll = vi.fn<() => CalRow[]>(() => calRows)
-const adaptiveAll = vi.fn<() => AdaptiveRow[]>(() => adaptiveRows)
+const eolAll = vi.fn<() => EolRow[]>(() => eolRows)
 
 const schema = vi.hoisted(() => ({
   movement: { side: {}, timestamp: {}, totalMovement: {} },
-  adaptiveOccupancyState: { side: {} },
+  eolOccupancyState: { side: {} },
   calibrationProfiles: {
     side: {},
     sensorType: {},
@@ -51,7 +52,7 @@ vi.mock('@/src/db/biometrics', () => ({
         where: () => ({
           limit: () => ({
             all: () => {
-              if (table === schema.adaptiveOccupancyState) return adaptiveAll()
+              if (table === schema.eolOccupancyState) return eolAll()
               // Distinguish queries by selected columns: movement uses `peak`,
               // calibration uses `parameters`. Cheap heuristic — no SQL coupling.
               if (cols && 'peak' in cols) return movementAll()
@@ -115,11 +116,11 @@ describe('getOccupancy', () => {
     vi.setSystemTime(new Date(FIXED_NOW))
     movementRows = []
     calRows = []
-    adaptiveRows = []
+    eolRows = []
     snapshot = null
     movementAll.mockClear()
     calAll.mockClear()
-    adaptiveAll.mockClear()
+    eolAll.mockClear()
     drizzle.gte.mockClear()
     drizzle.gt.mockClear()
     drizzle.isNull.mockClear()
@@ -129,15 +130,21 @@ describe('getOccupancy', () => {
     vi.useRealTimers()
   })
 
-  it('uses fresh adaptive load as the production occupancy signal', () => {
-    movementRows = [{ peak: 0 }]
-    adaptiveRows = [{
+  function eolRow(overrides: Partial<EolRow> = {}): EolRow {
+    return {
       side: 'left',
-      loadPresent: true,
-      score: 8.5,
+      confirmed: true,
+      degraded: false,
+      loadAboveReference: 820,
       sampleTimestamp: new Date(FIXED_NOW - 500),
       updatedAt: new Date(FIXED_NOW - 500),
-    }]
+      ...overrides,
+    }
+  }
+
+  it('uses fresh confirmed evidence-of-life state as the production signal', () => {
+    movementRows = [{ peak: 0 }]
+    eolRows = [eolRow()]
 
     const result = getOccupancy('left')
 
@@ -145,21 +152,21 @@ describe('getOccupancy', () => {
       occupied: true,
       available: true,
       movement: { active: false, peakScore: 0 },
-      level: { active: true, deviation: 8.5, threshold: 4, ageMs: 500 },
+      level: { active: true, deviation: 820, threshold: 300, ageMs: 500 },
     })
   })
 
-  it('lets adaptive empty override active legacy movement and level evidence', () => {
+  it('lets evidence-of-life empty override active legacy movement and level evidence', () => {
     movementRows = [{ peak: 350 }]
     snapshot = makeNamedFrame('right', [1040, 1040, 2060, 2060, 3075, 3075])
     calRows = [{ parameters: NAMED_CAPSENSE_CAL }]
-    adaptiveRows = [{
+    eolRows = [eolRow({
       side: 'right',
-      loadPresent: false,
-      score: 0.4,
+      confirmed: false,
+      loadAboveReference: 12,
       sampleTimestamp: new Date(FIXED_NOW - 1_000),
       updatedAt: new Date(FIXED_NOW - 1_000),
-    }]
+    })]
 
     const result = getOccupancy('right')
 
@@ -168,21 +175,30 @@ describe('getOccupancy', () => {
     expect(result.movement.active).toBe(true)
     expect(result.level).toEqual({
       active: false,
-      deviation: 0.4,
-      threshold: 4,
+      deviation: 12,
+      threshold: 300,
       ageMs: 1_000,
     })
   })
 
-  it('falls back to legacy occupancy but marks stale adaptive state unavailable', () => {
+  it('keeps a degraded evidence-of-life reading but marks it unavailable', () => {
     movementRows = [{ peak: 350 }]
-    adaptiveRows = [{
-      side: 'left',
-      loadPresent: false,
-      score: 0.2,
-      sampleTimestamp: new Date(FIXED_NOW - 60_001),
-      updatedAt: new Date(FIXED_NOW - 60_001),
-    }]
+    eolRows = [eolRow({ confirmed: false, degraded: true })]
+
+    const result = getOccupancy('left')
+
+    expect(result.occupied).toBe(false)
+    expect(result.level.deviation).toBe(820)
+    expect(result.available).toBe(false)
+  })
+
+  it('falls back to legacy occupancy but marks stale evidence-of-life state unavailable', () => {
+    movementRows = [{ peak: 350 }]
+    eolRows = [eolRow({
+      confirmed: false,
+      sampleTimestamp: new Date(FIXED_NOW - 30_001),
+      updatedAt: new Date(FIXED_NOW - 30_001),
+    })]
 
     const result = getOccupancy('left')
 
@@ -193,13 +209,11 @@ describe('getOccupancy', () => {
 
   it('treats replayed old samples as stale even when written recently', () => {
     movementRows = [{ peak: 350 }]
-    adaptiveRows = [{
-      side: 'left',
-      loadPresent: false,
-      score: 0.2,
-      sampleTimestamp: new Date(FIXED_NOW - 60_001),
+    eolRows = [eolRow({
+      confirmed: false,
+      sampleTimestamp: new Date(FIXED_NOW - 30_001),
       updatedAt: new Date(FIXED_NOW),
-    }]
+    })]
 
     const result = getOccupancy('left')
 
@@ -207,7 +221,7 @@ describe('getOccupancy', () => {
     expect(result.available).toBe(false)
   })
 
-  it('falls back unavailable when the adaptive state row is missing', () => {
+  it('falls back unavailable when the evidence-of-life state row is missing', () => {
     movementRows = [{ peak: 0 }]
 
     const result = getOccupancy('left')
@@ -223,11 +237,11 @@ describe('getLegacyOccupancy', () => {
     vi.setSystemTime(new Date(FIXED_NOW))
     movementRows = []
     calRows = []
-    adaptiveRows = []
+    eolRows = []
     snapshot = null
     movementAll.mockClear()
     calAll.mockClear()
-    adaptiveAll.mockClear()
+    eolAll.mockClear()
     drizzle.gte.mockClear()
     drizzle.gt.mockClear()
     drizzle.isNull.mockClear()

@@ -33,7 +33,7 @@ pod ship once.
 |---|---|---|---|
 | `Bed <side>` | Thermostat (single setpoint) | `deviceStatus.<side>` | `setTemperature` / `setPower` |
 | `Bed <side> power` | Switch | `deviceStatus.<side>.powered` | `setPower` (preserves last setpoint) |
-| `Bed <side> occupancy` | OccupancySensor | `sleep_records` (latest with `leftBedAt IS NULL`) | — |
+| `Bed <side> occupancy` | OccupancySensor | evidence-of-life occupancy, with an unavailable legacy fallback | — |
 | `Snooze <side>` | Switch | `snoozeManager` | `snoozeAlarm` / `cancelSnooze` |
 | `Prime` | Switch | `primeNotification` (auto-off on completion) | `startPriming` |
 | `Pod ambient` | TemperatureSensor | `bed_temp.ambient_temp` (centidegrees → °C) | — |
@@ -134,12 +134,7 @@ Assistant if publication stalls.
 | `<prefix>/<device-id>/state/occupancy/<side>` | pod → broker | non-retained primary evidence-of-life `ON` / `OFF` heartbeat (confirmed occupancy) |
 | `<prefix>/<device-id>/availability/occupancy/<side>` | pod → broker | retained per-side primary availability (`offline` when stale or degraded) |
 | `<prefix>/<device-id>/state/occupancy/<side>/decision` | pod → broker | retained primary classification, last event, and evidence diagnostics |
-| `<prefix>/<device-id>/state/occupancy/<side>/fused` | pod → broker | non-retained fused-v2 `ON` / `OFF` comparison heartbeat |
-| `<prefix>/<device-id>/availability/occupancy/<side>/fused` | pod → broker | retained per-side fused-v2 availability |
-| `<prefix>/<device-id>/state/occupancy/<side>/fused/decision` | pod → broker | retained fused-v2 classification, provenance, and certificate diagnostics |
 | `<prefix>/<device-id>/state/occupancy/<side>/legacy` | pod → broker | previous movement/calibrated-level detector for comparison and rollback |
-| `<prefix>/<device-id>/state/occupancy/<side>/adaptive` | pod → broker | adaptive load state, classification, and scores for comparison and rollback |
-| `<prefix>/<device-id>/availability/adaptive-occupancy` | pod → broker | `online` while both adaptive side states are fresh, otherwise `offline` |
 | `<prefix>/<device-id>/state/environment/ambient` | pod → broker | `{"ts": <epoch_ms>, "temperature": <number\|null>, "humidity": <number\|null>}` (°C, %) |
 | `<prefix>/<device-id>/cmd/set-temperature` | broker → pod | `{"side","temperature","duration?"}` |
 | `<prefix>/<device-id>/cmd/set-target-level` | broker → pod | `{"side","level","duration?"}` where level is normalized `-10..10` |

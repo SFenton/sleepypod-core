@@ -2,21 +2,19 @@
  * Virtual occupancy sensor — single source of truth shared by HomeKit,
  * auto-off, the API, and the web app.
  *
- * Fresh adaptive load state is the production signal. The previous
- * movement-plus-calibrated-level detector remains available as an explicit
- * legacy signal and as a conservative fallback when the adaptive sidecar is
- * unavailable. Fallback results are marked unavailable so absence-triggered
- * consumers stand down.
- *
- * The adaptive detector reports sustained surface load, not confirmed human
- * presence. Its score is exposed through the existing level diagnostics.
+ * The confirmed evidence-of-life state written by modules/eol-occupancy is
+ * the production signal, matching the primary MQTT occupancy entity. The
+ * upstream movement-plus-calibrated-level detector remains available as an
+ * explicit legacy signal and as a conservative fallback when EOL state is
+ * missing or stale. Fallback and degraded results are marked unavailable so
+ * absence-triggered consumers stand down.
  */
 
 import { and, eq, gt, gte, isNull, or, sql } from 'drizzle-orm'
 import { biometricsDb } from '@/src/db/biometrics'
 import {
-  adaptiveOccupancyState,
   calibrationProfiles,
+  eolOccupancyState,
   movement,
 } from '@/src/db/biometrics-schema'
 import { getLatestCapSenseSnapshot } from '@/src/streaming/piezoStream'
@@ -24,9 +22,11 @@ import { RESTLESS_SCORE_MIN } from '@/src/lib/movement'
 import type { Side } from '@/src/hardware/types'
 
 const MOVEMENT_WINDOW_MS = 15 * 60_000
-const ADAPTIVE_OCCUPANCY_STALE_MS = 60_000
-const ADAPTIVE_ENTRY_SCORE = 4
-const ADAPTIVE_WARNING_INTERVAL_MS = 60_000
+/** Matches the MQTT bridge: eol-occupancy upserts at least every 5 s. */
+const EOL_OCCUPANCY_STALE_MS = 30_000
+/** EolConfig.load_person — the load above reference that reads as a person. */
+const EOL_LOAD_PERSON = 300
+const EOL_WARNING_INTERVAL_MS = 60_000
 /** Capacitance frames nominally arrive at ~2 Hz. >30s gap = sensor / stream down. */
 const CAPSENSE_STALE_MS = 30_000
 /** Nominal reference-channel value used when the calibration profile is
@@ -41,8 +41,9 @@ export interface MovementSignal {
 
 export interface LevelSignal {
   active: boolean
-  /** Format-specific calibrated level score (named-channel z-score sum or
-   *  capSense2 compensated delta), or null when the signal can't be evaluated. */
+  /** EOL load above its empty reference, or for the legacy detector the
+   *  format-specific calibrated level score (named-channel z-score sum or
+   *  capSense2 compensated delta). Null when the signal can't be evaluated. */
   deviation: number | null
   /** Calibration threshold the deviation must exceed, or null when unavailable. */
   threshold: number | null
@@ -92,8 +93,8 @@ interface CapSenseCalibration {
 
 export function getOccupancy(side: Side): OccupancyResult {
   const legacy = getLegacyOccupancy(side)
-  const adaptive = readAdaptiveLevelSignal(side)
-  if (!adaptive) {
+  const eol = readEolSignal(side)
+  if (!eol) {
     return {
       ...legacy,
       available: false,
@@ -101,10 +102,12 @@ export function getOccupancy(side: Side): OccupancyResult {
   }
 
   return {
-    occupied: adaptive.active,
+    occupied: eol.level.active,
     movement: legacy.movement,
-    level: adaptive,
-    available: true,
+    level: eol.level,
+    // Without piezo EOL can clear a very still sleeper, so a degraded OFF
+    // must not drive absence-triggered actions.
+    available: !eol.degraded,
   }
 }
 
@@ -119,34 +122,37 @@ export function getLegacyOccupancy(side: Side): OccupancyResult {
   }
 }
 
-let lastAdaptiveWarningAt = 0
+let lastEolWarningAt = 0
 
-function readAdaptiveLevelSignal(side: Side): LevelSignal | null {
+function readEolSignal(side: Side): { level: LevelSignal, degraded: boolean } | null {
   try {
     const [row] = biometricsDb
       .select()
-      .from(adaptiveOccupancyState)
-      .where(eq(adaptiveOccupancyState.side, side))
+      .from(eolOccupancyState)
+      .where(eq(eolOccupancyState.side, side))
       .limit(1)
       .all()
     if (!row) return null
 
     const ageMs = Date.now() - row.sampleTimestamp.getTime()
-    if (ageMs < 0 || ageMs > ADAPTIVE_OCCUPANCY_STALE_MS) return null
+    if (ageMs < 0 || ageMs > EOL_OCCUPANCY_STALE_MS) return null
 
     return {
-      active: row.loadPresent,
-      deviation: row.score,
-      threshold: ADAPTIVE_ENTRY_SCORE,
-      ageMs,
+      level: {
+        active: row.confirmed,
+        deviation: row.loadAboveReference,
+        threshold: EOL_LOAD_PERSON,
+        ageMs,
+      },
+      degraded: row.degraded,
     }
   }
   catch (error) {
     const now = Date.now()
-    if (now - lastAdaptiveWarningAt >= ADAPTIVE_WARNING_INTERVAL_MS) {
-      lastAdaptiveWarningAt = now
+    if (now - lastEolWarningAt >= EOL_WARNING_INTERVAL_MS) {
+      lastEolWarningAt = now
       console.warn(
-        '[occupancy] adaptive state read failed:',
+        '[occupancy] eol state read failed:',
         error instanceof Error ? error.message : error,
       )
     }

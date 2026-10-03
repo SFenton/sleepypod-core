@@ -13,7 +13,7 @@
  * just-powered side off within seconds. See sleepypod-core-64.
  *
  * Fail-safe: auto-off only acts on a POSITIVE, reliable "empty" reading. If the
- * adaptive presence signal isn't fresh for a side
+ * evidence-of-life presence signal isn't fresh and healthy for a side
  * (`getOccupancy().available === false`), the per-side timer stands down
  * entirely. Missing or inconsistent biometrics never trigger a power-off; the
  * global wall-clock cap remains the independent backstop.
@@ -174,8 +174,8 @@ function getPoweredOnAtMs(side: Side): number | null {
 
 /**
  * Live presence for a side. Returns:
- *   'occupied'    — adaptive sustained load is present
- *   'empty'       — fresh adaptive state reliably reports no sustained load
+ *   'occupied'    — evidence-of-life confirms someone in bed
+ *   'empty'       — fresh, non-degraded evidence-of-life state reports empty
  *   'unsensable'  — presence can't be sensed; auto-off must stand down
  */
 function presenceState(side: Side): 'occupied' | 'empty' | 'unsensable' {
