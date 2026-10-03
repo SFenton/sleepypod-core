@@ -498,21 +498,43 @@ describe('module deployment guards', () => {
       'Warning: optional module $name dependencies failed to build; core biometrics installation will continue',
     )
     expect(update).toContain('MODULE_CANDIDATES+=(occupancy-study-recorder)')
-    expect(install).toContain('INSTALL_MODULE_CANDIDATES+=(adaptive-occupancy)')
-    expect(update).toContain('MODULE_CANDIDATES+=(adaptive-occupancy)')
     expect(install).toContain('INSTALL_MODULE_CANDIDATES+=(eol-occupancy)')
     expect(update).toContain('MODULE_CANDIDATES+=(eol-occupancy)')
     expect(install).toContain(
-      '[ "$name" = "adaptive-occupancy" ] || [ "$name" = "eol-occupancy" ]',
+      '[ "$name" = "occupancy-study-recorder" ] || [ "$name" = "eol-occupancy" ]',
     )
     expect(update).toContain(
-      '[ "$mod" = "adaptive-occupancy" ] || [ "$mod" = "eol-occupancy" ]',
+      '[ "$mod" = "occupancy-study-recorder" ] || [ "$mod" = "eol-occupancy" ]',
     )
+    for (const script of [install, update]) {
+      expect(script).toContain('RETIRED_MODULES=(adaptive-occupancy)')
+      expect(script).toContain('retire_module()')
+      expect(script).toContain('systemctl stop "$service" 2>/dev/null || true')
+      expect(script).toContain(
+        'systemctl disable "$service" 2>/dev/null || true',
+      )
+      expect(script).toContain(
+        'rm -f "/etc/systemd/system/$service" 2>/dev/null || true',
+      )
+      expect(script).toContain(
+        'rm -rf "$MODULES_DEST/$name" 2>/dev/null || true',
+      )
+      expect(script).toContain('systemctl daemon-reload 2>/dev/null || true')
+      const definedAt = script.indexOf('retire_module() {')
+      const calledAt = script.indexOf('retire_module "$retired_module"')
+      expect(definedAt).toBeGreaterThan(-1)
+      expect(calledAt).toBeGreaterThan(definedAt)
+      expect(script.lastIndexOf('retire_module() {')).toBe(definedAt)
+    }
     expect(install).toContain(
-      '[ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ]',
+      'for active_mod in "${INSTALL_ACTIVE_MODULES[@]}"; do',
     )
-    expect(update).toContain(
-      '[ "$mod" = "occupancy-study-recorder" ] || [ "$mod" = "adaptive-occupancy" ]',
+    expect(update).toContain('for active_mod in "${ACTIVE_MODULES[@]}"; do')
+    expect(install.indexOf('retire_module "$retired_module"')).toBeLessThan(
+      install.indexOf('mv "$INSTALL_MODULE_STAGE/common" "$MODULES_DEST/common"'),
+    )
+    expect(update.indexOf('retire_module "$retired_module"')).toBeLessThan(
+      update.indexOf('mv "$MODULES_STAGE/common" "$MODULES_DEST/common"'),
     )
     expect(update).toContain('OPTIONAL_MODULE_NAMES+=("$mod")')
     expect(update).toContain('for mod in "${REQUIRED_MODULE_NAMES[@]}"; do')

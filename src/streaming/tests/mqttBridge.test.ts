@@ -8,7 +8,6 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import os from 'node:os'
-import type { FusedOccupancyDecision } from '@/src/lib/fusedOccupancy'
 
 // Hoisted state shared with the @/src/db mock factory — lets each test stub
 // the device_settings row that resolveConfig will read.
@@ -17,9 +16,7 @@ const dbMock = vi.hoisted(() => {
     row: any | undefined
     throwOnSelect: boolean
     biometricsRow: any | null
-    adaptiveRows: any[]
     eolRows: any[]
-    piezoRows: any[]
     deviceStateRows: any[]
     bedTempRow: any | null
     alarmScheduleRows: any[]
@@ -28,15 +25,12 @@ const dbMock = vi.hoisted(() => {
     throwOnBedTemp: false | true | string
     throwOnDeviceState: false | true | string
     throwOnBiometrics: false | true | string
-    throwOnFusedOccupancy: false | true | string
     throwOnEolOccupancy: false | true | string
   } = {
     row: undefined,
     throwOnSelect: false,
     biometricsRow: null,
-    adaptiveRows: [],
     eolRows: [],
-    piezoRows: [],
     deviceStateRows: [],
     bedTempRow: null,
     alarmScheduleRows: [],
@@ -45,7 +39,6 @@ const dbMock = vi.hoisted(() => {
     throwOnBedTemp: false,
     throwOnDeviceState: false,
     throwOnBiometrics: false,
-    throwOnFusedOccupancy: false,
     throwOnEolOccupancy: false,
   }
   // The bridge calls db.select() several ways:
@@ -66,9 +59,7 @@ const dbMock = vi.hoisted(() => {
     if (name === 'power_schedules') return state.powerScheduleRows
     if (name === 'temperature_schedules') return state.temperatureScheduleRows
     if (name === 'device_state') return state.deviceStateRows
-    if (name === 'adaptive_occupancy_state') return state.adaptiveRows
     if (name === 'eol_occupancy_state') return state.eolRows
-    if (name === 'piezo_presence_decisions') return state.piezoRows
     return []
   }
 
@@ -84,49 +75,27 @@ const dbMock = vi.hoisted(() => {
         where: vi.fn(() => ({
           all: vi.fn(async () => rowsForTable(name)),
           orderBy: vi.fn(() => ({
-            limit: vi.fn(async (limit = 1) => {
+            limit: vi.fn(async () => {
               if (state.throwOnBiometrics !== false) {
                 throw typeof state.throwOnBiometrics === 'string'
                   ? state.throwOnBiometrics
                   : new Error('biometrics boom')
-              }
-              if (name === 'piezo_presence_decisions') {
-                return rowsForTable(name).slice(0, limit)
               }
               return state.biometricsRow ? [state.biometricsRow] : []
             }),
           })),
         })),
         orderBy: vi.fn(() => ({
-          limit: vi.fn(async (limit = 1) => {
-            if (
-              name === 'piezo_presence_decisions'
-              && state.throwOnFusedOccupancy !== false
-            ) {
-              throw typeof state.throwOnFusedOccupancy === 'string'
-                ? state.throwOnFusedOccupancy
-                : new Error('fused occupancy boom')
-            }
+          limit: vi.fn(async () => {
             if (state.throwOnBedTemp !== false) {
               throw typeof state.throwOnBedTemp === 'string'
                 ? state.throwOnBedTemp
                 : new Error('bed_temp boom')
             }
-            if (name === 'piezo_presence_decisions') {
-              return rowsForTable(name).slice(0, limit)
-            }
             return state.bedTempRow ? [state.bedTempRow] : []
           }),
         })),
         all: vi.fn(async () => {
-          if (
-            name === 'adaptive_occupancy_state'
-            && state.throwOnFusedOccupancy !== false
-          ) {
-            throw typeof state.throwOnFusedOccupancy === 'string'
-              ? state.throwOnFusedOccupancy
-              : new Error('fused occupancy boom')
-          }
           if (
             name === 'eol_occupancy_state'
             && state.throwOnEolOccupancy !== false
@@ -342,7 +311,6 @@ const {
   parsePayload,
   eolOccupancyDecision,
   eolOccupancyDecisionPayload,
-  fusedOccupancyDecisionPayload,
   publishEolOccupancy,
   state: bridgeState,
 } = __test__
@@ -406,9 +374,7 @@ beforeEach(() => {
   dbMock.state.row = undefined
   dbMock.state.throwOnSelect = false
   dbMock.state.biometricsRow = null
-  dbMock.state.adaptiveRows = []
   dbMock.state.eolRows = []
-  dbMock.state.piezoRows = []
   dbMock.state.deviceStateRows = []
   dbMock.state.bedTempRow = null
   dbMock.state.alarmScheduleRows = []
@@ -417,7 +383,6 @@ beforeEach(() => {
   dbMock.state.throwOnBedTemp = false
   dbMock.state.throwOnDeviceState = false
   dbMock.state.throwOnBiometrics = false
-  dbMock.state.throwOnFusedOccupancy = false
   dbMock.state.throwOnEolOccupancy = false
   mqttMock.state.nextClient = null
   mqttMock.state.throwOnConnect = null
@@ -449,7 +414,6 @@ beforeEach(() => {
   })
   hapticMock.triggerHapticConfirm.mockClear()
   schedulesMock.batchUpdate.mockClear()
-  bridgeState.fusedOccupancyLastWarningAt = 0
   bridgeState.eolOccupancyLastWarningAt = 0
 })
 
@@ -469,11 +433,6 @@ async function startBridgeWithFake(opts: {
   bridgeState.lastError = null
   bridgeState.publishTimer = null
   bridgeState.occupancyTimer = null
-  bridgeState.fusedOccupancyProvider = null
-  bridgeState.fusedOccupancyPublishInFlight = false
-  bridgeState.fusedOccupancyAvailability = { left: null, right: null }
-  bridgeState.fusedOccupancyDecisionRevision = { left: null, right: null }
-  bridgeState.fusedOccupancyLastWarningAt = 0
   bridgeState.eolOccupancyPublishInFlight = false
   bridgeState.eolOccupancyAvailability = { left: null, right: null }
   bridgeState.eolOccupancyDecisionKey = { left: null, right: null }
@@ -498,6 +457,37 @@ async function startBridgeWithFake(opts: {
   mqttMock.state.nextClient = fake
   await startMqttBridge()
   return fake
+}
+
+function removedOccupancyTombstoneTopics(id: string, prefix: string): string[] {
+  const haPrefix = process.env.MQTT_HA_DISCOVERY_PREFIX || 'homeassistant'
+  return [
+    ...(['left', 'right'] as const).flatMap(side => [
+      `${haPrefix}/binary_sensor/${id}/${side}_occupancy_fused_shadow/config`,
+      `${haPrefix}/sensor/${id}/${side}_occupancy_fused_shadow_decision/config`,
+      `${prefix}/${id}/availability/occupancy/${side}/fused-shadow`,
+      `${prefix}/${id}/state/occupancy/${side}/fused-shadow/decision`,
+      `${haPrefix}/binary_sensor/${id}/${side}_occupancy_fused/config`,
+      `${haPrefix}/sensor/${id}/${side}_occupancy_fused_decision/config`,
+      `${prefix}/${id}/availability/occupancy/${side}/fused`,
+      `${prefix}/${id}/state/occupancy/${side}/fused/decision`,
+      `${haPrefix}/binary_sensor/${id}/${side}_occupancy_adaptive/config`,
+      `${haPrefix}/sensor/${id}/${side}_occupancy_classification/config`,
+      `${prefix}/${id}/state/occupancy/${side}/adaptive`,
+    ]),
+    `${prefix}/${id}/availability/adaptive-occupancy`,
+  ]
+}
+
+function expectEmptyRetainedTombstones(fake: FakeClient, expectedTopics: string[]): void {
+  const tombstones = fake.publish.mock.calls.filter(([, payload]) =>
+    Buffer.isBuffer(payload) && payload.length === 0,
+  )
+  expect(tombstones.map(([topic]) => topic)).toEqual(expectedTopics)
+  for (const [, payload, options] of tombstones) {
+    expect(payload).toEqual(Buffer.alloc(0))
+    expect(options).toEqual({ qos: 0, retain: true })
+  }
 }
 
 async function publishSchedulesThroughMqtt(): Promise<Record<string, any>> {
@@ -995,17 +985,13 @@ describe('mqttBridge — startMqttBridge connect flow', () => {
 
     const haPublishes = fake.publish.mock.calls.filter(([t]) => typeof t === 'string' && (t as string).startsWith('homeassistant/'))
     const id = deviceId()
-    expect(haPublishes).toHaveLength(5)
-    expect(haPublishes).toEqual(expect.arrayContaining([
-      expect.arrayContaining([`homeassistant/sensor/${id}/gesture_settings/config`]),
-      expect.arrayContaining([`homeassistant/binary_sensor/${id}/left_occupancy_fused_shadow/config`]),
-      expect.arrayContaining([`homeassistant/sensor/${id}/left_occupancy_fused_shadow_decision/config`]),
-      expect.arrayContaining([`homeassistant/binary_sensor/${id}/right_occupancy_fused_shadow/config`]),
-      expect.arrayContaining([`homeassistant/sensor/${id}/right_occupancy_fused_shadow_decision/config`]),
-    ]))
-    expect(haPublishes.every(([, payload]) =>
-      Buffer.isBuffer(payload) && (payload as Buffer).length === 0,
-    )).toBe(true)
+    const expectedTombstones = [
+      `homeassistant/sensor/${id}/gesture_settings/config`,
+      `sleepypod/${id}/state/button-gestures`,
+      ...removedOccupancyTombstoneTopics(id, 'sleepypod'),
+    ]
+    expect(haPublishes.map(([topic]) => topic)).toEqual(expectedTombstones.filter(topic => topic.startsWith('homeassistant/')))
+    expectEmptyRetainedTombstones(fake, expectedTombstones)
 
     await shutdownMqttBridge()
   })
@@ -1016,19 +1002,11 @@ describe('mqttBridge — startMqttBridge connect flow', () => {
     fake.connected = true
     fake.emit('connect')
 
-    const tombstones = fake.publish.mock.calls.filter(([, payload]) => Buffer.isBuffer(payload) && (payload as Buffer).length === 0)
-    expect(tombstones).toEqual(expect.arrayContaining([
-      expect.arrayContaining(['homeassistant/sensor/testpod/gesture_settings/config']),
-      expect.arrayContaining(['sleepypod/testpod/state/button-gestures']),
-      expect.arrayContaining(['homeassistant/binary_sensor/testpod/left_occupancy_fused_shadow/config']),
-      expect.arrayContaining(['homeassistant/sensor/testpod/left_occupancy_fused_shadow_decision/config']),
-      expect.arrayContaining(['sleepypod/testpod/availability/occupancy/left/fused-shadow']),
-      expect.arrayContaining(['sleepypod/testpod/state/occupancy/left/fused-shadow/decision']),
-      expect.arrayContaining(['homeassistant/binary_sensor/testpod/right_occupancy_fused_shadow/config']),
-      expect.arrayContaining(['homeassistant/sensor/testpod/right_occupancy_fused_shadow_decision/config']),
-      expect.arrayContaining(['sleepypod/testpod/availability/occupancy/right/fused-shadow']),
-      expect.arrayContaining(['sleepypod/testpod/state/occupancy/right/fused-shadow/decision']),
-    ]))
+    expectEmptyRetainedTombstones(fake, [
+      'homeassistant/sensor/testpod/gesture_settings/config',
+      'sleepypod/testpod/state/button-gestures',
+      ...removedOccupancyTombstoneTopics('testpod', 'sleepypod'),
+    ])
 
     await shutdownMqttBridge()
   })
@@ -1392,7 +1370,7 @@ describe('mqttBridge — HA discovery payload content', () => {
 
   function occupancyBinaryCfg(
     side: 'left' | 'right',
-    algorithm: 'primary' | 'fused' | 'legacy' | 'adaptive',
+    algorithm: 'primary' | 'legacy',
   ): Record<string, unknown> {
     const label = side === 'left' ? 'Left' : 'Right'
     if (algorithm === 'primary') {
@@ -1409,83 +1387,19 @@ describe('mqttBridge — HA discovery payload content', () => {
         device: DEVICE,
       }
     }
-    if (algorithm === 'fused') {
-      return {
-        name: `${label} occupancy (fused)`,
-        unique_id: `testpod_${side}_occupancy_fused`,
-        state_topic: `sleepypod/testpod/state/occupancy/${side}/fused`,
-        payload_on: 'ON',
-        payload_off: 'OFF',
-        expire_after: 3,
-        availability: fusedOccupancyAvailability(side),
-        availability_mode: 'all',
-        device_class: 'occupancy',
-        device: DEVICE,
-      }
-    }
-
-    const adaptive = algorithm === 'adaptive'
-    const stateTopic = `sleepypod/testpod/state/occupancy/${side}/${adaptive ? 'adaptive' : 'legacy'}`
-    const common = {
-      name: `${label} occupancy (${adaptive ? 'adaptive load' : 'legacy'})`,
-      unique_id: `testpod_${side}_occupancy_${algorithm}`,
+    const stateTopic = `sleepypod/testpod/state/occupancy/${side}/legacy`
+    return {
+      name: `${label} occupancy (legacy)`,
+      unique_id: `testpod_${side}_occupancy_legacy`,
+      availability_topic: AVAILABILITY,
+      payload_available: 'online',
+      payload_not_available: 'offline',
       state_topic: stateTopic,
-      value_template: adaptive
-        ? `{{ 'on' if value_json.loadPresent else 'off' }}`
-        : `{{ 'on' if value_json.occupied else 'off' }}`,
+      value_template: `{{ 'on' if value_json.occupied else 'off' }}`,
       json_attributes_topic: stateTopic,
       payload_on: 'on',
       payload_off: 'off',
       device_class: 'occupancy',
-      device: DEVICE,
-    }
-    return adaptive
-      ? {
-          ...common,
-          availability: [
-            { topic: AVAILABILITY, payload_available: 'online', payload_not_available: 'offline' },
-            {
-              topic: 'sleepypod/testpod/availability/adaptive-occupancy',
-              payload_available: 'online',
-              payload_not_available: 'offline',
-            },
-          ],
-          availability_mode: 'all',
-        }
-      : {
-          ...common,
-          availability_topic: AVAILABILITY,
-          payload_available: 'online',
-          payload_not_available: 'offline',
-        }
-  }
-
-  function occupancyClassificationCfg(side: 'left' | 'right'): Record<string, unknown> {
-    const label = side === 'left' ? 'Left' : 'Right'
-    const stateTopic = `sleepypod/testpod/state/occupancy/${side}/adaptive`
-    return {
-      name: `${label} occupancy classification`,
-      unique_id: `testpod_${side}_occupancy_classification`,
-      state_topic: stateTopic,
-      value_template: '{{ value_json.classification }}',
-      json_attributes_topic: stateTopic,
-      availability: [
-        { topic: AVAILABILITY, payload_available: 'online', payload_not_available: 'offline' },
-        {
-          topic: 'sleepypod/testpod/availability/adaptive-occupancy',
-          payload_available: 'online',
-          payload_not_available: 'offline',
-        },
-      ],
-      availability_mode: 'all',
-      device_class: 'enum',
-      options: [
-        'empty',
-        'loaded_unconfirmed',
-        'inner_zone_encroachment',
-        'coupled_entry_suppressed',
-      ],
-      icon: 'mdi:bed',
       device: DEVICE,
     }
   }
@@ -1495,17 +1409,6 @@ describe('mqttBridge — HA discovery payload content', () => {
       { topic: AVAILABILITY, payload_available: 'online', payload_not_available: 'offline' },
       {
         topic: `sleepypod/testpod/availability/occupancy/${side}`,
-        payload_available: 'online',
-        payload_not_available: 'offline',
-      },
-    ]
-  }
-
-  function fusedOccupancyAvailability(side: 'left' | 'right') {
-    return [
-      { topic: AVAILABILITY, payload_available: 'online', payload_not_available: 'offline' },
-      {
-        topic: `sleepypod/testpod/availability/occupancy/${side}/fused`,
         payload_available: 'online',
         payload_not_available: 'offline',
       },
@@ -1528,32 +1431,6 @@ describe('mqttBridge — HA discovery payload content', () => {
       options: ['empty', 'provisional', 'occupied', 'degraded', 'stale', 'no_data', 'source_error'],
       icon: 'mdi:bed-clock',
       entity_category: 'diagnostic',
-      device: DEVICE,
-    }
-  }
-
-  function fusedOccupancyDecisionCfg(side: 'left' | 'right'): Record<string, unknown> {
-    const label = side === 'left' ? 'Left' : 'Right'
-    const stateTopic = `sleepypod/testpod/state/occupancy/${side}/fused/decision`
-    return {
-      name: `${label} occupancy decision (fused)`,
-      unique_id: `testpod_${side}_occupancy_fused_decision`,
-      state_topic: stateTopic,
-      value_template: '{{ value_json.classification }}',
-      json_attributes_topic: stateTopic,
-      availability: fusedOccupancyAvailability(side),
-      availability_mode: 'all',
-      device_class: 'enum',
-      options: [
-        'occupied_adaptive',
-        'clear_adaptive',
-        'clear_exit_certified',
-        'unavailable',
-      ],
-      icon: 'mdi:bed-clock',
-      entity_category: 'diagnostic',
-      enabled_by_default: false,
-      visible_by_default: false,
       device: DEVICE,
     }
   }
@@ -1595,20 +1472,18 @@ describe('mqttBridge — HA discovery payload content', () => {
       .toEqual(occupancyBinaryCfg(side, 'primary'))
     expect(configs.get(`homeassistant/binary_sensor/testpod/${side}_occupancy_legacy/config`))
       .toEqual(occupancyBinaryCfg(side, 'legacy'))
-    expect(configs.get(`homeassistant/binary_sensor/testpod/${side}_occupancy_adaptive/config`))
-      .toEqual(occupancyBinaryCfg(side, 'adaptive'))
-    expect(configs.get(`homeassistant/sensor/testpod/${side}_occupancy_classification/config`))
-      .toEqual(occupancyClassificationCfg(side))
     expect(configs.get(`homeassistant/sensor/testpod/${side}_occupancy_decision/config`))
       .toEqual(eolOccupancyDecisionCfg(side))
-    expect(configs.get(`homeassistant/binary_sensor/testpod/${side}_occupancy_fused/config`))
-      .toEqual(occupancyBinaryCfg(side, 'fused'))
-    expect(configs.get(`homeassistant/sensor/testpod/${side}_occupancy_fused_decision/config`))
-      .toEqual(fusedOccupancyDecisionCfg(side))
-    expect(configs.has(`homeassistant/binary_sensor/testpod/${side}_occupancy_fused_shadow/config`))
-      .toBe(false)
-    expect(configs.has(`homeassistant/sensor/testpod/${side}_occupancy_fused_shadow_decision/config`))
-      .toBe(false)
+    for (const entity of [
+      `homeassistant/binary_sensor/testpod/${side}_occupancy_fused_shadow/config`,
+      `homeassistant/sensor/testpod/${side}_occupancy_fused_shadow_decision/config`,
+      `homeassistant/binary_sensor/testpod/${side}_occupancy_fused/config`,
+      `homeassistant/sensor/testpod/${side}_occupancy_fused_decision/config`,
+      `homeassistant/binary_sensor/testpod/${side}_occupancy_adaptive/config`,
+      `homeassistant/sensor/testpod/${side}_occupancy_classification/config`,
+    ]) {
+      expect(configs.has(entity)).toBe(false)
+    }
   })
 
   it('publishes the full water_level sensor config', () => {
@@ -2282,71 +2157,8 @@ describe('mqttBridge — publishState content', () => {
 })
 
 describe('mqttBridge — periodic publish + shutdown edges', () => {
-  function setFreshFusedRows() {
-    const now = new Date(Date.now())
-    dbMock.state.eolRows = freshEolRows(now.getTime())
-    dbMock.state.adaptiveRows = [
-      {
-        side: 'left',
-        sampleTimestamp: now,
-        loadPresent: false,
-        classification: 'empty',
-        personPresent: false,
-        score: 1,
-        peakScore: 0.5,
-        loadedChannels: 0,
-        loadVelocityScore: 0,
-        unloadVelocityScore: 0,
-        entryVelocitySupported: false,
-        reason: 'empty_hold',
-        baseline: [1, 1, 1],
-        lastTransitionAt: now,
-        algorithmVersion: 'adaptive-cap-v3',
-        updatedAt: now,
-      },
-      {
-        side: 'right',
-        sampleTimestamp: now,
-        loadPresent: true,
-        classification: 'loaded_unconfirmed',
-        personPresent: null,
-        score: 10,
-        peakScore: 5,
-        loadedChannels: 3,
-        loadVelocityScore: 0,
-        unloadVelocityScore: 0,
-        entryVelocitySupported: false,
-        reason: 'occupied_hold',
-        baseline: [1, 1, 1],
-        lastTransitionAt: now,
-        algorithmVersion: 'adaptive-cap-v3',
-        updatedAt: now,
-      },
-    ]
-    dbMock.state.piezoRows = [
-      {
-        side: 'left',
-        timestamp: now,
-        present: false,
-        medStd: 100_000,
-        autocorrelationQuality: 0.1,
-        enterThreshold: 400_000,
-        exitThreshold: 150_000,
-        decisionReason: 'absent_hold',
-        pumpMode: null,
-      },
-      {
-        side: 'right',
-        timestamp: now,
-        present: true,
-        medStd: 900_000,
-        autocorrelationQuality: 0.6,
-        enterThreshold: 400_000,
-        exitThreshold: 150_000,
-        decisionReason: 'present_hold',
-        pumpMode: null,
-      },
-    ]
+  function setFreshEolRows() {
+    dbMock.state.eolRows = freshEolRows(Date.now())
   }
 
   it('re-runs publishState on the 30s interval after start', async () => {
@@ -2369,22 +2181,21 @@ describe('mqttBridge — periodic publish + shutdown edges', () => {
     }
   })
 
-  it('heartbeats primary and fused state every second without republishing unchanged diagnostics', async () => {
+  it('heartbeats primary state every second without republishing unchanged diagnostics', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] })
     try {
-      setFreshFusedRows()
+      setFreshEolRows()
       const fake = await startBridgeWithFake()
       fake.connected = true
       fake.emit('connect')
       await vi.advanceTimersByTimeAsync(0)
 
       const stateTopic = `sleepypod/${deviceId()}/state/occupancy/left`
-      const topics = [stateTopic, `${stateTopic}/fused`]
-      const decisionTopics = [`${stateTopic}/decision`, `${stateTopic}/fused/decision`]
+      const decisionTopic = `${stateTopic}/decision`
       const countTopic = (publishedTopic: string) =>
         fake.publish.mock.calls.filter(([topic]) => topic === publishedTopic).length
-      const stateBaselines = topics.map(countTopic)
-      const decisionBaselines = decisionTopics.map(countTopic)
+      const stateBaseline = countTopic(stateTopic)
+      const decisionBaseline = countTopic(decisionTopic)
 
       // A newer sample with new diagnostics is not a semantic change.
       for (const row of dbMock.state.eolRows) {
@@ -2394,12 +2205,8 @@ describe('mqttBridge — periodic publish + shutdown edges', () => {
       await vi.advanceTimersByTimeAsync(1_000)
       await vi.advanceTimersByTimeAsync(0)
 
-      topics.forEach((topic, index) => {
-        expect(countTopic(topic)).toBeGreaterThan(stateBaselines[index])
-      })
-      decisionTopics.forEach((topic, index) => {
-        expect(countTopic(topic)).toBe(decisionBaselines[index])
-      })
+      expect(countTopic(stateTopic)).toBeGreaterThan(stateBaseline)
+      expect(countTopic(decisionTopic)).toBe(decisionBaseline)
       await shutdownMqttBridge()
     }
     finally {
@@ -2407,8 +2214,8 @@ describe('mqttBridge — periodic publish + shutdown edges', () => {
     }
   })
 
-  it('forces primary and fused availability offline before publishing a reconnect decision', async () => {
-    setFreshFusedRows()
+  it('forces primary availability offline before publishing a reconnect decision', async () => {
+    setFreshEolRows()
     const fake = await startBridgeWithFake()
     fake.connected = true
     fake.emit('connect')
@@ -2421,14 +2228,11 @@ describe('mqttBridge — periodic publish + shutdown edges', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
 
     for (const side of ['left', 'right'] as const) {
-      for (const suffix of ['', '/fused']) {
-        const availabilityTopic
-          = `sleepypod/${deviceId()}/availability/occupancy/${side}${suffix}`
-        const payloads = fake.publish.mock.calls
-          .filter(([publishedTopic]) => publishedTopic === availabilityTopic)
-          .map(([, payload]) => payload)
-        expect(payloads).toEqual(['offline', 'online'])
-      }
+      const availabilityTopic = `sleepypod/${deviceId()}/availability/occupancy/${side}`
+      const payloads = fake.publish.mock.calls
+        .filter(([publishedTopic]) => publishedTopic === availabilityTopic)
+        .map(([, payload]) => payload)
+      expect(payloads).toEqual(['offline', 'online'])
     }
     await shutdownMqttBridge()
   })
@@ -2751,7 +2555,6 @@ describe('mqttBridge — shutdownMqttBridge', () => {
 
     expect(bridgeState.publishTimer).toBeNull()
     expect(bridgeState.occupancyTimer).toBeNull()
-    expect(bridgeState.fusedOccupancyProvider).toBeNull()
     expect(bridgeState.unsubscribeFrame).toBeNull()
     expect(bridgeState.runState).toBe('stopped')
     expect(piezoMock.unsubscribe).toHaveBeenCalled()
@@ -3189,27 +2992,10 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
         device: DEVICE,
       }
       const legacyOccupancyTopic = `sleepypod/${ID}/state/occupancy/${side}/legacy`
-      const adaptiveOccupancyTopic = `sleepypod/${ID}/state/occupancy/${side}/adaptive`
-      const adaptiveAvailability = [
-        { topic: AVAIL, payload_available: 'online', payload_not_available: 'offline' },
-        {
-          topic: `sleepypod/${ID}/availability/adaptive-occupancy`,
-          payload_available: 'online',
-          payload_not_available: 'offline',
-        },
-      ]
       const primaryOccupancyAvailability = [
         { topic: AVAIL, payload_available: 'online', payload_not_available: 'offline' },
         {
           topic: `sleepypod/${ID}/availability/occupancy/${side}`,
-          payload_available: 'online',
-          payload_not_available: 'offline',
-        },
-      ]
-      const fusedOccupancyAvailability = [
-        { topic: AVAIL, payload_available: 'online', payload_not_available: 'offline' },
-        {
-          topic: `sleepypod/${ID}/availability/occupancy/${side}/fused`,
           payload_available: 'online',
           payload_not_available: 'offline',
         },
@@ -3226,18 +3012,6 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
         availability: primaryOccupancyAvailability,
         availability_mode: 'all',
       }
-      expected[`homeassistant/binary_sensor/${ID}/${side}_occupancy_fused/config`] = {
-        name: `${Side} occupancy (fused)`,
-        unique_id: `${ID}_${side}_occupancy_fused`,
-        state_topic: `sleepypod/${ID}/state/occupancy/${side}/fused`,
-        payload_on: 'ON',
-        payload_off: 'OFF',
-        expire_after: 3,
-        device_class: 'occupancy',
-        device: DEVICE,
-        availability: fusedOccupancyAvailability,
-        availability_mode: 'all',
-      }
       expected[`homeassistant/binary_sensor/${ID}/${side}_occupancy_legacy/config`] = {
         name: `${Side} occupancy (legacy)`,
         unique_id: `${ID}_${side}_occupancy_legacy`,
@@ -3250,37 +3024,6 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
         payload_on: 'on',
         payload_off: 'off',
         device_class: 'occupancy',
-        device: DEVICE,
-      }
-      expected[`homeassistant/binary_sensor/${ID}/${side}_occupancy_adaptive/config`] = {
-        name: `${Side} occupancy (adaptive load)`,
-        unique_id: `${ID}_${side}_occupancy_adaptive`,
-        state_topic: adaptiveOccupancyTopic,
-        value_template: `{{ 'on' if value_json.loadPresent else 'off' }}`,
-        json_attributes_topic: adaptiveOccupancyTopic,
-        payload_on: 'on',
-        payload_off: 'off',
-        device_class: 'occupancy',
-        device: DEVICE,
-        availability: adaptiveAvailability,
-        availability_mode: 'all',
-      }
-      expected[`homeassistant/sensor/${ID}/${side}_occupancy_classification/config`] = {
-        name: `${Side} occupancy classification`,
-        unique_id: `${ID}_${side}_occupancy_classification`,
-        state_topic: adaptiveOccupancyTopic,
-        value_template: '{{ value_json.classification }}',
-        json_attributes_topic: adaptiveOccupancyTopic,
-        availability: adaptiveAvailability,
-        availability_mode: 'all',
-        device_class: 'enum',
-        options: [
-          'empty',
-          'loaded_unconfirmed',
-          'inner_zone_encroachment',
-          'coupled_entry_suppressed',
-        ],
-        icon: 'mdi:bed',
         device: DEVICE,
       }
       const eolDecisionTopic = `sleepypod/${ID}/state/occupancy/${side}/decision`
@@ -3297,28 +3040,6 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
         options: ['empty', 'provisional', 'occupied', 'degraded', 'stale', 'no_data', 'source_error'],
         icon: 'mdi:bed-clock',
         entity_category: 'diagnostic',
-        device: DEVICE,
-      }
-      const fusedDecisionTopic = `sleepypod/${ID}/state/occupancy/${side}/fused/decision`
-      expected[`homeassistant/sensor/${ID}/${side}_occupancy_fused_decision/config`] = {
-        name: `${Side} occupancy decision (fused)`,
-        unique_id: `${ID}_${side}_occupancy_fused_decision`,
-        state_topic: fusedDecisionTopic,
-        value_template: '{{ value_json.classification }}',
-        json_attributes_topic: fusedDecisionTopic,
-        availability: fusedOccupancyAvailability,
-        availability_mode: 'all',
-        device_class: 'enum',
-        options: [
-          'occupied_adaptive',
-          'clear_adaptive',
-          'clear_exit_certified',
-          'unavailable',
-        ],
-        icon: 'mdi:bed-clock',
-        entity_category: 'diagnostic',
-        enabled_by_default: false,
-        visible_by_default: false,
         device: DEVICE,
       }
       expected[`homeassistant/sensor/${ID}/pump_${side}_rpm/config`] = sensorCfg({
@@ -3370,6 +3091,16 @@ describe('mqttBridge — HA discovery payload contents (mutation coverage)', () 
     }
 
     expect(got).toEqual(expected)
+    for (const side of ['left', 'right'] as const) {
+      for (const entity of [
+        `homeassistant/binary_sensor/${ID}/${side}_occupancy_fused/config`,
+        `homeassistant/sensor/${ID}/${side}_occupancy_fused_decision/config`,
+        `homeassistant/binary_sensor/${ID}/${side}_occupancy_adaptive/config`,
+        `homeassistant/sensor/${ID}/${side}_occupancy_classification/config`,
+      ]) {
+        expect(got[entity]).toBeUndefined()
+      }
+    }
     await shutdownMqttBridge()
   })
 })
@@ -3394,68 +3125,6 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
     dbMock.state.biometricsRow = { side: 'left', timestamp: new Date('2026-04-04T00:00:00Z'), heartRate: 60, hrv: 50, breathingRate: 14 }
     dbMock.state.bedTempRow = { timestamp: new Date('2026-03-03T00:00:00Z'), ambientTemp: 2000, humidity: 5000, leftPumpRpm: 1800, rightPumpRpm: 1900, leftFlowrateCd: 2050, rightFlowrateCd: 2150 }
     dbMock.state.eolRows = freshEolRows()
-    dbMock.state.adaptiveRows = [
-      {
-        side: 'left',
-        sampleTimestamp: new Date(),
-        loadPresent: false,
-        classification: 'empty',
-        personPresent: false,
-        score: 0.5,
-        peakScore: 0.3,
-        loadedChannels: 0,
-        loadVelocityScore: 0.1,
-        unloadVelocityScore: 0.2,
-        entryVelocitySupported: false,
-        reason: 'empty_hold',
-        baseline: [1400, 1100, 1250],
-        lastTransitionAt: new Date('2026-09-13T15:00:00Z'),
-        algorithmVersion: 'adaptive-cap-v3',
-        updatedAt: new Date(),
-      },
-      {
-        side: 'right',
-        sampleTimestamp: new Date(),
-        loadPresent: true,
-        classification: 'loaded_unconfirmed',
-        personPresent: null,
-        score: 8.5,
-        peakScore: 4.2,
-        loadedChannels: 3,
-        loadVelocityScore: 0.4,
-        unloadVelocityScore: 0.1,
-        entryVelocitySupported: true,
-        reason: 'occupied_hold',
-        baseline: [1700, 1550, 2290],
-        lastTransitionAt: new Date('2026-09-13T14:00:00Z'),
-        algorithmVersion: 'adaptive-cap-v3',
-        updatedAt: new Date(),
-      },
-    ]
-    dbMock.state.piezoRows = [
-      {
-        side: 'left',
-        timestamp: new Date(),
-        present: false,
-        medStd: 100_000,
-        autocorrelationQuality: 0.1,
-        enterThreshold: 400_000,
-        exitThreshold: 150_000,
-        decisionReason: 'absent_hold',
-        pumpMode: null,
-      },
-      {
-        side: 'right',
-        timestamp: new Date(),
-        present: true,
-        medStd: 900_000,
-        autocorrelationQuality: 0.6,
-        enterThreshold: 400_000,
-        exitThreshold: 150_000,
-        decisionReason: 'present_hold',
-        pumpMode: null,
-      },
-    ]
   }
 
   async function capture(
@@ -3497,8 +3166,8 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
     await shutdownMqttBridge()
   })
 
-  it('publishes legacy and adaptive occupancy as separate retained states', async () => {
-    const { map } = await capture()
+  it('publishes legacy occupancy without non-empty adaptive state or availability', async () => {
+    const { fake, map } = await capture()
     expect(JSON.parse(map[`sleepypod/${ID}/state/occupancy/left/legacy`])).toEqual({
       algorithm: 'legacy',
       occupied: false,
@@ -3510,16 +3179,19 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
       levelThreshold: 6,
       levelAgeMs: 100,
     })
-    expect(JSON.parse(map[`sleepypod/${ID}/state/occupancy/right/adaptive`])).toMatchObject({
-      algorithm: 'adaptive-cap-v3',
-      loadPresent: true,
-      classification: 'loaded_unconfirmed',
-      personPresent: null,
-      score: 8.5,
-      loadedChannels: 3,
-      reason: 'occupied_hold',
-    })
-    expect(map[`sleepypod/${ID}/availability/adaptive-occupancy`]).toBe('online')
+    const legacyCall = fake.publish.mock.calls.find(([topic]) =>
+      topic === `sleepypod/${ID}/state/occupancy/left/legacy`,
+    )
+    expect(legacyCall?.[2]).toEqual({ qos: 0, retain: true })
+    expect(fake.publish.mock.calls.some(([topic, payload]) =>
+      typeof topic === 'string'
+      && topic.startsWith(`sleepypod/${ID}/state/occupancy/`)
+      && topic.endsWith('/adaptive')
+      && !(Buffer.isBuffer(payload) && payload.length === 0),
+    )).toBe(false)
+    expect(fake.publish.mock.calls.some(([topic, payload]) =>
+      topic === `sleepypod/${ID}/availability/adaptive-occupancy` && payload === 'online',
+    )).toBe(false)
     expect(occupancyMock.getLegacyOccupancy).toHaveBeenCalledWith('left')
     expect(occupancyMock.getLegacyOccupancy).toHaveBeenCalledWith('right')
     await shutdownMqttBridge()
@@ -3643,148 +3315,6 @@ describe('mqttBridge — publishState payload contents (mutation coverage)', () 
     fake.connected = false
     await publishEolOccupancy()
     expect(fake.publish).not.toHaveBeenCalled()
-    await shutdownMqttBridge()
-  })
-
-  it('publishes fused occupancy on its comparison topics with volatile state and retained diagnostics', async () => {
-    const { fake, map } = await capture()
-
-    expect(map[`sleepypod/${ID}/state/occupancy/left/fused`]).toBe('OFF')
-    expect(map[`sleepypod/${ID}/state/occupancy/right/fused`]).toBe('ON')
-    expect(map[`sleepypod/${ID}/availability/occupancy/left/fused`]).toBe('online')
-    expect(map[`sleepypod/${ID}/availability/occupancy/right/fused`]).toBe('online')
-    expect(JSON.parse(
-      map[`sleepypod/${ID}/state/occupancy/left/fused/decision`],
-    )).toMatchObject({
-      state: 'clear',
-      occupied: false,
-      available: true,
-      algorithm: 'fused-occupancy-v2',
-      classification: 'clear_adaptive',
-      reason: 'adaptive_clear',
-      certificatePhase: 'observing',
-      shortCycle: null,
-    })
-
-    const stateCall = fake.publish.mock.calls.find(([publishedTopic]) =>
-      publishedTopic === `sleepypod/${ID}/state/occupancy/left/fused`,
-    )
-    expect(stateCall?.[2]).toEqual({ qos: 0, retain: false })
-
-    const decisionCall = fake.publish.mock.calls.find(([publishedTopic]) =>
-      publishedTopic === `sleepypod/${ID}/state/occupancy/left/fused/decision`,
-    )
-    expect(decisionCall?.[2]).toEqual({ qos: 0, retain: true })
-    await shutdownMqttBridge()
-  })
-
-  it('serializes fused certificate provenance and short-cycle progress', () => {
-    const decision: FusedOccupancyDecision = {
-      side: 'left',
-      state: 'occupied',
-      occupied: true,
-      available: true,
-      classification: 'occupied_adaptive',
-      reason: 'adaptive_load',
-      algorithm: 'fused-occupancy-v2',
-      semanticRevision: 4,
-      decisionChangedAtMs: 10_000,
-      stateSinceMs: 5_000,
-      evidenceThroughMs: 12_000,
-      validUntilMs: 15_000,
-      provenanceEpoch: 'test-epoch',
-      certificatePhase: 'confirming',
-      certificate: null,
-      shortCycle: {
-        entryAtMs: 5_000,
-        expiresAtMs: 305_000,
-        adaptivePeakScore: 20,
-        adaptivePeakLoadedChannels: 3,
-        piezoPeakEnergy: 300_000,
-        loadPresentObserved: true,
-        adaptiveCollapseAtMs: 8_000,
-        adaptiveCollapseRatio: 0.15,
-        blockedReason: null,
-      },
-      lastCertificateInvalidationReason: null,
-    }
-
-    expect(fusedOccupancyDecisionPayload(decision)).toMatchObject({
-      shortCycle: {
-        entryAt: '1970-01-01T00:00:05.000Z',
-        expiresAt: '1970-01-01T00:05:05.000Z',
-        adaptiveCollapseAt: '1970-01-01T00:00:08.000Z',
-        adaptiveCollapseRatio: 0.15,
-      },
-    })
-
-    const certified: FusedOccupancyDecision = {
-      ...decision,
-      state: 'clear',
-      occupied: false,
-      classification: 'clear_exit_certified',
-      reason: 'exit_certified',
-      certificatePhase: 'certified',
-      certificate: {
-        id: 'left-test-epoch-9000',
-        basis: 'entry_transition',
-        transitionAtMs: 9_000,
-        confirmedAtMs: 10_000,
-        latestVerifiedAtMs: 12_000,
-        adaptiveBaselineScore: 20,
-        piezoBaselineEnergy: 300_000,
-        piezoBaselineSource: 'entry_window',
-        adaptiveCollapseRatio: 0.15,
-        piezoCollapseRatio: 0.3,
-      },
-      shortCycle: null,
-    }
-    expect(fusedOccupancyDecisionPayload(certified)).toMatchObject({
-      certificate: {
-        basis: 'entry_transition',
-        transitionAt: '1970-01-01T00:00:09.000Z',
-        piezoBaselineSource: 'entry_window',
-      },
-      shortCycle: null,
-    })
-  })
-
-  it('marks replayed old adaptive samples offline despite a recent database write', async () => {
-    const { map } = await capture(() => {
-      for (const row of dbMock.state.adaptiveRows) {
-        row.sampleTimestamp = new Date(Date.now() - 60_001)
-        row.updatedAt = new Date()
-      }
-    })
-
-    expect(map[`sleepypod/${ID}/availability/adaptive-occupancy`]).toBe('offline')
-    expect(map[`sleepypod/${ID}/availability/occupancy/left/fused`]).toBe('offline')
-    expect(map[`sleepypod/${ID}/availability/occupancy/right/fused`]).toBe('offline')
-    await shutdownMqttBridge()
-  })
-
-  it('marks both fused comparison sides unavailable when an evidence query fails', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const { map } = await capture(() => {
-      dbMock.state.throwOnFusedOccupancy = true
-    })
-
-    for (const side of ['left', 'right'] as const) {
-      const stateTopic = `sleepypod/${ID}/state/occupancy/${side}/fused`
-      expect(map[`sleepypod/${ID}/availability/occupancy/${side}/fused`])
-        .toBe('offline')
-      expect(JSON.parse(map[`${stateTopic}/decision`])).toMatchObject({
-        state: 'unavailable',
-        available: false,
-        classification: 'unavailable',
-        reason: 'source_read_failed',
-      })
-    }
-    expect(warn).toHaveBeenCalledWith(
-      '[mqtt] fused occupancy publish failed:',
-      'fused occupancy boom',
-    )
-    warn.mockRestore()
     await shutdownMqttBridge()
   })
 

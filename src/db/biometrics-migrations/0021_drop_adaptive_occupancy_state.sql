@@ -1,0 +1,1 @@
+DROP TABLE `adaptive_occupancy_state`;

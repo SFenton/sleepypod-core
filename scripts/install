@@ -1790,10 +1790,6 @@ else
     calibrator
     cover-buttons
   )
-  if [ -f /etc/sleepypod/modules/adaptive-occupancy.env ] \
-     || [ -f "$DATA_DIR/adaptive-occupancy-checkpoint.json" ]; then
-    INSTALL_MODULE_CANDIDATES+=(adaptive-occupancy)
-  fi
   # Evidence-of-life occupancy drives the primary MQTT occupancy entities.
   INSTALL_MODULE_CANDIDATES+=(eol-occupancy)
   if [ -d /persistent/jetstream ] \
@@ -1816,7 +1812,7 @@ else
       _uv_sync_args+=(--python-preference only-managed)
     fi
     if ! (cd "$stage" && uv sync "${_uv_sync_args[@]}"); then
-      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ] || [ "$name" = "eol-occupancy" ]; then
+      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "eol-occupancy" ]; then
         echo "Warning: optional module $name dependencies failed to build; core biometrics installation will continue" >&2
         rm -rf "$stage"
         unset _uv_sync_args
@@ -1829,11 +1825,34 @@ else
     unset _uv_sync_args
     chmod -R o+rX "$stage/.venv" 2>/dev/null || true
     INSTALL_MODULE_NAMES+=("$name")
-    if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ] || [ "$name" = "eol-occupancy" ]; then
+    if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "eol-occupancy" ]; then
       INSTALL_OPTIONAL_MODULE_NAMES+=("$name")
     else
       INSTALL_REQUIRED_MODULE_NAMES+=("$name")
     fi
+  done
+
+  # Retire modules before common is swapped so removed imports cannot
+  # crash-loop an old service. Their operator data remains inert and intact.
+  RETIRED_MODULES=(adaptive-occupancy)
+  retire_module() {
+    local name="$1"
+    local service="sleepypod-$name.service"
+
+    if systemctl cat "$service" >/dev/null 2>&1 || [ -d "$MODULES_DEST/$name" ]; then
+      echo "Retiring module: $name"
+      systemctl stop "$service" 2>/dev/null || true
+      systemctl disable "$service" 2>/dev/null || true
+      rm -f "/etc/systemd/system/$service" 2>/dev/null || true
+      rm -rf "$MODULES_DEST/$name" 2>/dev/null || true
+      systemctl daemon-reload 2>/dev/null || true
+    fi
+  }
+
+  # Retirement is intentionally not rolled back: the replacement common tree
+  # no longer provides the retired module's imports.
+  for retired_module in "${RETIRED_MODULES[@]}"; do
+    retire_module "$retired_module"
   done
 
   INSTALL_MODULE_SWAP_ACTIVE=true
@@ -1871,7 +1890,7 @@ else
       chmod 0644 "/etc/systemd/system/$service"
       unset _data_dir_sed
       systemctl daemon-reload
-      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ] || [ "$name" = "eol-occupancy" ]; then
+      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "eol-occupancy" ]; then
         if systemctl enable "$service" && systemctl restart "$service"; then
           INSTALL_SWAPPED_MODULES+=("$name")
           echo "Optional module $name installed and started"
@@ -1886,7 +1905,7 @@ else
         echo "Module $name installed and started"
       fi
     else
-      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "adaptive-occupancy" ] || [ "$name" = "eol-occupancy" ]; then
+      if [ "$name" = "occupancy-study-recorder" ] || [ "$name" = "eol-occupancy" ]; then
         restore_optional_install_module "$name"
         echo "Warning: optional module $name has no service file; core biometrics installation will continue" >&2
       else
